@@ -74,8 +74,12 @@ pub fn run() -> Result<()> {
     let result = event_loop(&mut terminal, &mut app, &rx, &rest, poll_fallback_secs, &theme_name);
     ratatui::restore();
 
+    // Signal the worker and detach rather than join: `socket::run`'s read loop blocks on a
+    // 30s read timeout with no state here that needs flushing, so joining it would make `q`
+    // hang the terminal restore for up to 30s. The thread exits on its own once `cancelled`
+    // is observed; the process must return control instantly.
     cancelled.store(true, Ordering::Release);
-    let _ = worker.join();
+    drop(worker);
     result
 }
 
@@ -121,6 +125,9 @@ fn event_loop(
     theme_name: &str,
 ) -> Result<()> {
     let palette = theme::resolve(Some(theme_name));
+    if let Some(warning) = theme_warning(theme_name) {
+        app.status = warning;
+    }
     let mut last_unread = app.unread_mentions();
     let mut down_since: Option<Instant> = None;
     let mut last_poll_tick = Instant::now();
@@ -184,5 +191,33 @@ fn event_loop(
                 _ => {}
             }
         }
+    }
+}
+
+/// The one-line status to show when `theme_name` doesn't resolve to a known palette, or
+/// `None` when it does. Pulled out of `event_loop` so the fallback message is unit-testable
+/// without a terminal.
+fn theme_warning(theme_name: &str) -> Option<String> {
+    if theme::is_known(theme_name) {
+        None
+    } else {
+        Some(format!("unknown theme '{theme_name}' — using {}", theme::DEFAULT))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::theme_warning;
+
+    #[test]
+    fn known_theme_has_no_warning() {
+        assert_eq!(theme_warning("catppuccin"), None);
+    }
+
+    #[test]
+    fn unknown_theme_warns_and_names_the_fallback() {
+        let warning = theme_warning("catppuccin-mocha").expect("should warn");
+        assert!(warning.contains("catppuccin-mocha"), "{warning}");
+        assert!(warning.contains("catppuccin"), "{warning}");
     }
 }

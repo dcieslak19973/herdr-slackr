@@ -70,7 +70,7 @@ never dead because a proxy hates WebSockets.
   channels = ["#eng-infra", "#releases"]   # required; names resolved to ids at startup
   dms = true                               # include IMs/MPIMs (default true)
   keywords = ["deploy", "oncall"]          # extra Mentions-tab triggers (default none)
-  theme = "catppuccin-mocha"               # reviewr's palette system, same names
+  theme = "catppuccin"                     # reviewr's palette system, same names
   poll_fallback_secs = 30                  # 5..=300
   ```
 

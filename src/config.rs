@@ -14,7 +14,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 5] =
     ["channels", "dms", "keywords", "theme", "poll_fallback_secs"];
 
 /// The default theme name when `config.toml` omits `theme`.
-pub const DEFAULT_THEME: &str = "catppuccin-mocha";
+pub const DEFAULT_THEME: &str = "catppuccin";
 
 /// The default polling fallback interval, in seconds, when the socket is unavailable.
 pub const DEFAULT_POLL_FALLBACK_SECS: u64 = 30;
@@ -49,7 +49,7 @@ impl PluginConfig {
         &self.keywords
     }
 
-    /// The palette name (reviewr's theme system). Defaults to `"catppuccin-mocha"`.
+    /// The palette name (reviewr's theme system). Defaults to `"catppuccin"`.
     pub fn theme(&self) -> &str {
         &self.theme
     }
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(config.channels(), ["#eng-infra"]);
         assert!(config.dms());
         assert!(config.keywords().is_empty());
-        assert_eq!(config.theme(), "catppuccin-mocha");
+        assert_eq!(config.theme(), "catppuccin");
         assert_eq!(config.poll_fallback_secs(), 30);
     }
 
