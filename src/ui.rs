@@ -72,7 +72,10 @@ fn tab_style(palette: &Palette, active: bool) -> Style {
     }
 }
 
-/// The active tab's rows, the selected one filled with the cursor color.
+/// The active tab's rows, the selected one filled with the cursor color, scrolled so the
+/// cursor row always stays on-screen (see `scroll_offset`) — without this, a tall row set
+/// simply painted every row from the top, leaving live arrivals and a cursor walked past the
+/// last visible line invisible below the viewport.
 fn render_body(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let rows = match app.tab {
         Tab::Feed => app.feed_rows(),
@@ -84,7 +87,26 @@ fn render_body(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, row)| row_line(palette, row, width, i == app.cursor))
         .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+    let offset = scroll_offset(lines.len(), app.cursor, area.height as usize);
+    #[allow(clippy::cast_possible_truncation)]
+    let offset = offset as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), area);
+}
+
+/// The first visible row for a `height`-row-tall viewport that keeps `cursor` on-screen among
+/// `total` rows: the window stays pinned at the top (`0`) until `cursor` would fall below it,
+/// then follows `cursor` exactly (so `cursor` sits on the viewport's last visible row), capped
+/// so it never scrolls past the point that shows the final `height` rows. `render_body` never
+/// wraps a row across multiple terminal lines (each `Row` is exactly one `Line`), so this
+/// row-count arithmetic is exactly the terminal-line arithmetic `Paragraph::scroll` needs — no
+/// per-row display-height accounting required.
+fn scroll_offset(total: usize, cursor: usize, height: usize) -> usize {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    let cursor = cursor.min(total - 1);
+    let wants = (cursor + 1).saturating_sub(height);
+    wants.min(total - height)
 }
 
 /// One row as `#chan  @author  HH:MM  text` (a thread marker keeps its own `↳ n replies`
@@ -139,10 +161,33 @@ pub fn nav_title(unread: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::nav_title;
+    use super::{nav_title, scroll_offset};
 
     #[test]
     fn nav_title_builds_the_osc_0_escape_with_the_unread_count() {
         assert_eq!(nav_title(3), "\x1b]0;slack (3)\x07");
+    }
+
+    #[test]
+    fn scroll_offset_is_zero_when_every_row_already_fits() {
+        assert_eq!(scroll_offset(5, 3, 10), 0);
+    }
+
+    #[test]
+    fn scroll_offset_stays_pinned_to_the_top_while_the_cursor_fits_in_view() {
+        assert_eq!(scroll_offset(100, 0, 10), 0);
+        assert_eq!(scroll_offset(100, 9, 10), 0);
+    }
+
+    #[test]
+    fn scroll_offset_follows_the_cursor_once_it_would_fall_below_the_viewport() {
+        assert_eq!(scroll_offset(100, 10, 10), 1);
+        assert_eq!(scroll_offset(100, 99, 10), 90);
+    }
+
+    #[test]
+    fn scroll_offset_never_scrolls_past_the_final_screenful() {
+        assert_eq!(scroll_offset(100, 50, 10), 41);
+        assert_eq!(scroll_offset(20, 19, 10), 10);
     }
 }

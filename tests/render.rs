@@ -118,6 +118,60 @@ fn mentions_tab_shows_read_unread_markers_and_the_tab_bar_count() {
     assert!(out.contains('\u{25cb}'), "the toggled row now shows read:\n{out}");
 }
 
+// ---- vertical scrolling (Fix 1): a tall row set in a short viewport ------------------------
+
+/// A Feed-tab app with `n` distinct, ascending-`ts` messages, each rendering as `row {i}`.
+fn tall_feed(n: usize) -> App {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    for i in 0..n {
+        let ts = format!("{}.0", 1_000 + i);
+        app.apply(SocketEvent::Message(msg("C1", &ts, None, "U1", &format!("row {i}"))));
+    }
+    app.touch();
+    app
+}
+
+fn render_ready_sized(app: &App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(app))).unwrap();
+    dump(terminal.backend().buffer())
+}
+
+#[test]
+fn cursor_at_the_top_keeps_the_first_row_visible_in_a_short_viewport() {
+    let app = tall_feed(30); // cursor defaults to row 0
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("row 0"), "first row must be visible:\n{out}");
+    assert!(!out.contains("row 29"), "the last row must be scrolled out of view:\n{out}");
+}
+
+#[test]
+fn cursor_at_the_bottom_keeps_the_last_row_visible_in_a_short_viewport() {
+    let mut app = tall_feed(30);
+    app.move_cursor(1000); // clamps to the last row
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("row 29"), "last row must be visible with the cursor on it:\n{out}");
+    assert!(!out.contains("row 0"), "the first row must be scrolled out of view:\n{out}");
+}
+
+#[test]
+fn a_new_arrival_while_the_cursor_sits_at_the_bottom_stays_visible() {
+    let mut app = tall_feed(30);
+    app.move_cursor(1000); // sit at the bottom, the common at-the-bottom chat state
+
+    app.apply(SocketEvent::Message(msg("C1", "5000.0", None, "U1", "brand new arrival")));
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(
+        out.contains("brand new arrival"),
+        "a new arrival while pinned to the bottom must stay in view:\n{out}"
+    );
+}
+
 #[test]
 fn degraded_screen_names_the_tokens_and_the_tokens_toml_path() {
     let dir = tempfile::tempdir().unwrap();

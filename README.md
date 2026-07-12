@@ -38,7 +38,7 @@ whoever approves new Slack apps in your workspace — it lists every scope and s
 requests, and nothing else.
 
 1. Create a Slack app at <https://api.slack.com/apps> ("From scratch"), in your workspace.
-2. **OAuth & Permissions → User Token Scopes** — add exactly these five:
+2. **OAuth & Permissions → User Token Scopes** — add exactly these nine:
    - `channels:read`, `channels:history`
    - `groups:read`, `groups:history`
    - `im:read`, `im:history`
@@ -182,9 +182,9 @@ Slack's servers) — it's covered here instead, by hand, before each release:
    so the socket errors immediately and the status line should show `socket unavailable (…) —
    polling` within roughly 30 seconds (one backoff cycle). A firewall block instead (drop
    outbound to `slack.com` with no reply, rather than refusing it) produces dead air with no
-   socket error, so the read loop has to wait out its 90-second liveness deadline (three 30s read
-   timeouts) before it gives up and reconnects — expect the same status line within roughly 2
-   minutes in that case.
+   socket error, so the read loop has to wait out its 90-second liveness deadline — the deadline
+   trips on the first timeout tick past 90s, in practice the fourth 30s read timeout — before it
+   gives up and reconnects — expect the same status line within roughly 2 minutes in that case.
 4. **Verify polling still delivers.** Post another message while still offline-from-socket but
    with REST reachable (or restore just enough connectivity for `conversations.history` to
    answer) — it should appear within `poll_fallback_secs` of its send time.

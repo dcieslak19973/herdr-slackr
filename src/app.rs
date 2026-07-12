@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::config::PluginConfig;
 use crate::entities::{self, is_mention};
 use crate::model::{ConvKind, Conversation, Message, ts_cmp, ts_key};
-use crate::rest::Rest;
+use crate::rest::{Rest, RestError};
 use crate::socket::SocketEvent;
 use crate::tokens::Tokens;
 
@@ -193,16 +193,15 @@ impl App {
         };
 
         for conv in app.conversations.clone() {
-            if let Ok(msgs) = crate::rest::history(rest, &conv.id, 50) {
-                for msg in msgs {
-                    app.upsert_new(msg);
-                }
-            }
+            apply_backfill(&mut app, &conv.name, crate::rest::history(rest, &conv.id, 50))?;
         }
         // Everything just backfilled counts as already-seen: the divider only ever marks
         // messages that arrive after this point.
         app.touch();
         app.resync_cursor();
+        // Chat panes open scrolled to the bottom — the common at-the-bottom state new
+        // arrivals should keep following (see `apply`'s follow-bottom logic below).
+        app.snap_cursor_to_last_row();
 
         Ok(app)
     }
@@ -248,6 +247,11 @@ impl App {
     /// — it is recomputed on demand by `mention_rows`/`unread_mentions` from the raw message,
     /// so a later config change (e.g. a new keyword) would not require replaying history.
     pub fn apply(&mut self, ev: SocketEvent) {
+        // Captured before the event lands: if the Feed tab's cursor is already sitting on the
+        // last row (the common at-the-bottom chat-pane state — see `build`/`snap_cursor_to_last_row`),
+        // a new arrival below it should not leave the cursor stranded above the new bottom; it
+        // should keep following, exactly like a chat client scrolled to "now".
+        let follow_bottom = self.tab == Tab::Feed && self.is_cursor_at_last_row();
         match ev {
             SocketEvent::Connected => {
                 self.polling = false;
@@ -262,17 +266,54 @@ impl App {
             SocketEvent::Deleted { conv, ts } => self.remove(&conv, &ts),
         }
         self.resync_cursor();
+        if follow_bottom {
+            self.snap_cursor_to_last_row();
+        }
+    }
+
+    /// Whether `cursor` currently sits on the active tab's last row (the "scrolled to the
+    /// bottom" state — see `apply`'s follow-bottom logic and `build`).
+    fn is_cursor_at_last_row(&self) -> bool {
+        let ids = self.current_ids();
+        !ids.is_empty() && self.cursor == ids.len() - 1
+    }
+
+    /// Force `cursor`/`selected` onto the active tab's last row, if it has one. Called after
+    /// `build`'s backfill (chat panes open scrolled to the bottom) and by `apply` to keep a
+    /// Feed-tab cursor that was already at the bottom pinned there through new arrivals.
+    fn snap_cursor_to_last_row(&mut self) {
+        let ids = self.current_ids();
+        if let Some(last) = ids.len().checked_sub(1) {
+            self.cursor = last;
+            self.selected.clone_from(&ids[last]);
+        }
     }
 
     /// Fallback mode: re-pull the last 50 messages of every subscribed conversation.
     /// Messages already known (same `(conv, ts)`) are deduplicated by `upsert_new`, so a
     /// message that arrives via both a poll and the socket still appears exactly once.
+    ///
+    /// A `RestError::RateLimited` sets a rate-limit status and stops the rest of this tick
+    /// (Slack's own signal to back off now, not to keep hammering the remaining conversations);
+    /// any other error sets a one-line status naming the conversation and moves on to the next
+    /// one rather than crashing (spec: a per-conversation poll failure must never take down the
+    /// pane). See `poll_error_status` for the pure wording decision.
     pub fn poll_tick(&mut self, rest: &Rest) {
-        let convs: Vec<String> = self.conversations.iter().map(|c| c.id.clone()).collect();
-        for conv in convs {
-            if let Ok(msgs) = crate::rest::history(rest, &conv, 50) {
-                for msg in msgs {
-                    self.upsert_new(msg);
+        let convs: Vec<(String, String)> =
+            self.conversations.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
+        for (conv_id, conv_name) in convs {
+            match crate::rest::history(rest, &conv_id, 50) {
+                Ok(msgs) => {
+                    for msg in msgs {
+                        self.upsert_new(msg);
+                    }
+                }
+                Err(err @ RestError::RateLimited(_)) => {
+                    self.status = poll_error_status(&conv_name, &err);
+                    break;
+                }
+                Err(err) => {
+                    self.status = poll_error_status(&conv_name, &err);
                 }
             }
         }
@@ -531,13 +572,21 @@ impl App {
 
     /// A permalink for the selected row's message, if any (e.g. the cursor is past the end,
     /// or sits on the synthetic `Divider` row). Resolves via the selected identity, not raw
-    /// row position — see `feed_target`/`mention_target`.
-    pub fn permalink_of_selected(&self, rest: &Rest) -> Option<String> {
+    /// row position — see `feed_target`/`mention_target`. On a REST failure this sets `status`
+    /// naming the failure and returns `None`, the same as "nothing selected" to the caller, but
+    /// now visibly distinguishable from it in the status line rather than silently doing nothing.
+    pub fn permalink_of_selected(&mut self, rest: &Rest) -> Option<String> {
         let id = match self.tab {
             Tab::Feed => self.feed_target().map(|(id, _)| id),
             Tab::Mentions => self.mention_target().map(|(id, _)| id),
         }?;
-        crate::rest::permalink(rest, &id.0, &id.1).ok()
+        match crate::rest::permalink(rest, &id.0, &id.1) {
+            Ok(url) => Some(url),
+            Err(err) => {
+                self.status = format!("permalink failed: {err:?}");
+                None
+            }
+        }
     }
 
     // ---- Feed tab: thread expand (thin REST edge over the pure `toggle_thread`) ----------
@@ -551,7 +600,13 @@ impl App {
         }
         let will_expand = !self.expanded.contains(&(conv.clone(), root_ts.clone()));
         let fetched = if will_expand {
-            crate::rest::replies(rest, &conv, &root_ts).unwrap_or_default()
+            match crate::rest::replies(rest, &conv, &root_ts) {
+                Ok(msgs) => msgs,
+                Err(err) => {
+                    self.status = format!("replies failed: {err:?}");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -687,6 +742,33 @@ fn ts_to_hhmm(ts: &str) -> String {
     format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
 }
 
+/// Fold one conversation's backfill result into `app`, or produce an error naming which
+/// conversation's history fetch failed (spec: "a per-channel history error fails build with an
+/// error naming the channel"). Split out of `build`'s loop so the error-naming path is
+/// unit-tested without a real REST call.
+fn apply_backfill(
+    app: &mut App,
+    conv_name: &str,
+    msgs: Result<Vec<Message>, RestError>,
+) -> Result<(), String> {
+    let msgs = msgs.map_err(|e| format!("history failed for {conv_name}: {e:?}"))?;
+    for msg in msgs {
+        app.upsert_new(msg);
+    }
+    Ok(())
+}
+
+/// The one-line status `poll_tick` sets on a per-conversation history-fetch failure: a
+/// rate-limit notice naming the retry delay (Slack's own back-off signal, distinct from any
+/// other failure) or a line naming which conversation failed and why. Split out so the wording
+/// is unit-tested without a real REST call.
+fn poll_error_status(conv_name: &str, error: &RestError) -> String {
+    match error {
+        RestError::RateLimited(secs) => format!("slack rate limit — retrying in {secs}s"),
+        other => format!("{conv_name}: {other:?}"),
+    }
+}
+
 /// Resolve configured channel names (e.g. `"#eng-infra"`) to their `Conversation`s among
 /// `all`, matching only `Channel`/`Group` kinds; an unresolved name is an error naming it
 /// (per the design doc: "A configured channel name that resolves to nothing is an error
@@ -739,9 +821,12 @@ fn resolve_im_names(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, RowKind, SelKind, Tab, resolve_channels, resolve_im_names, ts_to_hhmm};
+    use super::{
+        App, RowKind, SelKind, Tab, apply_backfill, poll_error_status, resolve_channels,
+        resolve_im_names, ts_to_hhmm,
+    };
     use crate::model::{ConvKind, Conversation, Message};
-    use crate::rest::Rest;
+    use crate::rest::{Rest, RestError};
     use crate::socket::SocketEvent;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
@@ -1322,5 +1407,83 @@ mod tests {
         app.conv_names.insert("D1".to_string(), "priya".to_string());
         assert_eq!(app.conv_label("C1"), "#eng");
         assert_eq!(app.conv_label("D1"), "@priya");
+    }
+
+    // ---- build backfill errors name the failing channel (Fix 2a) --------------------------
+
+    #[test]
+    fn a_backfill_history_error_fails_build_naming_the_channel() {
+        let mut app = empty_app();
+        let error =
+            apply_backfill(&mut app, "eng", Err(RestError::SlackError("channel_not_found".into())))
+                .unwrap_err();
+        assert!(error.contains("eng"), "{error}");
+        assert!(error.contains("channel_not_found"), "{error}");
+    }
+
+    #[test]
+    fn a_successful_backfill_upserts_every_message() {
+        let mut app = empty_app();
+        apply_backfill(&mut app, "eng", Ok(vec![msg("C1", "1.0", None, "U1", "hi")])).unwrap();
+        app.touch();
+        assert_eq!(app.feed_rows().len(), 1);
+    }
+
+    // ---- poll_tick status wording (Fix 2b) --------------------------------------------------
+
+    #[test]
+    fn poll_error_status_is_a_rate_limit_notice_for_rate_limited() {
+        let status = poll_error_status("eng", &RestError::RateLimited(42));
+        assert_eq!(status, "slack rate limit — retrying in 42s");
+    }
+
+    #[test]
+    fn poll_error_status_names_the_conversation_for_other_errors() {
+        let status =
+            poll_error_status("eng", &RestError::SlackError("channel_not_found".to_string()));
+        assert!(status.contains("eng"), "{status}");
+    }
+
+    #[test]
+    fn poll_tick_surfaces_a_rest_failure_as_a_one_line_status_without_crashing() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick(&rest);
+        assert!(!app.status.is_empty(), "poll_tick must surface the failure, not swallow it");
+    }
+
+    // ---- Feed-tab bottom-follow (Fix 1b: identity plumbing) ----------------------------------
+
+    #[test]
+    fn cursor_at_the_last_row_follows_a_new_arrival_to_the_new_last_row() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "row A")));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "row B")));
+        app.touch();
+        app.move_cursor(10); // clamps to the last row, "row B"
+        assert_eq!(app.feed_rows()[app.cursor].text, "row B");
+
+        app.apply(SocketEvent::Message(msg("C1", "3.0", None, "U1", "row C")));
+
+        let rows = app.feed_rows();
+        assert_eq!(
+            rows[app.cursor].text, "row C",
+            "cursor must follow to the new bottom, not stay pinned on row B"
+        );
+    }
+
+    #[test]
+    fn cursor_not_at_the_last_row_does_not_follow_a_new_arrival() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "row A")));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "row B")));
+        app.touch();
+        app.move_cursor(0); // stays on "row A", not the bottom
+
+        app.apply(SocketEvent::Message(msg("C1", "3.0", None, "U1", "row C")));
+
+        let rows = app.feed_rows();
+        assert_eq!(rows[app.cursor].text, "row A", "cursor away from the bottom must not move");
     }
 }
