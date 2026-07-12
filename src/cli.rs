@@ -242,7 +242,7 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
     let total = selected.len();
     let mut partial_note = None;
     for (scanned, conv) in selected.iter().enumerate() {
-        match rest::history(&rest, &conv.id, HISTORY_LIMIT) {
+        match rest::history(&rest, &conv.id, HISTORY_LIMIT, None) {
             Ok(v) => msgs.extend(v),
             Err(error) => match scan_outcome(scanned, total, &error) {
                 ScanOutcome::HardFail => return rest_fail(&error),

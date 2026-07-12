@@ -110,11 +110,38 @@ pub fn list_conversations(rest: &Rest) -> Result<Vec<Conversation>, RestError> {
     Ok(out)
 }
 
-/// The most recent `limit` messages in `conv`.
-pub fn history(rest: &Rest, conv: &str, limit: u32) -> Result<Vec<Message>, RestError> {
+/// The most recent `limit` messages in `conv`, or — when `oldest` names a `ts` — only messages
+/// newer than it (Slack's `oldest` is exclusive by default, which is exactly what incremental
+/// polling wants: the tracked newest-seen `ts` is passed back in, so the common tick's response
+/// body is empty rather than re-shipping the same 50 messages every time). `None` fetches the
+/// plain last-`limit` page, used for the initial backfill and the CLI (both want the freshest
+/// window regardless of anything previously seen).
+pub fn history(
+    rest: &Rest,
+    conv: &str,
+    limit: u32,
+    oldest: Option<&str>,
+) -> Result<Vec<Message>, RestError> {
     let limit = limit.to_string();
-    let v = rest.get("conversations.history", &[("channel", conv), ("limit", &limit)])?;
+    let params = history_params(conv, &limit, oldest);
+    let v = rest.get("conversations.history", &params)?;
     Ok(parse_messages(&v, conv))
+}
+
+/// Pure param-list construction for [`history`], split out so `oldest`'s presence/absence is
+/// unit-tested without a real REST call. `channel`/`limit` are always sent; `oldest` is appended
+/// only when given — omitting the key entirely rather than sending an empty value, matching how
+/// `list_conversations`/`users` treat their own optional-cursor case.
+fn history_params<'a>(
+    conv: &'a str,
+    limit: &'a str,
+    oldest: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut params = vec![("channel", conv), ("limit", limit)];
+    if let Some(oldest) = oldest {
+        params.push(("oldest", oldest));
+    }
+    params
 }
 
 /// All replies in the thread rooted at `thread_ts` within `conv`.
@@ -625,6 +652,21 @@ mod tests {
             None
         );
         assert_eq!(next_cursor(&serde_json::json!({})), None);
+    }
+
+    // ---- history_params (oldest threading, Task 2) -----------------------------------------
+
+    #[test]
+    fn history_params_omits_oldest_when_none() {
+        assert_eq!(history_params("C1", "50", None), vec![("channel", "C1"), ("limit", "50")]);
+    }
+
+    #[test]
+    fn history_params_includes_oldest_when_given() {
+        assert_eq!(
+            history_params("C1", "50", Some("1752300000.000100")),
+            vec![("channel", "C1"), ("limit", "50"), ("oldest", "1752300000.000100")]
+        );
     }
 
     // ---- history / replies -----------------------------------------------------------------
