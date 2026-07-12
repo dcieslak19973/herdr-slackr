@@ -19,7 +19,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::config::{self, PluginConfig};
 use crate::entities::{self, is_mention};
-use crate::model::{ConvKind, Conversation, Message, ts_cmp, ts_key};
+use crate::model::{ConvKind, Conversation, Message, resolve_channels, ts_cmp, ts_key};
 use crate::rest::{self, Rest, RestError};
 use crate::tokens;
 
@@ -37,6 +37,7 @@ const DEFAULT_LIMIT: u32 = 20;
 /// of the four subcommands this module owns.
 #[allow(clippy::needless_pass_by_value)]
 pub fn run(args: Vec<String>) -> ExitCode {
+    crate::log::init();
     match args.get(1).map(String::as_str) {
         Some("mentions") => mentions(&args[2..]),
         Some("feed") => feed(&args[2..]),
@@ -182,6 +183,20 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
     let cancelled = AtomicBool::new(false);
     let rest = Rest { user_token: &tokens.user, cancelled: &cancelled };
 
+    // Checked first, ahead of any network call: a fresh on-disk cache answers `users.list`
+    // without ever touching the network, so this must not wait on `auth_self`/`list_conversations`
+    // succeeding first (see `crate::users_cache`).
+    let state_dir = crate::users_cache::state_dir(real_env, real_home);
+    let users = match crate::users_cache::users_cached(
+        &rest,
+        state_dir.as_deref(),
+        crate::users_cache::now_secs(),
+    ) {
+        Ok(v) => v,
+        Err(error) => return rest_fail(&error),
+    };
+    let user_names: HashMap<String, String> = users.into_iter().collect();
+
     let self_id = match rest::auth_self(&rest) {
         Ok(id) => id,
         Err(error) => return rest_fail(&error),
@@ -190,16 +205,12 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
         Ok(v) => v,
         Err(error) => return rest_fail(&error),
     };
-    let users = match rest::users(&rest) {
-        Ok(v) => v,
-        Err(error) => return rest_fail(&error),
-    };
-    let user_names: HashMap<String, String> = users.into_iter().collect();
 
-    let selected = match resolve_channels(config.channels(), config.dms(), &all_convs) {
-        Ok(v) => v,
-        Err(message) => return fail(&message),
-    };
+    let selected =
+        match resolve_channels(config.channels(), config.dms(), config.dm_limit(), &all_convs) {
+            Ok(v) => v,
+            Err(message) => return fail(&message),
+        };
     let selected = resolve_im_names(selected, &user_names);
 
     let selected = if let Some(wanted) = channel_filter {
@@ -398,32 +409,6 @@ fn ts_to_hhmm(ts: &str) -> String {
     let (secs, _) = ts_key(ts);
     let day_secs = secs % 86_400;
     format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
-}
-
-/// Filter `all` down to the conversations named in `config_channels` (matched by name, `#`
-/// stripped), erroring on the first unresolved name, then append every IM/MPIM when `dms` is
-/// set. Duplicated from `crate::app`'s private `resolve_channels` (not `pub`) with identical
-/// behavior — see that module for the original and its tests.
-fn resolve_channels(
-    config_channels: &[String],
-    dms: bool,
-    all: &[Conversation],
-) -> Result<Vec<Conversation>, String> {
-    let mut out = Vec::with_capacity(config_channels.len());
-    for wanted in config_channels {
-        let name = wanted.strip_prefix('#').unwrap_or(wanted.as_str());
-        let found = all
-            .iter()
-            .find(|c| c.name == name && matches!(c.kind, ConvKind::Channel | ConvKind::Group));
-        match found {
-            Some(c) => out.push(c.clone()),
-            None => return Err(format!("unknown channel: {wanted}")),
-        }
-    }
-    if dms {
-        out.extend(all.iter().filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim)).cloned());
-    }
-    Ok(out)
 }
 
 /// Resolve each `Im` conversation's display name via the `users.list` cache, falling back to
@@ -631,7 +616,7 @@ mod tests {
     }
 
     fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
-        Conversation { id: id.into(), name: name.into(), kind }
+        Conversation { id: id.into(), name: name.into(), kind, updated: None }
     }
 
     // ---- config_dir --------------------------------------------------------------------------
@@ -708,28 +693,7 @@ mod tests {
         assert_eq!(row, "@dan  @dan  06:00  hi");
     }
 
-    // ---- resolve_channels / resolve_im_names (duplicated from app.rs; same contract) --------
-
-    #[test]
-    fn resolve_channels_matches_by_name_stripping_the_hash() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel)];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, &all).unwrap();
-        assert_eq!(resolved, vec![conv("C1", "eng-infra", ConvKind::Channel)]);
-    }
-
-    #[test]
-    fn resolve_channels_errors_naming_an_unknown_channel() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel)];
-        let error = resolve_channels(&["#nope".to_string()], false, &all).unwrap_err();
-        assert!(error.contains("#nope"), "{error}");
-    }
-
-    #[test]
-    fn resolve_channels_includes_dms_when_enabled() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel), conv("D1", "U9", ConvKind::Im)];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], true, &all).unwrap();
-        assert_eq!(resolved.len(), 2);
-    }
+    // ---- resolve_channels: see `crate::model`'s tests (moved there — dedup, task 1) --------
 
     #[test]
     fn resolve_im_names_maps_the_counterpart_user_id_to_a_display_name() {

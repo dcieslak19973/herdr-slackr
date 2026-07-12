@@ -11,8 +11,12 @@
 //! curl exit code, so it would never see a Slack-level error and buys nothing here. Instead
 //! every response is parsed regardless of transport outcome, and `ok` is checked on every call.
 //! A `ratelimited` error is Slack's signal for HTTP 429; Slack does not echo the triggering
-//! `Retry-After` value into that JSON body, so [`RestError::RateLimited`] carries a fixed 30s
-//! default rather than a parsed one.
+//! `Retry-After` value into that JSON body, so every call also appends
+//! `--write-out '\n%{http_code} %header{retry-after}'` (curl ≥ 7.83) — [`parse_response`] splits
+//! that trailer off the body and [`RestError::RateLimited`] carries the server's real
+//! `Retry-After` seconds when the trailer names one, defaulting to 30 when it's missing (no
+//! header sent, or — on curl < 7.83 — no trailer at all, in which case parsing degrades exactly
+//! to the pre-trailer behavior: the whole output is the body).
 #![allow(clippy::result_large_err)]
 
 use std::sync::atomic::AtomicBool;
@@ -49,8 +53,9 @@ pub enum RestError {
     /// Slack answered `{"ok": false, "error": "..."}`; the `error` field verbatim
     /// (`invalid_auth`, `channel_not_found`, …).
     SlackError(String),
-    /// Slack answered `{"ok": false, "error": "ratelimited"}`; the suggested backoff in
-    /// seconds (a fixed default — see the module doc).
+    /// Slack answered `{"ok": false, "error": "ratelimited"}`, or the write-out trailer's HTTP
+    /// code was 429; the suggested backoff in seconds — the server's real `Retry-After` when
+    /// the trailer carries one, else the 30s default (see the module doc).
     RateLimited(u64),
     /// Any other transport, I/O, or JSON-shape failure.
     Other(String),
@@ -161,14 +166,31 @@ fn curl_config(token: &str) -> String {
     format!("header = \"Authorization: Bearer {token}\"\n")
 }
 
-/// The GET args: no `--fail` (see the module doc), config from stdin (`-`).
+/// The `--write-out` format appended to every call: a leading `\n` so [`split_trailer`] can
+/// find it as the output's last line, then the HTTP status and the `Retry-After` header value
+/// (empty when the header is absent). Requires curl ≥ 7.83 for `%header{}`; see the module doc
+/// for the older-curl degradation.
+const WRITE_OUT: &str = "\n%{http_code} %header{retry-after}";
+
+/// The GET args: no `--fail` (see the module doc), config from stdin (`-`), plus the
+/// Retry-After write-out trailer.
 fn get_args(url: &str) -> Vec<&str> {
-    vec!["--silent", "--show-error", "--config", "-", url]
+    vec!["--silent", "--show-error", "--write-out", WRITE_OUT, "--config", "-", url]
 }
 
 /// As [`get_args`], but forcing a POST — the only caller is [`connections_open`].
 fn post_args(url: &str) -> Vec<&str> {
-    vec!["--silent", "--show-error", "--request", "POST", "--config", "-", url]
+    vec![
+        "--silent",
+        "--show-error",
+        "--write-out",
+        WRITE_OUT,
+        "--request",
+        "POST",
+        "--config",
+        "-",
+        url,
+    ]
 }
 
 /// `NotFound` → [`RestError::NoCurl`]; a cancelled/IO failure or a transport-level `curl`
@@ -184,24 +206,48 @@ fn classify(f: crate::proc::RunFail) -> RestError {
     }
 }
 
-/// Parse `out` as JSON and apply [`check_ok`]. Split from `check_ok` so the ok/error decision
-/// is pure and fixture-testable without a JSON parse in the way.
-fn parse_response(out: &str) -> Result<Value, RestError> {
-    let v: Value =
-        serde_json::from_str(out).map_err(|e| RestError::Other(format!("invalid JSON: {e}")))?;
-    check_ok(v)
+/// The write-out trailer's HTTP status and optional `Retry-After` seconds, once split off the
+/// response body by [`split_trailer`].
+type Trailer = (u16, Option<u64>);
+
+/// Split `out`'s trailing `\n<http_code> <retry-after>` line (appended by [`WRITE_OUT`]) off
+/// the response body. Returns `(body, None)` when the last line isn't a valid trailer — no
+/// trailing newline at all, or a non-numeric status — which is exactly what curl < 7.83
+/// produces (module doc): the whole output is the body, same as before this trailer existed.
+/// A present but empty `Retry-After` value (header not sent) yields `Some((code, None))`.
+fn split_trailer(out: &str) -> (&str, Option<Trailer>) {
+    let Some(idx) = out.rfind('\n') else { return (out, None) };
+    let tail = out[idx + 1..].trim_end();
+    let mut parts = tail.splitn(2, ' ');
+    let Some(Ok(code)) = parts.next().map(str::parse::<u16>) else { return (out, None) };
+    let retry_after =
+        parts.next().map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
+    (&out[..idx], Some((code, retry_after)))
 }
 
-/// Slack's uniform envelope: `ok: true` passes `v` through; `ok: false` reads `error`, mapping
-/// `ratelimited` to a fixed 30s [`RestError::RateLimited`] (module doc) and anything else to
-/// [`RestError::SlackError`] verbatim.
-fn check_ok(v: Value) -> Result<Value, RestError> {
+/// Split the write-out trailer off `out`, parse the remaining body as JSON, and apply
+/// [`check_ok`]. Split from `check_ok` so the ok/error decision is pure and fixture-testable
+/// without a JSON parse in the way.
+fn parse_response(out: &str) -> Result<Value, RestError> {
+    let (body, trailer) = split_trailer(out);
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| RestError::Other(format!("invalid JSON: {e}")))?;
+    check_ok(v, trailer)
+}
+
+/// Slack's uniform envelope: `ok: true` passes `v` through; `ok: false` reads `error`. A
+/// `ratelimited` error, or a trailer reporting HTTP 429, maps to [`RestError::RateLimited`]
+/// carrying the trailer's `Retry-After` seconds when present, else the 30s default (module doc).
+/// Anything else maps to [`RestError::SlackError`] verbatim.
+fn check_ok(v: Value, trailer: Option<Trailer>) -> Result<Value, RestError> {
     if v["ok"].as_bool() == Some(true) {
         return Ok(v);
     }
     let error = v["error"].as_str().unwrap_or("unknown_error");
-    if error == "ratelimited" {
-        return Err(RestError::RateLimited(30));
+    let is_429 = trailer.is_some_and(|(code, _)| code == 429);
+    if error == "ratelimited" || is_429 {
+        let secs = trailer.and_then(|(_, retry_after)| retry_after).unwrap_or(30);
+        return Err(RestError::RateLimited(secs));
     }
     Err(RestError::SlackError(error.to_string()))
 }
@@ -238,6 +284,8 @@ fn next_cursor(v: &Value) -> Option<String> {
 /// required flag). An IM's `name` is its counterpart `user` id — Slack has no channel-style name
 /// for a DM — resolved to a display name later by pairing with [`users`]'s output. A channel's
 /// `name` prefers `name_normalized` (Slack's canonicalized form) and falls back to `name`.
+/// `updated` (millisecond epoch of last activity) is carried through as `None` when Slack's
+/// payload omits it — some workspaces don't send it — rather than defaulted to any value.
 fn parse_conversations(v: &Value) -> Vec<Conversation> {
     v["channels"]
         .as_array()
@@ -263,7 +311,8 @@ fn parse_conversations(v: &Value) -> Vec<Conversation> {
                     .unwrap_or_default()
                     .to_string()
             };
-            Some(Conversation { id, name, kind })
+            let updated = c["updated"].as_u64();
+            Some(Conversation { id, name, kind, updated })
         })
         .collect()
 }
@@ -326,10 +375,25 @@ mod tests {
         let args = get_args("https://slack.com/api/auth.test");
         assert_eq!(
             args,
-            vec!["--silent", "--show-error", "--config", "-", "https://slack.com/api/auth.test"]
+            vec![
+                "--silent",
+                "--show-error",
+                "--write-out",
+                WRITE_OUT,
+                "--config",
+                "-",
+                "https://slack.com/api/auth.test"
+            ]
         );
         assert!(!args.iter().any(|a| a.contains("Bearer") || a.contains("Authorization")));
         assert!(!args.contains(&"--fail")); // module doc: --fail is deliberately absent
+    }
+
+    #[test]
+    fn get_args_appends_the_retry_after_write_out_trailer() {
+        let args = get_args("https://slack.com/api/auth.test");
+        assert!(args.contains(&"--write-out"));
+        assert!(args.contains(&"\n%{http_code} %header{retry-after}"));
     }
 
     #[test]
@@ -338,6 +402,7 @@ mod tests {
         assert!(args.contains(&"--request"));
         assert!(args.contains(&"POST"));
         assert!(!args.iter().any(|a| a.contains("Bearer")));
+        assert!(args.contains(&"--write-out")); // same trailer parsing as get_args
     }
 
     #[test]
@@ -371,25 +436,79 @@ mod tests {
     #[test]
     fn check_ok_passes_through_a_true_ok_response() {
         let v = serde_json::json!({"ok": true, "user_id": "U1"});
-        assert_eq!(check_ok(v.clone()).unwrap(), v);
+        assert_eq!(check_ok(v.clone(), None).unwrap(), v);
     }
 
     #[test]
     fn check_ok_maps_a_named_slack_error() {
         let v = serde_json::json!({"ok": false, "error": "invalid_auth"});
-        assert_eq!(check_ok(v).unwrap_err(), RestError::SlackError("invalid_auth".to_string()));
+        assert_eq!(
+            check_ok(v, None).unwrap_err(),
+            RestError::SlackError("invalid_auth".to_string())
+        );
     }
 
     #[test]
-    fn check_ok_maps_ratelimited_to_a_fixed_thirty_second_backoff() {
+    fn check_ok_maps_ratelimited_with_no_trailer_to_the_thirty_second_default() {
         let v = serde_json::json!({"ok": false, "error": "ratelimited"});
-        assert_eq!(check_ok(v).unwrap_err(), RestError::RateLimited(30));
+        assert_eq!(check_ok(v, None).unwrap_err(), RestError::RateLimited(30));
+    }
+
+    #[test]
+    fn check_ok_a_429_trailer_with_no_ratelimited_body_error_still_rate_limits() {
+        let v = serde_json::json!({"ok": false, "error": "unknown_error"});
+        assert_eq!(check_ok(v, Some((429, Some(12)))).unwrap_err(), RestError::RateLimited(12));
     }
 
     #[test]
     fn parse_response_surfaces_invalid_json_as_other() {
         let err = parse_response("not json").unwrap_err();
         assert!(matches!(err, RestError::Other(_)));
+    }
+
+    // ---- write-out trailer parsing (spec's four cases) ---------------------------------------
+
+    #[test]
+    fn trailer_429_with_retry_after_header_carries_the_real_seconds() {
+        let out = "{\"ok\":false,\"error\":\"ratelimited\"}\n429 42";
+        assert_eq!(parse_response(out).unwrap_err(), RestError::RateLimited(42));
+    }
+
+    #[test]
+    fn trailer_429_without_retry_after_header_defaults_to_thirty() {
+        let out = "{\"ok\":false,\"error\":\"ratelimited\"}\n429 ";
+        assert_eq!(parse_response(out).unwrap_err(), RestError::RateLimited(30));
+    }
+
+    #[test]
+    fn trailer_absent_entirely_degrades_to_legacy_whole_output_as_body() {
+        // Older curl (< 7.83): no `%header{}` support, so no trailer line is appended at all —
+        // the whole output is the body, exactly as it was before this trailer existed.
+        let out = "{\"ok\":true,\"user_id\":\"U1\"}";
+        let v = parse_response(out).unwrap();
+        assert_eq!(v["user_id"].as_str(), Some("U1"));
+    }
+
+    #[test]
+    fn trailer_absent_ratelimited_body_still_gets_the_legacy_thirty_second_default() {
+        let out = "{\"ok\":false,\"error\":\"ratelimited\"}";
+        assert_eq!(parse_response(out).unwrap_err(), RestError::RateLimited(30));
+    }
+
+    #[test]
+    fn body_says_ratelimited_even_when_the_trailer_status_is_not_429() {
+        // Module doc: Slack answers 200 even on failure; the trailer's status is not the only
+        // signal a rate limit happened.
+        let out = "{\"ok\":false,\"error\":\"ratelimited\"}\n200 7";
+        assert_eq!(parse_response(out).unwrap_err(), RestError::RateLimited(7));
+    }
+
+    #[test]
+    fn split_trailer_handles_the_four_cases() {
+        assert_eq!(split_trailer("body\n429 30"), ("body", Some((429, Some(30)))));
+        assert_eq!(split_trailer("body\n429 "), ("body", Some((429, None))));
+        assert_eq!(split_trailer("body"), ("body", None));
+        assert_eq!(split_trailer("body\n200 "), ("body", Some((200, None))));
     }
 
     // ---- conversations.list ---------------------------------------------------------------
@@ -413,20 +532,35 @@ mod tests {
         assert_eq!(convs.len(), 4);
         assert_eq!(
             convs[0],
-            Conversation { id: "C1".into(), name: "general".into(), kind: ConvKind::Channel }
+            Conversation {
+                id: "C1".into(),
+                name: "general".into(),
+                kind: ConvKind::Channel,
+                updated: None
+            }
         );
         assert_eq!(
             convs[1],
-            Conversation { id: "G1".into(), name: "priv-team".into(), kind: ConvKind::Group }
+            Conversation {
+                id: "G1".into(),
+                name: "priv-team".into(),
+                kind: ConvKind::Group,
+                updated: None
+            }
         );
         // The IM's "name" is the counterpart user id, resolved to a display name later.
         assert_eq!(
             convs[2],
-            Conversation { id: "D1".into(), name: "U42".into(), kind: ConvKind::Im }
+            Conversation { id: "D1".into(), name: "U42".into(), kind: ConvKind::Im, updated: None }
         );
         assert_eq!(
             convs[3],
-            Conversation { id: "M1".into(), name: "mpdm-a-b-1".into(), kind: ConvKind::Mpim }
+            Conversation {
+                id: "M1".into(),
+                name: "mpdm-a-b-1".into(),
+                kind: ConvKind::Mpim,
+                updated: None
+            }
         );
     }
 
@@ -434,6 +568,19 @@ mod tests {
     fn parse_conversations_skips_entries_missing_an_id() {
         let v = serde_json::json!({"channels": [{"name": "no-id"}]});
         assert!(parse_conversations(&v).is_empty());
+    }
+
+    #[test]
+    fn parse_conversations_reads_updated_when_present_and_none_when_absent() {
+        let v = serde_json::json!({
+            "channels": [
+                {"id": "D1", "user": "U1", "is_im": true, "updated": 1_752_300_000_000_u64},
+                {"id": "D2", "user": "U2", "is_im": true}
+            ]
+        });
+        let convs = parse_conversations(&v);
+        assert_eq!(convs[0].updated, Some(1_752_300_000_000));
+        assert_eq!(convs[1].updated, None);
     }
 
     #[test]

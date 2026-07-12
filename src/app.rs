@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::config::PluginConfig;
 use crate::entities::{self, is_mention};
-use crate::model::{ConvKind, Conversation, Message, ts_cmp, ts_key};
+use crate::model::{ConvKind, Conversation, Message, resolve_channels, ts_cmp, ts_key};
 use crate::rest::{Rest, RestError};
 use crate::socket::SocketEvent;
 use crate::tokens::Tokens;
@@ -162,11 +162,21 @@ impl App {
     pub fn build(config: PluginConfig, _tokens: &Tokens, rest: &Rest) -> Result<App, String> {
         let all_convs = crate::rest::list_conversations(rest)
             .map_err(|e| format!("list_conversations failed: {e:?}"))?;
-        let selected = resolve_channels(config.channels(), config.dms(), &all_convs)?;
+        let selected =
+            resolve_channels(config.channels(), config.dms(), config.dm_limit(), &all_convs)?;
 
         let self_id =
             crate::rest::auth_self(rest).map_err(|e| format!("auth_self failed: {e:?}"))?;
-        let users = crate::rest::users(rest).map_err(|e| format!("users failed: {e:?}"))?;
+        // The pane always runs inside herdr, which always sets `HERDR_PLUGIN_STATE_DIR` (like
+        // `HERDR_PLUGIN_CONFIG_DIR`); no home-dir fallback is needed here (that's the CLI's
+        // standalone-invocation concern — see `cli::scan`).
+        let state_dir = crate::users_cache::state_dir(|n| std::env::var(n).ok(), || None);
+        let users = crate::users_cache::users_cached(
+            rest,
+            state_dir.as_deref(),
+            crate::users_cache::now_secs(),
+        )
+        .map_err(|e| format!("users failed: {e:?}"))?;
         let user_names: HashMap<String, String> = users.into_iter().collect();
         let selected = resolve_im_names(selected, &user_names);
 
@@ -769,33 +779,6 @@ fn poll_error_status(conv_name: &str, error: &RestError) -> String {
     }
 }
 
-/// Resolve configured channel names (e.g. `"#eng-infra"`) to their `Conversation`s among
-/// `all`, matching only `Channel`/`Group` kinds; an unresolved name is an error naming it
-/// (per the design doc: "A configured channel name that resolves to nothing is an error
-/// naming the channel"). When `dms` is true, every `Im`/`Mpim` conversation in `all` is
-/// included wholesale — DMs are subscribed as a class, not named individually in config.
-fn resolve_channels(
-    config_channels: &[String],
-    dms: bool,
-    all: &[Conversation],
-) -> Result<Vec<Conversation>, String> {
-    let mut out = Vec::with_capacity(config_channels.len());
-    for wanted in config_channels {
-        let name = wanted.strip_prefix('#').unwrap_or(wanted.as_str());
-        let found = all
-            .iter()
-            .find(|c| c.name == name && matches!(c.kind, ConvKind::Channel | ConvKind::Group));
-        match found {
-            Some(c) => out.push(c.clone()),
-            None => return Err(format!("unknown channel: {wanted}")),
-        }
-    }
-    if dms {
-        out.extend(all.iter().filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim)).cloned());
-    }
-    Ok(out)
-}
-
 /// Resolve each `Im` conversation's display name: `conversations.list` sets an IM's `name` to
 /// its counterpart user id (rest.rs's `parse_conversations` doc), not a display name, so it is
 /// looked up in the `users.list` cache here — falling back to the raw id if the user is
@@ -822,8 +805,7 @@ fn resolve_im_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, RowKind, SelKind, Tab, apply_backfill, poll_error_status, resolve_channels,
-        resolve_im_names, ts_to_hhmm,
+        App, RowKind, SelKind, Tab, apply_backfill, poll_error_status, resolve_im_names, ts_to_hhmm,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -832,7 +814,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
-        Conversation { id: id.into(), name: name.into(), kind }
+        Conversation { id: id.into(), name: name.into(), kind, updated: None }
     }
 
     fn msg(conv: &str, ts: &str, thread_ts: Option<&str>, author: &str, text: &str) -> Message {
@@ -1330,42 +1312,7 @@ mod tests {
         assert_eq!(app.unread_mentions(), 0);
     }
 
-    // ---- resolve_channels ---------------------------------------------------------------------
-
-    #[test]
-    fn resolve_channels_matches_by_name_stripping_the_hash() {
-        let all = vec![
-            conv("C1", "eng-infra", ConvKind::Channel),
-            conv("C2", "releases", ConvKind::Channel),
-        ];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, &all).unwrap();
-        assert_eq!(resolved, vec![conv("C1", "eng-infra", ConvKind::Channel)]);
-    }
-
-    #[test]
-    fn resolve_channels_errors_naming_an_unknown_channel() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel)];
-        let error = resolve_channels(&["#nope".to_string()], false, &all).unwrap_err();
-        assert!(error.contains("#nope"), "{error}");
-    }
-
-    #[test]
-    fn resolve_channels_includes_all_dms_when_enabled() {
-        let all = vec![
-            conv("C1", "eng-infra", ConvKind::Channel),
-            conv("D1", "U9", ConvKind::Im),
-            conv("M1", "mpdm-a-b", ConvKind::Mpim),
-        ];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], true, &all).unwrap();
-        assert_eq!(resolved.len(), 3);
-    }
-
-    #[test]
-    fn resolve_channels_excludes_dms_when_disabled() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel), conv("D1", "U9", ConvKind::Im)];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, &all).unwrap();
-        assert_eq!(resolved.len(), 1);
-    }
+    // ---- resolve_channels: see `crate::model`'s tests (moved there — dedup, task 1) --------
 
     // ---- resolve_im_names -----------------------------------------------------------------
 
