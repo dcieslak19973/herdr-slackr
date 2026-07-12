@@ -228,8 +228,17 @@ fn split_trailer(out: &str) -> (&str, Option<Trailer>) {
 /// Split the write-out trailer off `out`, parse the remaining body as JSON, and apply
 /// [`check_ok`]. Split from `check_ok` so the ok/error decision is pure and fixture-testable
 /// without a JSON parse in the way.
+///
+/// The trailer is consulted *before* the JSON parse: a corporate-proxy/WAF 429 typically comes
+/// back with an HTML (non-JSON) body, and the trailer's HTTP status is authoritative regardless
+/// of what the body contains. Deferring to the JSON parse first would surface that as
+/// `Other("invalid JSON...")` instead of the `RateLimited` the caller needs to back off on.
 fn parse_response(out: &str) -> Result<Value, RestError> {
     let (body, trailer) = split_trailer(out);
+    if trailer.is_some_and(|(code, _)| code == 429) {
+        let secs = trailer.and_then(|(_, retry_after)| retry_after).unwrap_or(30);
+        return Err(RestError::RateLimited(secs));
+    }
     let v: Value =
         serde_json::from_str(body).map_err(|e| RestError::Other(format!("invalid JSON: {e}")))?;
     check_ok(v, trailer)
@@ -509,6 +518,28 @@ mod tests {
         assert_eq!(split_trailer("body\n429 "), ("body", Some((429, None))));
         assert_eq!(split_trailer("body"), ("body", None));
         assert_eq!(split_trailer("body\n200 "), ("body", Some((200, None))));
+    }
+
+    #[test]
+    fn a_429_trailer_rate_limits_even_when_the_body_is_not_json() {
+        // A corporate-proxy/WAF 429 typically returns an HTML body, not Slack's JSON envelope.
+        // The trailer must be consulted before the JSON parse is attempted, or this surfaces
+        // as `Other("invalid JSON...")` instead of the rate limit the caller needs to react to.
+        let out = "<html>Too Many Requests</html>\n429 17";
+        assert_eq!(parse_response(out).unwrap_err(), RestError::RateLimited(17));
+    }
+
+    #[test]
+    fn a_429_trailer_without_retry_after_rate_limits_a_non_json_body_with_the_default() {
+        let out = "<html>Too Many Requests</html>\n429 ";
+        assert_eq!(parse_response(out).unwrap_err(), RestError::RateLimited(30));
+    }
+
+    #[test]
+    fn a_non_json_body_with_a_200_trailer_still_surfaces_as_invalid_json() {
+        let out = "<html>Too Many Requests</html>\n200 ";
+        let err = parse_response(out).unwrap_err();
+        assert!(matches!(err, RestError::Other(_)));
     }
 
     // ---- conversations.list ---------------------------------------------------------------

@@ -96,22 +96,29 @@ fn store(state_dir: &Path, users: &[(String, String)], now: u64) {
     }
 }
 
-/// The shared entry point pane build and every CLI invocation call instead of `rest::users`
-/// directly: serve `state_dir`'s cache when fresh, else fetch fresh from Slack and (best-effort)
-/// rewrite the cache for the next caller. `state_dir` is `None` when neither
-/// `HERDR_PLUGIN_STATE_DIR` nor a home directory could be resolved ([`state_dir`]'s own
-/// contract) — degrading to a per-process fetch with no cache read or write at all, same as
-/// before this cache existed.
-pub fn users_cached(
+/// The pure, network-free half of [`users_cached`]: `state_dir`'s on-disk cache when fresh,
+/// logging the hit. `None` on any miss — file absent, unreadable, malformed, stale, or
+/// `state_dir` itself unavailable — the uniform "go fetch" signal, same as [`load`]. Since this
+/// never touches the network, a caller may run it at any point relative to other network calls
+/// (unlike [`fetch_users`], which does) — `cli::scan` uses that to keep its cache check ahead of
+/// `auth_self` without breaking the "`auth_self` is the first network call" ordering.
+pub fn cached_users(state_dir: Option<&Path>, now: u64) -> Option<Vec<(String, String)>> {
+    let dir = state_dir?;
+    let users = load(dir, now)?;
+    crate::logln!("users_cache: hit ({} users, dir {})", users.len(), dir.display());
+    Some(users)
+}
+
+/// The network-touching half of [`users_cached`]: fetch `users.list` fresh and (best-effort)
+/// rewrite `state_dir`'s cache for the next caller. Callers that split the cache check out via
+/// [`cached_users`] must only reach this on a miss, and only once any network call that must
+/// come first (`cli::scan`'s `auth_self`) has already run.
+fn fetch_users(
     rest: &Rest,
     state_dir: Option<&Path>,
     now: u64,
 ) -> Result<Vec<(String, String)>, RestError> {
     if let Some(dir) = state_dir {
-        if let Some(users) = load(dir, now) {
-            crate::logln!("users_cache: hit ({} users, dir {})", users.len(), dir.display());
-            return Ok(users);
-        }
         crate::logln!("users_cache: miss/stale (dir {}); fetching users.list", dir.display());
     }
     let users = crate::rest::users(rest)?;
@@ -121,9 +128,28 @@ pub fn users_cached(
     Ok(users)
 }
 
+/// The shared entry point pane build and every CLI invocation call instead of `rest::users`
+/// directly: serve `state_dir`'s cache when fresh, else fetch fresh from Slack and (best-effort)
+/// rewrite the cache for the next caller. `state_dir` is `None` when neither
+/// `HERDR_PLUGIN_STATE_DIR` nor a home directory could be resolved ([`state_dir`]'s own
+/// contract) — degrading to a per-process fetch with no cache read or write at all, same as
+/// before this cache existed. A thin composition of [`cached_users`] then [`fetch_users`]; split
+/// out so a caller that needs to interleave the cache check with another network call (see
+/// `cli::scan`) can call those two directly instead.
+pub fn users_cached(
+    rest: &Rest,
+    state_dir: Option<&Path>,
+    now: u64,
+) -> Result<Vec<(String, String)>, RestError> {
+    if let Some(users) = cached_users(state_dir, now) {
+        return Ok(users);
+    }
+    fetch_users(rest, state_dir, now)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{load, now_secs, state_dir, store};
+    use super::{cached_users, load, now_secs, state_dir, store};
 
     // ---- state_dir --------------------------------------------------------------------------
 
@@ -194,6 +220,32 @@ mod tests {
         let users = vec![("U1".to_string(), "Alice".to_string())];
         store(&nested, &users, 1_000_000);
         assert_eq!(load(&nested, 1_000_060), Some(users));
+    }
+
+    // ---- cached_users (the pure, network-free seam `cli::scan` uses) -------------------------
+
+    #[test]
+    fn cached_users_hits_without_any_network_call_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let users = vec![("U1".to_string(), "Alice".to_string())];
+        let now = 1_000_000;
+        store(dir.path(), &users, now);
+        assert_eq!(cached_users(Some(dir.path()), now + 60), Some(users));
+    }
+
+    #[test]
+    fn cached_users_misses_when_state_dir_is_none() {
+        assert_eq!(cached_users(None, now_secs()), None);
+    }
+
+    #[test]
+    fn cached_users_misses_once_the_ttl_has_elapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let users = vec![("U1".to_string(), "Alice".to_string())];
+        let now = 1_000_000;
+        store(dir.path(), &users, now);
+        let past_ttl = now + super::TTL_SECS + 1;
+        assert_eq!(cached_users(Some(dir.path()), past_ttl), None);
     }
 
     #[cfg(unix)]

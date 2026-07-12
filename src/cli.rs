@@ -183,24 +183,32 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
     let cancelled = AtomicBool::new(false);
     let rest = Rest { user_token: &tokens.user, cancelled: &cancelled };
 
-    // Checked first, ahead of any network call: a fresh on-disk cache answers `users.list`
-    // without ever touching the network, so this must not wait on `auth_self`/`list_conversations`
-    // succeeding first (see `crate::users_cache`).
+    // Error-priority contract: `auth_self` is the first *network* call on every scan — a cheap
+    // identity check, so a bad/expired token surfaces as a clean `invalid_auth` before any other
+    // call has a chance to fail first with a less specific error. The users cache's on-disk read
+    // (`cached_users`) is checked before that, since it never touches the network and so can't
+    // violate the ordering — a fresh cache answers `users.list` without ever needing `auth_self`
+    // to have run. Only on a cache miss does fetching `users.list` (`users_cached`'s network
+    // fallback) happen, and only after `auth_self` has already succeeded. `list_conversations`
+    // runs last.
+    let now = crate::users_cache::now_secs();
     let state_dir = crate::users_cache::state_dir(real_env, real_home);
-    let users = match crate::users_cache::users_cached(
-        &rest,
-        state_dir.as_deref(),
-        crate::users_cache::now_secs(),
-    ) {
-        Ok(v) => v,
-        Err(error) => return rest_fail(&error),
-    };
-    let user_names: HashMap<String, String> = users.into_iter().collect();
+    let cached_users = crate::users_cache::cached_users(state_dir.as_deref(), now);
 
     let self_id = match rest::auth_self(&rest) {
         Ok(id) => id,
         Err(error) => return rest_fail(&error),
     };
+
+    let users = match cached_users {
+        Some(v) => v,
+        None => match crate::users_cache::users_cached(&rest, state_dir.as_deref(), now) {
+            Ok(v) => v,
+            Err(error) => return rest_fail(&error),
+        },
+    };
+    let user_names: HashMap<String, String> = users.into_iter().collect();
+
     let all_convs = match rest::list_conversations(&rest) {
         Ok(v) => v,
         Err(error) => return rest_fail(&error),

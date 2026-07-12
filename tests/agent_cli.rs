@@ -105,10 +105,11 @@ fn seed_users_cache(state_dir: &Path) {
 
 /// The CLI reads a pre-seeded, fresh `users.json` from a fixture state dir (env-injected via
 /// `HERDR_PLUGIN_STATE_DIR`, same pattern as `HERDR_PLUGIN_CONFIG_DIR` above) instead of
-/// fetching `users.list` fresh. The cache check happens before any network call
-/// (`cli::scan` orders it ahead of `auth_self`/`list_conversations` for exactly this reason —
-/// see `src/cli.rs`), so the eventual REST failure from the fake token doesn't mask it: the
-/// state dir's `slackr.log` (enabled by the same env var) still records the cache hit.
+/// fetching `users.list` fresh. `cli::scan`'s error-priority contract puts `auth_self` first
+/// among *network* calls, but the on-disk cache check itself is pure and happens ahead of that
+/// (see `src/cli.rs`) — so a cache hit is logged, and the fake token still fails at `auth_self`
+/// right after, without ever needing `users.list`. The state dir's `slackr.log` (enabled by the
+/// same env var) records the hit regardless of that later REST failure.
 #[test]
 fn mentions_reads_a_pre_seeded_fresh_users_cache_instead_of_fetching() {
     let fixture = rest_fixture();
