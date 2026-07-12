@@ -25,10 +25,20 @@ const BASE: &str = "https://slack.com/api/";
 
 /// One REST session: the user token (`xoxp-...`) used for every Web API call in this module
 /// except [`connections_open`], and the cancellation flag shared with the rest of the fetch.
-#[derive(Debug)]
 pub struct Rest<'a> {
     pub user_token: &'a str,
     pub cancelled: &'a AtomicBool,
+}
+
+impl std::fmt::Debug for Rest<'_> {
+    /// Redacts `user_token`: never echo the bearer token, matching `tokens.rs`'s never-echo
+    /// discipline. Only the sentinel is rendered, regardless of the token's actual value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rest")
+            .field("user_token", &"<redacted>")
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
 }
 
 /// A classified REST failure.
@@ -328,6 +338,15 @@ mod tests {
         assert!(args.contains(&"--request"));
         assert!(args.contains(&"POST"));
         assert!(!args.iter().any(|a| a.contains("Bearer")));
+    }
+
+    #[test]
+    fn debug_format_redacts_the_bearer_token() {
+        let cancelled = AtomicBool::new(false);
+        let rest = Rest { user_token: "xoxp-super-secret-token", cancelled: &cancelled };
+        let debug = format!("{rest:?}");
+        assert!(!debug.contains("xoxp-super-secret-token"));
+        assert!(debug.contains("redacted"));
     }
 
     // ---- enc / query building ----------------------------------------------------------------
