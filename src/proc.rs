@@ -9,6 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+/// Whether `name` is a file in some directory on `$PATH` — used by `browser::open` to pick
+/// the first available platform URL opener. Copied from `herdr-reviewr`'s `src/proc.rs`.
+pub(crate) fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
 /// How a spawned tool run failed, before its stdout/stderr is classified by the caller.
 pub(crate) enum RunFail {
     /// The tool binary is not on `PATH`.

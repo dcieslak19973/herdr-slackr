@@ -11,6 +11,9 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    // The TUI event loop arrives in Task 7.
+    if let Err(error) = herdr_slackr::run() {
+        eprintln!("herdr-slackr: {error:#}");
+        return std::process::ExitCode::FAILURE;
+    }
     std::process::ExitCode::SUCCESS
 }

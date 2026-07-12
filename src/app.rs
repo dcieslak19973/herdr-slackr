@@ -207,6 +207,42 @@ impl App {
         Ok(app)
     }
 
+    /// A bare `App` with no subscribed conversations, built up by `apply`/`add_conversation`/
+    /// `add_user` instead of `build`'s REST calls. `build` is this module's only I/O edge (see
+    /// the module doc), so a caller that needs an `App` without touching the network — Task
+    /// 7's render tests are the only current caller — has no other way to get one.
+    pub fn empty(self_id: impl Into<String>) -> App {
+        App {
+            tab: Tab::Feed,
+            cursor: 0,
+            status: String::new(),
+            polling: false,
+            conversations: Vec::new(),
+            conv_names: HashMap::new(),
+            conv_kinds: HashMap::new(),
+            user_names: HashMap::new(),
+            messages: BTreeMap::new(),
+            expanded: HashSet::new(),
+            read_mentions: HashSet::new(),
+            selected: None,
+            self_id: self_id.into(),
+            keywords: Vec::new(),
+            arrival_seq: 0,
+            divider_mark: 0,
+        }
+    }
+
+    /// Register a conversation's display name and kind, for fixture setup (see `empty`).
+    pub fn add_conversation(&mut self, id: &str, name: &str, kind: ConvKind) {
+        self.conv_names.insert(id.to_string(), name.to_string());
+        self.conv_kinds.insert(id.to_string(), kind);
+    }
+
+    /// Register a user's display name, for fixture setup (see `empty`).
+    pub fn add_user(&mut self, id: &str, name: &str) {
+        self.user_names.insert(id.to_string(), name.to_string());
+    }
+
     /// Apply one socket event: insert a new message, replace an edited one in place, remove
     /// a deleted one, or update connection/status state. Mention detection is not done here
     /// — it is recomputed on demand by `mention_rows`/`unread_mentions` from the raw message,

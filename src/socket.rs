@@ -266,6 +266,13 @@ fn connect_and_pump_inner(
             continue;
         };
         let (events, ack) = handle_frame(&text);
+        if events.is_empty() {
+            // Unknown/unparseable envelope, or one whose payload had nothing usable — acked
+            // (if it carried an envelope_id) and skipped, never a crash. Logged per spec
+            // §Error handling; a no-op unless HERDR_PLUGIN_STATE_DIR is set (see `crate::log`).
+            let preview: String = text.chars().take(200).collect();
+            crate::logln!("socket: skipped frame with no mapped events: {preview}");
+        }
         if events.iter().any(|e| matches!(e, SocketEvent::Connected)) {
             *had_hello = true;
         }
