@@ -67,15 +67,35 @@ pub fn handle_frame(frame: &str) -> (Vec<SocketEvent>, Option<String>) {
 
 /// Map one `events_api` payload event to zero-or-one [`SocketEvent`]s, per the subtype rules
 /// in [`handle_frame`]'s doc comment.
+///
+/// Guard: a missing/garbage payload (no `channel`, or no usable `ts` for the subtype — the
+/// nested `message.ts` for `message_changed`, `deleted_ts` for `message_deleted`) yields no
+/// event at all rather than a phantom empty [`Message`]; the envelope is still acked (by
+/// `handle_frame`, since it still carries an `envelope_id`) so Slack does not redeliver it.
 fn events_api(event: &Value) -> Vec<SocketEvent> {
-    let conv = event["channel"].as_str().unwrap_or_default().to_string();
+    let conv = event["channel"].as_str().unwrap_or_default();
+    if conv.is_empty() {
+        return Vec::new();
+    }
+    let conv = conv.to_string();
     match event["subtype"].as_str() {
-        None | Some("bot_message") => vec![SocketEvent::Message(message_from(event, &conv))],
+        None | Some("bot_message") => {
+            if event["ts"].as_str().unwrap_or_default().is_empty() {
+                return Vec::new();
+            }
+            vec![SocketEvent::Message(message_from(event, &conv))]
+        }
         Some("message_changed") => {
+            if event["message"]["ts"].as_str().unwrap_or_default().is_empty() {
+                return Vec::new();
+            }
             vec![SocketEvent::Changed(message_from(&event["message"], &conv))]
         }
         Some("message_deleted") => {
             let ts = event["deleted_ts"].as_str().unwrap_or_default().to_string();
+            if ts.is_empty() {
+                return Vec::new();
+            }
             vec![SocketEvent::Deleted { conv, ts }]
         }
         Some(_) => Vec::new(),
@@ -85,12 +105,18 @@ fn events_api(event: &Value) -> Vec<SocketEvent> {
 /// Build a [`Message`] from one event-shaped JSON object (top-level `events_api` event, or
 /// the nested `message` object of a `message_changed`), using `conv` as the conversation id
 /// (the envelope's `channel`, not necessarily present on the nested object).
+///
+/// `author` is `user` if present, else `bot_id` (Slack's `bot_message` events usually carry
+/// `bot_id` and no `user`), else empty.
 fn message_from(v: &Value, conv: &str) -> Message {
+    let user = v["user"].as_str().filter(|s| !s.is_empty());
+    let bot_id = v["bot_id"].as_str().filter(|s| !s.is_empty());
+    let author = user.or(bot_id).unwrap_or_default().to_string();
     Message {
         conv: conv.to_string(),
         ts: v["ts"].as_str().unwrap_or_default().to_string(),
         thread_ts: v["thread_ts"].as_str().map(str::to_string),
-        author: v["user"].as_str().unwrap_or_default().to_string(),
+        author,
         text: v["text"].as_str().unwrap_or_default().to_string(),
         edited: !v["edited"].is_null(),
     }
@@ -141,19 +167,31 @@ pub fn backoff_secs(attempt: u32, jitter: impl Fn(u64) -> u64) -> u64 {
 pub fn run(app_token: String, tx: Sender<SocketEvent>, cancelled: Arc<AtomicBool>) {
     let mut attempt: u32 = 0;
     while !cancelled.load(Ordering::Acquire) {
-        match connect_and_pump(&app_token, &tx, &cancelled) {
-            Ok(()) => {}
-            Err(reason) => {
-                let _ = tx.send(SocketEvent::Down(reason));
-            }
+        let (result, had_hello) = connect_and_pump(&app_token, &tx, &cancelled);
+        if let Err(reason) = result {
+            let _ = tx.send(SocketEvent::Down(reason));
         }
         if cancelled.load(Ordering::Acquire) {
             return;
         }
+        if had_hello {
+            attempt = 0;
+        }
         let secs = backoff_secs(attempt, default_jitter);
-        attempt = attempt.saturating_add(1);
+        attempt = next_attempt(attempt, had_hello);
         std::thread::sleep(Duration::from_secs(secs));
     }
+}
+
+/// The attempt counter to carry into the *next* round, given whether the connection that just
+/// ended produced a successful `hello` at any point. A `hello` means the session was healthy,
+/// so the backoff schedule resets to 0 — this covers both a clean disconnect after a healthy
+/// session (reviewer note: should restart promptly, not from the escalated attempt count) and
+/// any subsequent failure starting its own fresh doubling schedule. No `hello` means the
+/// connection never came up, so the schedule keeps escalating.
+#[must_use]
+fn next_attempt(prev: u32, had_hello: bool) -> u32 {
+    if had_hello { 0 } else { prev.saturating_add(1) }
 }
 
 /// `±25%` jitter around `base`, used by [`run`]'s real reconnect schedule (tests pin their own
@@ -171,11 +209,35 @@ fn default_jitter(base: u64) -> u64 {
 
 /// One connect-and-pump cycle: open a fresh socket URL, TLS-handshake, WebSocket-handshake,
 /// then loop reading frames through [`handle_frame`] until `disconnect`, an error, or
-/// `cancelled`. Returns `Ok(())` on a clean `disconnect`/cancel, `Err(reason)` on any failure.
+/// `cancelled`.
+///
+/// Returns `(Ok(()), had_hello)` on a clean `disconnect`/cancel, `(Err(reason), had_hello)` on
+/// any failure, where `had_hello` is whether this connection ever received a `hello` frame
+/// (regardless of how the cycle ended) — [`run`] uses it to reset the backoff schedule, since
+/// a `hello` means the session was healthy at least for a while.
+///
+/// The underlying TCP read has a 30s timeout (set in [`connect_tls`]); Slack pings far more
+/// often than that on a healthy socket, so the timeout firing means true silence, not a slow
+/// but live connection. On timeout the loop just re-checks `cancelled` and reads again — it is
+/// not treated as connection death — which is what lets `cancelled` actually interrupt a
+/// blocked read in a timely fashion instead of waiting out an indefinitely silent socket.
 fn connect_and_pump(
     app_token: &str,
     tx: &Sender<SocketEvent>,
     cancelled: &AtomicBool,
+) -> (Result<(), String>, bool) {
+    let mut had_hello = false;
+    match connect_and_pump_inner(app_token, tx, cancelled, &mut had_hello) {
+        Ok(()) => (Ok(()), had_hello),
+        Err(reason) => (Err(reason), had_hello),
+    }
+}
+
+fn connect_and_pump_inner(
+    app_token: &str,
+    tx: &Sender<SocketEvent>,
+    cancelled: &AtomicBool,
+    had_hello: &mut bool,
 ) -> Result<(), String> {
     let url = crate::rest::connections_open(app_token, cancelled)
         .map_err(|e| format!("connections_open failed: {e:?}"))?;
@@ -187,11 +249,26 @@ fn connect_and_pump(
         if cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
-        let msg = ws.read().map_err(|e| format!("read failed: {e}"))?;
+        let msg = match ws.read() {
+            Ok(msg) => msg,
+            Err(tungstenite::Error::Io(ref e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Read timeout tick, not a dead connection: loop back to the cancelled check.
+                continue;
+            }
+            Err(e) => return Err(format!("read failed: {e}")),
+        };
         let tungstenite::Message::Text(text) = msg else {
             continue;
         };
         let (events, ack) = handle_frame(&text);
+        if events.iter().any(|e| matches!(e, SocketEvent::Connected)) {
+            *had_hello = true;
+        }
         let is_down = events.iter().any(|e| matches!(e, SocketEvent::Down(_)));
         for event in events {
             let _ = tx.send(event);
@@ -211,6 +288,10 @@ fn connect_and_pump(
 /// Build the `Read + Write` TLS stream `tungstenite::client_with_config` handshakes over: a
 /// plain TCP connection to `url`'s host on 443, wrapped in a `rustls::ClientConnection` — see
 /// [`run`]'s doc comment for why the root store mixes native + webpki-roots certs.
+///
+/// The TCP stream gets a 30s read timeout so a silent connection can't block `ws.read()`
+/// forever — see [`connect_and_pump`]'s doc comment for how the read loop treats a timeout as
+/// a tick to re-check `cancelled`, not as connection death.
 fn connect_tls(
     url: &str,
 ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
@@ -230,6 +311,8 @@ fn connect_tls(
         .map_err(|e| format!("tls setup failed: {e}"))?;
     let sock =
         TcpStream::connect((host.as_str(), 443)).map_err(|e| format!("tcp connect failed: {e}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| format!("set_read_timeout failed: {e}"))?;
     Ok(rustls::StreamOwned::new(conn, sock))
 }
 
@@ -281,10 +364,50 @@ mod tests {
     #[test]
     fn events_api_bot_message_maps_to_message_too() {
         let frame = r#"{"envelope_id":"y","type":"events_api","payload":{"event":
-            {"type":"message","subtype":"bot_message","channel":"C1","ts":"1.2","text":"hi"}}}"#;
+            {"type":"message","subtype":"bot_message","channel":"C1","ts":"1.2","text":"hi",
+             "bot_id":"B1"}}}"#;
         let (events, ack) = handle_frame(frame);
-        assert!(matches!(events.as_slice(), [SocketEvent::Message(_)]));
+        match events.as_slice() {
+            [SocketEvent::Message(m)] => assert_eq!(m.author, "B1"),
+            other => panic!("expected one Message event, got {other:?}"),
+        }
         assert_eq!(ack, Some("y".to_string()));
+    }
+
+    // ---- handle_frame: events_api / missing or unusable payload ----------------------------
+
+    #[test]
+    fn events_api_missing_payload_yields_no_events_but_still_acks() {
+        let (events, ack) = handle_frame(r#"{"envelope_id":"g","type":"events_api","payload":{}}"#);
+        assert!(events.is_empty());
+        assert_eq!(ack, Some("g".to_string()));
+    }
+
+    #[test]
+    fn events_api_event_missing_channel_yields_no_events_but_still_acks() {
+        let frame = r#"{"envelope_id":"h","type":"events_api","payload":{"event":
+            {"type":"message","ts":"1.2","user":"U1","text":"hi"}}}"#;
+        let (events, ack) = handle_frame(frame);
+        assert!(events.is_empty());
+        assert_eq!(ack, Some("h".to_string()));
+    }
+
+    #[test]
+    fn events_api_event_missing_ts_yields_no_events_but_still_acks() {
+        let frame = r#"{"envelope_id":"i","type":"events_api","payload":{"event":
+            {"type":"message","channel":"C1","user":"U1","text":"hi"}}}"#;
+        let (events, ack) = handle_frame(frame);
+        assert!(events.is_empty());
+        assert_eq!(ack, Some("i".to_string()));
+    }
+
+    #[test]
+    fn events_api_message_deleted_missing_deleted_ts_yields_no_events_but_still_acks() {
+        let frame = r#"{"envelope_id":"j","type":"events_api","payload":{"event":
+            {"type":"message","subtype":"message_deleted","channel":"C1"}}}"#;
+        let (events, ack) = handle_frame(frame);
+        assert!(events.is_empty());
+        assert_eq!(ack, Some("j".to_string()));
     }
 
     #[test]
@@ -363,6 +486,20 @@ mod tests {
     #[test]
     fn backoff_secs_applies_the_injected_jitter() {
         assert_eq!(backoff_secs(2, |b| b * 10), 40);
+    }
+
+    // ---- next_attempt -------------------------------------------------------------------------
+
+    #[test]
+    fn next_attempt_increments_when_no_hello_was_seen() {
+        assert_eq!(next_attempt(0, false), 1);
+        assert_eq!(next_attempt(4, false), 5);
+    }
+
+    #[test]
+    fn next_attempt_resets_to_zero_once_hello_was_seen() {
+        assert_eq!(next_attempt(0, true), 0);
+        assert_eq!(next_attempt(7, true), 0);
     }
 
     // ---- url::host_from_wss -------------------------------------------------------------------
