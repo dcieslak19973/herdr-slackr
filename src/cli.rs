@@ -184,15 +184,15 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
 
     let self_id = match rest::auth_self(&rest) {
         Ok(id) => id,
-        Err(error) => return rest_fail(error),
+        Err(error) => return rest_fail(&error),
     };
     let all_convs = match rest::list_conversations(&rest) {
         Ok(v) => v,
-        Err(error) => return rest_fail(error),
+        Err(error) => return rest_fail(&error),
     };
     let users = match rest::users(&rest) {
         Ok(v) => v,
-        Err(error) => return rest_fail(error),
+        Err(error) => return rest_fail(&error),
     };
     let user_names: HashMap<String, String> = users.into_iter().collect();
 
@@ -220,10 +220,18 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
         selected.iter().map(|c| (c.id.clone(), c.kind)).collect();
 
     let mut msgs = Vec::new();
-    for conv in &selected {
+    let total = selected.len();
+    let mut partial_note = None;
+    for (scanned, conv) in selected.iter().enumerate() {
         match rest::history(&rest, &conv.id, HISTORY_LIMIT) {
             Ok(v) => msgs.extend(v),
-            Err(error) => return rest_fail(error),
+            Err(error) => match scan_outcome(scanned, total, &error) {
+                ScanOutcome::HardFail => return rest_fail(&error),
+                ScanOutcome::Partial(note) => {
+                    partial_note = Some(note);
+                    break;
+                }
+            },
         }
     }
 
@@ -240,6 +248,9 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
     } else {
         print_human(&rows, &conv_names, &conv_kinds, &user_names);
     }
+    if let Some(note) = partial_note {
+        eprintln!("{note}");
+    }
     ExitCode::SUCCESS
 }
 
@@ -250,16 +261,46 @@ fn fail(message: &str) -> ExitCode {
 
 /// `RestError` → exit 1: a rate limit gets the fixed remedy line the spec pins, everything
 /// else prints the classified detail (Slack's own error name for `SlackError`).
-fn rest_fail(error: RestError) -> ExitCode {
-    match error {
-        RestError::RateLimited(secs) => {
-            eprintln!("slackr: slack rate limit — retry in {secs}s");
-        }
-        RestError::SlackError(name) => eprintln!("slackr: {name}"),
-        RestError::NoCurl => eprintln!("slackr: curl not found on PATH"),
-        RestError::Other(detail) => eprintln!("slackr: {detail}"),
-    }
+fn rest_fail(error: &RestError) -> ExitCode {
+    eprintln!("slackr: {}", rest_error_summary(error));
     ExitCode::from(1)
+}
+
+/// The one-line classification of a `RestError` shared by `rest_fail` (hard failure) and
+/// `scan_outcome` (partial-results note): the rate-limit remedy line the spec pins, or Slack's
+/// own error name/detail otherwise.
+fn rest_error_summary(error: &RestError) -> String {
+    match error {
+        RestError::RateLimited(secs) => format!("slack rate limit — retry in {secs}s"),
+        RestError::SlackError(name) => name.clone(),
+        RestError::NoCurl => "curl not found on PATH".to_string(),
+        RestError::Other(detail) => detail.clone(),
+    }
+}
+
+/// The scan loop's decision on a mid-scan `history()` failure (maintainer decision: partial
+/// results beat discarding work already fetched, mirroring `app.rs::poll_tick`'s per-tick
+/// graceful degradation). `scanned` conversations already succeeded before this failure, out of
+/// `total` selected: zero scanned means the very first conversation failed, so there is nothing
+/// to show — a hard failure, same as the pre-fix behavior. Otherwise the loop stops here but
+/// keeps what it has: the caller prints the rows already collected as normal, then this one
+/// stderr note. Pure — no I/O — so the branch and wording are unit-tested without a REST call.
+enum ScanOutcome {
+    /// Print rows normally, then this one `slackr: partial results — …` stderr line; exit 0.
+    Partial(String),
+    /// Discard everything (there is nothing to keep); `rest_fail`'s line, no stdout, exit 1.
+    HardFail,
+}
+
+fn scan_outcome(scanned: usize, total: usize, error: &RestError) -> ScanOutcome {
+    if scanned == 0 {
+        ScanOutcome::HardFail
+    } else {
+        ScanOutcome::Partial(format!(
+            "slackr: partial results — {} after {scanned}/{total} conversations",
+            rest_error_summary(error)
+        ))
+    }
 }
 
 /// Filter `msgs` to the ones that fire [`is_mention`] (using `kinds` to look up each message's
@@ -725,6 +766,42 @@ mod tests {
     #[test]
     fn ts_to_hhmm_malformed_input_renders_midnight() {
         assert_eq!(ts_to_hhmm("garbage"), "00:00");
+    }
+
+    // ---- scan_outcome (partial-results decision) ---------------------------------------------
+
+    #[test]
+    fn scan_outcome_is_partial_when_at_least_one_conversation_already_scanned() {
+        let outcome = scan_outcome(2, 5, &RestError::SlackError("channel_not_found".to_string()));
+        match outcome {
+            ScanOutcome::Partial(note) => {
+                assert_eq!(
+                    note,
+                    "slackr: partial results — channel_not_found after 2/5 conversations"
+                );
+            }
+            ScanOutcome::HardFail => panic!("expected Partial, got HardFail"),
+        }
+    }
+
+    #[test]
+    fn scan_outcome_is_partial_with_rate_limit_wording() {
+        let outcome = scan_outcome(1, 3, &RestError::RateLimited(30));
+        match outcome {
+            ScanOutcome::Partial(note) => {
+                assert_eq!(
+                    note,
+                    "slackr: partial results — slack rate limit — retry in 30s after 1/3 conversations"
+                );
+            }
+            ScanOutcome::HardFail => panic!("expected Partial, got HardFail"),
+        }
+    }
+
+    #[test]
+    fn scan_outcome_is_hard_fail_when_the_first_conversation_fails() {
+        let outcome = scan_outcome(0, 5, &RestError::SlackError("channel_not_found".to_string()));
+        assert!(matches!(outcome, ScanOutcome::HardFail));
     }
 
     // ---- owns -----------------------------------------------------------------------------------

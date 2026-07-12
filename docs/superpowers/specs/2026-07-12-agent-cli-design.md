@@ -42,6 +42,11 @@ herdr-slackr skill-install [--target <dir> | --project] [--copy] [--force]
   `skills/herdr-slackr/SKILL.md`, skill name `herdr-slackr`.
 - Errors and exit codes follow reviewr's CLI conventions (usage → 2, one-line
   `slackr: …` stderr → 1). Tokens never in argv/output (the existing rules).
+- Partial results: if a `mentions`/`feed` scan's per-conversation history fetch fails after at
+  least one earlier conversation already succeeded, the scan stops there and prints the rows
+  already collected (exit 0) plus one `slackr: partial results — … after n/total conversations`
+  stderr note, rather than discarding them (exit 1 still applies when the first conversation is
+  the one that fails).
 
 ## Skill
 
