@@ -191,6 +191,88 @@ Slack's servers) — it's covered here instead, by hand, before each release:
 5. **Restore the network.** The socket should reconnect on its own; the status line clears and
    `polling` stops appearing within one backoff interval.
 
+## Working with agents
+
+The pane is for you to watch. Your coding agent gets its own read-only view of the same Slack
+feed through subcommands on this same binary — `mentions` and `feed` — so it can check what
+needs you without you alt-tabbing to Slack. See
+[specs/agent-cli.md](specs/agent-cli.md) for the full CLI contract.
+
+### Install the skill
+
+The universal path works across harnesses — Claude Code, Gemini CLI, GitHub Copilot, OpenCode,
+Amp, Codex and more — via the [skills CLI](https://github.com/skills-sh/skills), verified working
+against this repo:
+
+```bash
+npx skills add dcieslak19973/herdr-slackr --skill herdr-slackr -g
+```
+
+`-g` installs globally (every harness's personal skills directory, e.g. `~/.claude/skills` for
+Claude Code); omit it to install per-project instead, into each harness's project-level directory
+in the current repo. Either way, once installed it's in every session's skill list: "check my
+Slack mentions" works with no `skill-path`/`load that skill` preamble.
+
+If you'd rather not use `npx`, `herdr-slackr` installs the skill itself, offline, from the
+already-installed plugin — no npm required. After `herdr plugin install`, the binary is available
+as `herdr-slackr` *if* `~/.local/bin` is on your `PATH` (`install.sh` links it there; see
+[Install](#install)):
+
+```bash
+herdr-slackr skill-install             # ~/.claude/skills/herdr-slackr (Claude Code, personal)
+herdr-slackr skill-install --project   # ./.agents/skills/herdr-slackr (universal, project-level)
+```
+
+If `~/.local/bin` isn't on `PATH`, skip the bare command and invoke the plugin action instead,
+which runs the same binary by its plugin-root path and needs no `PATH` entry:
+
+```bash
+herdr plugin action invoke skill-install --plugin dcieslak19973.slackr
+```
+
+`--project` installs into `.agents/skills/`, the location read by Gemini CLI, GitHub Copilot,
+OpenCode, Amp, Antigravity and others (Claude Code reads it too, via the skills ecosystem
+tooling; Codex and Cursor also read `.claude/skills/`). Commit that path and every agent session
+opened in the repo picks it up, no per-user install step at all. `--project` and `--target` are
+mutually exclusive.
+
+Variants, either mode: `--copy` installs a real file instead of a symlink (Windows falls back to
+this automatically, with a note on stderr); `--target <dir>` installs somewhere else entirely.
+Re-running is idempotent: an unchanged install prints `already installed at <path>` and exits 0. A
+conflicting file at the target exits 1 naming it; add `--force` to replace it.
+
+### Make it proactive (CLAUDE.md)
+
+Installing the skill covers "the agent knows how, once asked." It doesn't make the agent check
+Slack unprompted — for that, put this in your `CLAUDE.md` (loaded every session, unlike the skill
+list, which is only consulted when the agent decides it's relevant):
+
+```
+Slack triage happens via herdr-slackr — when the user asks about mentions or a
+channel, run `herdr-slackr mentions --json` / `herdr-slackr feed --channel …`.
+```
+
+`skill-install` prints this same snippet after a fresh install, as a copy-pasteable reminder.
+Without it, the most common failure mode is the agent simply not knowing slackr exists until you
+say so.
+
+### Reading the feed
+
+```bash
+herdr-slackr mentions --json          # @you, every DM/MPIM, and keyword hits, newest first
+herdr-slackr feed --channel "#eng-infra" --json   # recent history in one configured conversation
+```
+
+Both take `--limit <n>` (default 20). Human output (the default, no `--json`) renders
+`#chan  @author  HH:MM  text`; `--json` emits the raw message documents plus resolved
+conversation names, for an agent to parse. Every invocation is a fresh, independent Slack REST
+read — the CLI does not talk to a running pane — using the same config and token discovery as the
+pane (`$HERDR_PLUGIN_CONFIG_DIR`, else `~/.config/herdr/plugins/config/dcieslak19973.slackr/`).
+
+**READ-ONLY, always.** Neither subcommand ever posts, reacts, or marks anything read — same
+invariant as the pane. An agent that needs to reply does so through your Slack MCP integration
+(if configured) or by telling you to send it yourself; this CLI has no write path at all.
+
 ## Limitations
 
 This is a focused, young tool. Known constraints:
@@ -239,8 +321,12 @@ The living design lives in [`specs/`](specs/), one concept per doc, always curre
 - [specs/pane.md](specs/pane.md) — the Feed/Mentions UI: tabs, keys, markers, degraded states.
 - [specs/slack-host.md](specs/slack-host.md) — Socket Mode lifecycle, the ack contract, URL
   rotation, polling fallback, and the REST methods + scopes this pane uses.
+- [specs/agent-cli.md](specs/agent-cli.md) — the `mentions`/`feed`/`skill-path`/`skill-install`
+  CLI contract, config/token discovery outside herdr, and partial-results semantics.
 
-The original design proposal is [docs/superpowers/specs/2026-07-12-herdr-slackr-design.md](docs/superpowers/specs/2026-07-12-herdr-slackr-design.md).
+The original design proposals are
+[docs/superpowers/specs/2026-07-12-herdr-slackr-design.md](docs/superpowers/specs/2026-07-12-herdr-slackr-design.md)
+and [docs/superpowers/specs/2026-07-12-agent-cli-design.md](docs/superpowers/specs/2026-07-12-agent-cli-design.md).
 
 ## License
 
