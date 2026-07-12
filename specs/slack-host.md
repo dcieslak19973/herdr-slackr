@@ -63,7 +63,7 @@ Every method above is a read. Nothing in this pane calls a `chat.postMessage`/`r
 | #   | Always true                                                                                       |
 | --- | ---------------------------------------------------------------------------------------------------|
 | F1  | The app flips into polling mode the instant a `Down` event arrives — before any backoff cycle completes. |
-| F2  | The pane's `poll_tick` (a `conversations.history` re-fetch per subscribed conversation) does not start firing until the current down streak has outlived one full backoff cycle (the worker's own first retry interval), so a fast reconnect is not raced by an eager poll. |
+| F2  | The pane's `poll_tick` (an incremental, batched `conversations.history` scan — F7/F8) does not start firing until the current down streak has outlived one full backoff cycle (the worker's own first retry interval), so a fast reconnect is not raced by an eager poll. |
 | F3  | Once polling has started, it repeats every `poll_fallback_secs` until a `Connected` event clears the streak. |
 | F4  | A message seen via both the socket and a poll re-fetch appears exactly once — `(conv, ts)` identity dedups. |
 | F5  | A poll-delivered edit (re-fetched history carrying a since-edited message) still surfaces the edit, without moving the row's position in the unread divider's arrival order. |
