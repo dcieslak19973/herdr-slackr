@@ -7,4 +7,5 @@ pub mod entities;
 pub mod model;
 pub mod proc;
 pub mod rest;
+pub mod socket;
 pub mod tokens;
