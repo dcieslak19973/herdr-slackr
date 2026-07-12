@@ -1,0 +1,72 @@
+---
+Status: Current
+Created: 2026-07-12
+Last edited: 2026-07-12
+---
+
+# Configuration and tokens
+
+How herdr-slackr validates and applies `$HERDR_PLUGIN_CONFIG_DIR/config.toml` and `tokens.toml`.
+
+## Overview
+
+The plugin config is one typed value, read fresh at pane startup. A valid file may set any subset of the supported keys; `channels` is the only one with no default.
+
+```toml
+channels = ["#eng-infra", "#releases"]   # required
+dms = false                              # default true
+keywords = ["deploy", "oncall"]          # default []
+theme = "tokyo-night"                    # default "catppuccin"
+poll_fallback_secs = 45                  # default 30
+```
+
+| key                   | value                                                              |
+| ---------------------- | ------------------------------------------------------------------- |
+| `channels`            | required, non-empty array of `#`-prefixed channel names             |
+| `dms`                 | boolean; whether IMs/MPIMs are subscribed alongside `channels`       |
+| `keywords`            | array of strings; extra Mentions-tab triggers, matched case-insensitively as a substring |
+| `theme`               | a palette name (see below); an unrecognized name is a runtime warning, not a config error |
+| `poll_fallback_secs`  | integer in `5..=300`; seconds between polls while the socket is down |
+
+Tokens live in a separate file, `tokens.toml` in the same directory, or the environment:
+
+| token       | env var             | `tokens.toml` key | required prefix |
+| ------------ | -------------------- | ------------------ | ----------------- |
+| app-level   | `SLACK_APP_TOKEN`    | `app_token`         | `xapp-`           |
+| user OAuth  | `SLACK_USER_TOKEN`   | `user_token`        | `xoxp-`           |
+
+## Behavior
+
+| #  | Always true                                                                                    |
+| -- | -------------------------------------------------------------------------------------------------|
+| C1 | A missing `config.toml` fails the same as one missing `channels` — `channels` has no default.    |
+| C2 | An omitted key other than `channels` uses that key's default.                                     |
+| C3 | An unknown key in `config.toml` makes the whole file invalid.                                     |
+| C4 | An invalid value for any key in `config.toml` makes the whole file invalid.                        |
+| C5 | An invalid `config.toml` applies none of its keys — the pane renders the config error, nothing else. |
+| C6 | `theme` is validated separately from the rest of `config.toml`: an unrecognized name does not fail the file: the pane starts on the default palette with a one-line status warning naming the bad value. |
+| C7 | Per token, resolution is env first, then `tokens.toml`; a present env value always wins even when the file also has an entry. |
+| C8 | A present token failing its expected prefix (`xapp-`/`xoxp-`) is a loud error, regardless of source. |
+| C9 | On Unix, a `tokens.toml` readable by group or world is refused with a `chmod 600 <path>` remedy, before its contents are ever parsed. |
+| C10 | No error message constructed by config or token resolution ever contains a candidate token value. |
+| C11 | A configured channel name that resolves to no real conversation is an error naming that channel. |
+
+An error names the config path and the read, syntax, key, or value failure, and states the expected form when a value is invalid.
+
+| entrypoint    | invalid config/token outcome                                    |
+| -------------- | ------------------------------------------------------------------|
+| pane (startup) | the pane's only screen is the remedy message; no socket, no REST, no crash (→ O4 in `overview.md`) |
+
+The pane reads config and tokens once, at startup, from one process launch. There is no live-reload: a fixed `config.toml` requires relaunching the pane (unlike reviewr's per-refresh reread — herdr-slackr's socket worker and message store are long-lived for the pane's whole session, not rebuilt per poll tick).
+
+## Failure semantics
+
+- A missing `config.toml` and a missing `tokens.toml` are indistinguishable in kind from any other invalid-input case: both are a fail-loud remedy screen, never a silent default (`channels` has none; a token file has no acceptable absence once the matching env var is also unset).
+- A missing `tokens.toml` is not a config-file error — it is a `TokenError` naming both the unset env var and the file that doesn't exist, with the exact `key = "prefix..."` line to add.
+- `theme`'s failure mode is the one deliberate exception to the fail-loud config contract (C6): the pane's job is to stay legible, and a cosmetic default is a safer failure than blocking the whole feed over a typo'd palette name.
+
+## Related specs
+
+- [overview](./overview.md)
+- [pane](./pane.md)
+- [slack-host](./slack-host.md)

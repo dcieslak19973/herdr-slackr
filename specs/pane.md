@@ -1,0 +1,86 @@
+---
+Status: Current
+Created: 2026-07-12
+Last edited: 2026-07-12
+---
+
+# The pane
+
+The Feed/Mentions UI: tabs, keys, row markers, and the two degraded states.
+
+## Overview
+
+One frame, three regions, always: a one-line tab bar, the active tab's row list, and a one-line status bar.
+
+```
+ 1 Feed  2 Mentions (3)
+ #eng-infra  @dan  09:14  shipping the migration now
+ #eng-infra  ↳ 2 replies
+ ───────────────────────────────────────────────────
+ @priya  09:20  can you look at this when you get a sec
+```
+
+| region     | content                                                                       |
+| ----------- | ------------------------------------------------------------------------------ |
+| tab bar    | `1 Feed` / `2 Mentions (n)`, active tab underlined; `n` is the unread mention count |
+| row list   | the active tab's rows, cursor row highlighted                                  |
+| status bar | one-line notice (socket down, rate limit, theme warning); empty when nothing to say |
+
+Row shapes, identical structure across both tabs:
+
+| kind          | rendered as                                                     |
+| -------------- | ------------------------------------------------------------------|
+| message       | `#chan  @author  HH:MM  text` (`@chan` prefix for a DM)          |
+| thread marker | `#chan  ↳ n replies` — a collapsed thread's root, in place of its replies |
+| divider       | a bare horizontal rule                                            |
+| mention       | `●`/`○` read marker, then the same message header as above        |
+
+## Behavior
+
+| #  | Always true                                                                                                     |
+| -- | --------------------------------------------------------------------------------------------------------------- |
+| P1 | The Feed tab is one chronological stream across every subscribed conversation, ordered by message `ts`.         |
+| P2 | A thread's replies render collapsed under its root as one `ThreadMarker` row unless expanded; `Enter` on that row toggles it, fetching replies via REST on first expand. |
+| P3 | A reply whose root the pane never backfilled still renders, as a normal row prefixed `↳`, rather than vanishing. |
+| P4 | An unread divider sits before the first Feed row that arrived since the last keypress in the pane — any key, not only navigation, since a terminal child process has no other attention signal. |
+| P5 | The Mentions tab holds only messages that trigger attention: a literal `@self` token, any Im/Mpim message, or a keyword hit — newest first. |
+| P6 | Each Mentions row carries its own read/unread marker, toggled independently by `Enter`; toggling never touches Slack (O1 in `overview.md`). |
+| P7 | Selection is identity-based: moving the cursor records the selected row's `(conv, ts)` (and, for a thread marker sharing its root's id, which of the two it is), so a later insert/delete re-finds the same row instead of retargeting whatever now sits at the old index. |
+| P8 | Switching tabs re-derives cursor and selection for the new tab's row list; a cursor position valid in a longer tab is clamped into a shorter one. |
+| P9 | Message text is plain text: Slack mrkdwn styling is not interpreted, but `<@U…>`, `<#C…\|name>`, `<url\|label>`, and HTML escapes are resolved to display form. |
+
+**Keys:**
+
+| key                  | action                                                          |
+| --------------------- | ------------------------------------------------------------------|
+| `1` / `2`            | switch to Feed / Mentions                                        |
+| `Tab`                | switch tab (Feed ↔ Mentions)                                      |
+| `j`/`k`, `↓`/`↑`      | move the cursor                                                   |
+| `Enter`               | Feed: expand/collapse the selected thread. Mentions: toggle read  |
+| `o`                   | open the selected row's Slack permalink (`chat.getPermalink`) in the browser |
+| `r`                   | manual refresh: re-pull the last 50 messages of every subscribed conversation |
+| `q`                   | quit the pane                                                     |
+
+## Degraded states
+
+The pane has exactly two render states: `Ready` (the tab bar/rows/status above) and `Blocked` — a full-pane word-wrapped message, no chrome, shown instead of everything above.
+
+| trigger                                                     | `Blocked` message                                        |
+| ------------------------------------------------------------ | ----------------------------------------------------------|
+| invalid/missing `config.toml` (see `config.md`)              | the config error, naming the path and the bad key/value    |
+| invalid/missing tokens (see `config.md`)                      | the token error, naming the env var and `tokens.toml` path |
+| `App::build`'s own REST failure (e.g. an unknown channel, `invalid_auth`) | the build error verbatim                        |
+
+`Blocked` never crashes the process — `q` still quits it. Once the pane reaches `Ready`, it stays there for the rest of the session: a later Slack-side error (rate limit, socket down) surfaces in the status bar, not by reverting to `Blocked`.
+
+An unrecognized `theme` value is not a `Blocked` trigger (see `config.md` C6): the pane starts `Ready` on the default palette with a one-line status warning.
+
+## Nav presence
+
+herdr's plugin v1 has no nav extension point for a custom badge. The pane emits an OSC 0 terminal-title escape (`slack (n)`, `n` the unread mention count) to stdout whenever the count changes, on the chance herdr's left-nav panel reflects a terminal-title update the way it does for another pane observed doing so. Whether it does is unverified pending a live-herdr check (see the project README's Limitations section); until confirmed, the tab bar's own count is the only reliable indicator.
+
+## Related specs
+
+- [overview](./overview.md)
+- [config](./config.md)
+- [slack-host](./slack-host.md)

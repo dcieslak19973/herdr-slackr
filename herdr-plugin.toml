@@ -1,0 +1,44 @@
+id = "dcieslak19973.slackr"
+name = "slackr"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["macos", "linux"]
+description = "Real-time Slack feed and mentions pane for herdr."
+
+# On `herdr plugin install`, download the prebuilt `herdr-slackr` binary for this platform from
+# the matching GitHub Release into $HERDR_PLUGIN_ROOT/bin (no Rust toolchain needed). Skipped by
+# `herdr plugin link` — for a local checkout, build it yourself with `cargo install --path .`.
+[[build]]
+command = ["bash", "herdr/install.sh"]
+
+# The pane runs the downloaded binary by absolute path under the plugin root, since the pane's
+# cwd is not the plugin root and the binary isn't on PATH. Placement is fixed: unlike reviewr,
+# slackr has no toggle_placement config key (see specs/config.md) — one channel/DM feed has no
+# reason to open as a tab or overlay.
+[[panes]]
+id = "feed"
+title = "slack"
+placement = "split"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-slackr\""]
+
+[[actions]]
+id = "toggle"
+title = "slackr: toggle feed"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/sidebar.sh", "toggle"]
+
+[[actions]]
+id = "open"
+title = "slackr: open feed"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/sidebar.sh", "open"]
+
+[[actions]]
+id = "close"
+title = "slackr: close feed"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/sidebar.sh", "close"]
+
+# No [[events]] block: unlike reviewr, slackr never auto-opens. The design spec is explicit
+# (Goal: "native herdr nav integration" is out of scope beyond the title-badge spike) — the user
+# opens the feed once per session via the toggle action, typically bound to a key.
