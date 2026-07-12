@@ -86,6 +86,54 @@ fn mentions_with_valid_config_but_a_fake_token_fails_at_the_rest_layer_not_confi
     assert!(!err.contains("tokens.toml"), "not a token error: {err}");
 }
 
+// ---- shared users cache -------------------------------------------------------------------
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs()
+}
+
+/// A pre-seeded, fresh `users.json` in `state_dir` — enough for `users_cache::load` to hit
+/// without ever touching the network.
+fn seed_users_cache(state_dir: &Path) {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let doc = serde_json::json!({
+        "fetched_at": now_secs(),
+        "users": [["U1", "Alice"]],
+    });
+    std::fs::write(state_dir.join("users.json"), doc.to_string()).unwrap();
+}
+
+/// The CLI reads a pre-seeded, fresh `users.json` from a fixture state dir (env-injected via
+/// `HERDR_PLUGIN_STATE_DIR`, same pattern as `HERDR_PLUGIN_CONFIG_DIR` above) instead of
+/// fetching `users.list` fresh. `cli::scan`'s error-priority contract puts `auth_self` first
+/// among *network* calls, but the on-disk cache check itself is pure and happens ahead of that
+/// (see `src/cli.rs`) — so a cache hit is logged, and the fake token still fails at `auth_self`
+/// right after, without ever needing `users.list`. The state dir's `slackr.log` (enabled by the
+/// same env var) records the hit regardless of that later REST failure.
+#[test]
+fn mentions_reads_a_pre_seeded_fresh_users_cache_instead_of_fetching() {
+    let fixture = rest_fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    seed_users_cache(state_dir.path());
+
+    let out = Command::new(bin())
+        .args(["mentions"])
+        .env("HERDR_PLUGIN_CONFIG_DIR", fixture.path())
+        .env("HERDR_PLUGIN_STATE_DIR", state_dir.path())
+        .env_remove("SLACK_APP_TOKEN")
+        .env_remove("SLACK_USER_TOKEN")
+        .output()
+        .expect("spawn herdr-slackr");
+
+    // Unaffected by the cache: auth_self still hits the network with the fake token and fails.
+    assert_eq!(out.status.code(), Some(1));
+
+    let log = std::fs::read_to_string(state_dir.path().join("slackr.log"))
+        .expect("slackr.log written under HERDR_PLUGIN_STATE_DIR");
+    assert!(log.contains("users_cache: hit"), "expected a cache-hit log line: {log}");
+    assert!(log.contains("1 users"), "expected the pre-seeded user count: {log}");
+}
+
 // ---- usage / exit codes ---------------------------------------------------------------------
 
 #[test]

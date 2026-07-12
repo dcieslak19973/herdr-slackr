@@ -21,6 +21,10 @@ herdr-slackr skill-install [--target <dir> | --project] [--copy] [--force]
 
 `mentions` and `feed` open a fresh Slack REST session on every invocation — the pane's in-memory message store belongs to another process and is never read or shared. Same user token, same read methods the pane's own backfill uses (`auth.test`, `conversations.list`, `conversations.history`, `users.list`), same rate-limit handling (surface the remedy, no retry). `skill-path` prints the bundled skill's location; `skill-install` copies or symlinks it into an agent's skills directory. Both are ported from herdr-reviewr's `cli.rs` contract verbatim, adapted to this crate's skill name and directory.
 
+The `users.list` display-name directory is shared with the pane through the same on-disk cache (`users_cache.rs`): a scan checks `$HERDR_PLUGIN_STATE_DIR/users.json` (or, when that env is unset, `<home>/.local/state/herdr/plugins/dcieslak19973.slackr/users.json` — the state-dir counterpart to `config_dir`'s own `~/.config/...` fallback) and reuses it when younger than 24h, refetching and rewriting it only on a miss or once it's gone stale. Reading the cache never touches the network, so a scan checks it before `auth_self` without breaking the error-priority contract below.
+
+**Error-priority contract:** every scan calls `auth_self` as its first *network* call, ahead of `users.list`/`conversations.list`/`conversations.history` — a cheap identity check, so a bad or expired token surfaces as a clean `invalid_auth` before any other call has a chance to fail first with a less specific error. The users-cache read is checked even earlier, since it is pure and network-free and so cannot violate that ordering; only a cache miss falls through to a `users.list` fetch, and only after `auth_self` has already succeeded.
+
 ## Behavior
 
 **`mentions` / `feed`:**

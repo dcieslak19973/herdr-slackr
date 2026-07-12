@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-12
+
+### Added
+- **`dm_limit` config key** (default 20, valid `0..=200`): caps how many DMs/MPIMs are
+  actively subscribed when `dms = true`, keeping the most-recently-active ones. `0`
+  subscribes none, even with `dms = true`. A DM outside the cap can still surface a
+  message that arrives live over the socket; only backfill and polling respect the cap.
+- **Shared `users.list` cache.** The workspace member directory (used for display names)
+  is now cached on disk for 24h in `$HERDR_PLUGIN_STATE_DIR` (or the CLI's home-relative
+  fallback), so the pane and every `mentions`/`feed` CLI invocation stop re-fetching the
+  whole member list on every single run.
+
+### Changed
+- **Real `Retry-After` cooldowns.** A Slack rate limit now pauses the affected path for
+  the server's actual advertised `Retry-After` seconds instead of a fixed 30-second
+  guess, parsed from a `curl --write-out` trailer appended to every REST call.
+- **Incremental, staggered polling.** The fallback poller no longer re-pulls every
+  subscribed conversation's last 50 messages every tick: each tick visits at most 8
+  conversations round-robin, and each conversation is asked only for messages newer
+  than the last one already seen.
+- **Startup backfill retries once on a rate limit** (sleeping the real `Retry-After`
+  first) before giving up on the rest of that session's backfill list rather than
+  failing pane startup outright; the socket/poll paths fill in the remainder.
+
+### Fixed
+- A socket reconnect (`Connected`) now also clears any pending rate-limit cooldown, not
+  just the `polling`/status state — previously a cooldown set just before a reconnect
+  could silently no-op the next manual poll (`r`) until its stale deadline lapsed.
+
 ## [0.1.1] — 2026-07-12
 
 ### Added

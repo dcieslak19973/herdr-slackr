@@ -10,8 +10,8 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-const PLUGIN_CONFIG_KEYS: [&str; 5] =
-    ["channels", "dms", "keywords", "theme", "poll_fallback_secs"];
+const PLUGIN_CONFIG_KEYS: [&str; 6] =
+    ["channels", "dms", "keywords", "theme", "poll_fallback_secs", "dm_limit"];
 
 /// The default theme name when `config.toml` omits `theme`.
 pub const DEFAULT_THEME: &str = "catppuccin";
@@ -22,6 +22,12 @@ pub const DEFAULT_POLL_FALLBACK_SECS: u64 = 30;
 /// Valid range for `poll_fallback_secs`.
 const POLL_FALLBACK_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=300;
 
+/// The default cap on subscribed DMs when `config.toml` omits `dm_limit`.
+pub const DEFAULT_DM_LIMIT: u32 = 20;
+
+/// Valid range for `dm_limit`; `0` means "no DMs even when `dms = true`".
+const DM_LIMIT_RANGE: std::ops::RangeInclusive<u32> = 0..=200;
+
 /// One validated snapshot of `$HERDR_PLUGIN_CONFIG_DIR/config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginConfig {
@@ -30,6 +36,7 @@ pub struct PluginConfig {
     keywords: Vec<String>,
     theme: String,
     poll_fallback_secs: u64,
+    dm_limit: u32,
 }
 
 impl PluginConfig {
@@ -58,6 +65,13 @@ impl PluginConfig {
     /// Defaults to 30; valid range is `5..=300`.
     pub fn poll_fallback_secs(&self) -> u64 {
         self.poll_fallback_secs
+    }
+
+    /// The cap on subscribed DMs (IMs/MPIMs) when `dms = true`: only the `dm_limit` most
+    /// recently active ones are subscribed (see `crate::model::resolve_channels`). Defaults to
+    /// 20; valid range is `0..=200`, where `0` means no DMs even when `dms = true`.
+    pub fn dm_limit(&self) -> u32 {
+        self.dm_limit
     }
 }
 
@@ -156,7 +170,18 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         poll_fallback_secs = secs;
     }
 
-    Ok(PluginConfig { channels, dms, keywords, theme, poll_fallback_secs })
+    let mut dm_limit = DEFAULT_DM_LIMIT;
+    if let Some(value) = table.get("dm_limit") {
+        let expected = "an integer in 0..=200";
+        let raw = value.as_integer().ok_or_else(|| value_error(path, "dm_limit", expected))?;
+        let limit = u32::try_from(raw).map_err(|_| value_error(path, "dm_limit", expected))?;
+        if !DM_LIMIT_RANGE.contains(&limit) {
+            return Err(value_error(path, "dm_limit", expected));
+        }
+        dm_limit = limit;
+    }
+
+    Ok(PluginConfig { channels, dms, keywords, theme, poll_fallback_secs, dm_limit })
 }
 
 fn parse_channels(
@@ -224,6 +249,7 @@ mod tests {
         assert!(config.keywords().is_empty());
         assert_eq!(config.theme(), "catppuccin");
         assert_eq!(config.poll_fallback_secs(), 30);
+        assert_eq!(config.dm_limit(), 20);
     }
 
     #[test]
@@ -237,6 +263,7 @@ mod tests {
                 "keywords = [\"deploy\", \"oncall\"]\n",
                 "theme = \"tokyo-night\"\n",
                 "poll_fallback_secs = 45\n",
+                "dm_limit = 15\n",
             ),
         );
         let config = super::plugin_config_in(dir.path()).unwrap();
@@ -245,6 +272,7 @@ mod tests {
         assert_eq!(config.keywords(), ["deploy", "oncall"]);
         assert_eq!(config.theme(), "tokyo-night");
         assert_eq!(config.poll_fallback_secs(), 45);
+        assert_eq!(config.dm_limit(), 15);
     }
 
     #[test]
@@ -293,6 +321,9 @@ mod tests {
             ("channels = [\"#a\"]\npoll_fallback_secs = \"30\"\n", "poll_fallback_secs"),
             ("channels = [\"#a\"]\npoll_fallback_secs = 3\n", "poll_fallback_secs"),
             ("channels = [\"#a\"]\npoll_fallback_secs = 301\n", "poll_fallback_secs"),
+            ("channels = [\"#a\"]\ndm_limit = \"20\"\n", "dm_limit"),
+            ("channels = [\"#a\"]\ndm_limit = -1\n", "dm_limit"),
+            ("channels = [\"#a\"]\ndm_limit = 201\n", "dm_limit"),
         ];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -311,6 +342,15 @@ mod tests {
         assert_eq!(super::plugin_config_in(dir.path()).unwrap().poll_fallback_secs(), 5);
         write(dir.path(), "channels = [\"#a\"]\npoll_fallback_secs = 300\n");
         assert_eq!(super::plugin_config_in(dir.path()).unwrap().poll_fallback_secs(), 300);
+    }
+
+    #[test]
+    fn dm_limit_boundary_values_are_valid_and_zero_disables_dms_without_disabling_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "channels = [\"#a\"]\ndm_limit = 0\n");
+        assert_eq!(super::plugin_config_in(dir.path()).unwrap().dm_limit(), 0);
+        write(dir.path(), "channels = [\"#a\"]\ndm_limit = 200\n");
+        assert_eq!(super::plugin_config_in(dir.path()).unwrap().dm_limit(), 200);
     }
 
     #[test]

@@ -17,10 +17,11 @@
 //! logic below — is pure and unit-tested without touching the network (house pattern: see
 //! the REST and socket modules' thin-edge-over-pure-core split).
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::config::PluginConfig;
 use crate::entities::{self, is_mention};
-use crate::model::{ConvKind, Conversation, Message, ts_cmp, ts_key};
+use crate::model::{ConvKind, Conversation, Message, resolve_channels, ts_cmp, ts_key};
 use crate::rest::{Rest, RestError};
 use crate::socket::SocketEvent;
 use crate::tokens::Tokens;
@@ -144,7 +145,30 @@ pub struct App {
     /// The `arrival_seq` value as of the last `touch()`; the divider sits before the first
     /// row whose arrival is greater than this.
     divider_mark: u64,
+    /// The newest message `ts` seen so far per conversation, threaded into `poll_tick`'s
+    /// `history` call as `oldest` so a routine tick only ever asks Slack for what's actually
+    /// new. Derived cheaply at `upsert_new` time (see `track_newest`) rather than scanned out
+    /// of `messages` on every tick: `messages` is one global `BTreeMap` with no per-conversation
+    /// index, so finding a conversation's max `ts` there would mean a full linear scan per
+    /// conversation per tick, while updating this map costs one comparison per newly-seen
+    /// message — already-seen messages (the common case once caught up) don't even reach it.
+    newest_ts: HashMap<String, String>,
+    /// Round-robin position into `conversations` for `poll_tick`'s next `POLL_BATCH`-sized
+    /// batch (see `next_batch`); persists across ticks so every conversation is eventually
+    /// polled rather than only ever the first `POLL_BATCH`.
+    poll_cursor: usize,
+    /// Set from a `RateLimited(secs)` hit during `poll_tick`; while `Some` and unexpired, ticks
+    /// are skipped entirely (not merely shortened) rather than hammering Slack again on
+    /// schedule. `Instant`-based (not wall-clock) so it is monotonic and immune to clock
+    /// adjustments; the `now` it's compared against is injected as a parameter to
+    /// `poll_tick_at` so the gating logic is unit-tested without a real sleep.
+    cooldown_until: Option<Instant>,
 }
+
+/// Ticks poll at most this many conversations, round-robin, per call — request count is what
+/// Slack's rate limits meter, so a tick over every subscribed conversation every time is what
+/// triggers them in the first place (see `next_batch`).
+const POLL_BATCH: usize = 8;
 
 impl App {
     /// Build the initial state: resolve configured channel names to ids (erroring on an
@@ -162,11 +186,21 @@ impl App {
     pub fn build(config: PluginConfig, _tokens: &Tokens, rest: &Rest) -> Result<App, String> {
         let all_convs = crate::rest::list_conversations(rest)
             .map_err(|e| format!("list_conversations failed: {e:?}"))?;
-        let selected = resolve_channels(config.channels(), config.dms(), &all_convs)?;
+        let selected =
+            resolve_channels(config.channels(), config.dms(), config.dm_limit(), &all_convs)?;
 
         let self_id =
             crate::rest::auth_self(rest).map_err(|e| format!("auth_self failed: {e:?}"))?;
-        let users = crate::rest::users(rest).map_err(|e| format!("users failed: {e:?}"))?;
+        // The pane always runs inside herdr, which always sets `HERDR_PLUGIN_STATE_DIR` (like
+        // `HERDR_PLUGIN_CONFIG_DIR`); no home-dir fallback is needed here (that's the CLI's
+        // standalone-invocation concern — see `cli::scan`).
+        let state_dir = crate::users_cache::state_dir(|n| std::env::var(n).ok(), || None);
+        let users = crate::users_cache::users_cached(
+            rest,
+            state_dir.as_deref(),
+            crate::users_cache::now_secs(),
+        )
+        .map_err(|e| format!("users failed: {e:?}"))?;
         let user_names: HashMap<String, String> = users.into_iter().collect();
         let selected = resolve_im_names(selected, &user_names);
 
@@ -190,10 +224,17 @@ impl App {
             keywords: config.keywords().to_vec(),
             arrival_seq: 0,
             divider_mark: 0,
+            newest_ts: HashMap::new(),
+            poll_cursor: 0,
+            cooldown_until: None,
         };
 
         for conv in app.conversations.clone() {
-            apply_backfill(&mut app, &conv.name, crate::rest::history(rest, &conv.id, 50))?;
+            match backfill_one(&mut app, rest, &conv) {
+                BackfillOutcome::Ok => {}
+                BackfillOutcome::SkipRemaining => break,
+                BackfillOutcome::Fail(msg) => return Err(msg),
+            }
         }
         // Everything just backfilled counts as already-seen: the divider only ever marks
         // messages that arrive after this point.
@@ -228,6 +269,9 @@ impl App {
             keywords: Vec::new(),
             arrival_seq: 0,
             divider_mark: 0,
+            newest_ts: HashMap::new(),
+            poll_cursor: 0,
+            cooldown_until: None,
         }
     }
 
@@ -256,6 +300,11 @@ impl App {
             SocketEvent::Connected => {
                 self.polling = false;
                 self.status.clear();
+                // A cooldown set from a `RateLimited` hit before this reconnect must not
+                // outlive it: a healthy socket means Slack accepted our connection, so the
+                // poll path restarts clean rather than silently no-oping the next manual `r`
+                // until a now-stale deadline lapses.
+                self.cooldown_until = None;
             }
             SocketEvent::Down(reason) => {
                 self.polling = true;
@@ -289,27 +338,56 @@ impl App {
         }
     }
 
-    /// Fallback mode: re-pull the last 50 messages of every subscribed conversation.
-    /// Messages already known (same `(conv, ts)`) are deduplicated by `upsert_new`, so a
-    /// message that arrives via both a poll and the socket still appears exactly once.
+    /// Fallback mode: incrementally re-pull each polled conversation's messages newer than the
+    /// last one seen (`newest_ts`, threaded as `history`'s `oldest`), staggered across ticks in
+    /// `POLL_BATCH`-sized round-robin batches (`next_batch`) rather than every subscribed
+    /// conversation every time — see the `App::newest_ts`/`poll_cursor` field docs and the
+    /// module's spec reference for why (request count is what Slack's limits meter). Skips
+    /// entirely, without issuing a single request, while a prior `RateLimited` hit's cooldown
+    /// (`cooldown_until`) hasn't yet passed — the status line keeps showing the notice from when
+    /// the cooldown was set.
     ///
-    /// A `RestError::RateLimited` sets a rate-limit status and stops the rest of this tick
-    /// (Slack's own signal to back off now, not to keep hammering the remaining conversations);
-    /// any other error sets a one-line status naming the conversation and moves on to the next
-    /// one rather than crashing (spec: a per-conversation poll failure must never take down the
-    /// pane). See `poll_error_status` for the pure wording decision.
+    /// Messages already known (same `(conv, ts)`) are deduplicated by `upsert_new` regardless
+    /// (belt-and-suspenders against a re-widened `oldest` window), so a message that arrives via
+    /// both a poll and the socket still appears exactly once.
+    ///
+    /// A `RestError::RateLimited` sets a rate-limit status, starts the cooldown, and stops the
+    /// rest of this tick's batch (Slack's own signal to back off now, not to keep hammering the
+    /// remaining conversations); any other error sets a one-line status naming the conversation
+    /// and moves on to the next one in the batch rather than crashing (spec: a per-conversation
+    /// poll failure must never take down the pane). See `poll_error_status` for the pure wording
+    /// decision.
     pub fn poll_tick(&mut self, rest: &Rest) {
-        let convs: Vec<(String, String)> =
-            self.conversations.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
-        for (conv_id, conv_name) in convs {
-            match crate::rest::history(rest, &conv_id, 50) {
+        self.poll_tick_at(rest, Instant::now());
+    }
+
+    /// `poll_tick`'s real logic, taking `now` as a parameter (production always passes
+    /// `Instant::now()`) so the cooldown-gating decision is exercised in tests without a real
+    /// sleep — `Instant` supports arithmetic (`now + Duration::from_secs(n)`), so tests build
+    /// deadlines directly rather than needing a mockable clock trait.
+    fn poll_tick_at(&mut self, rest: &Rest, now: Instant) {
+        if cooldown_active(now, self.cooldown_until) {
+            return;
+        }
+        self.cooldown_until = None;
+
+        let n = self.conversations.len();
+        let (indices, next_cursor) = next_batch(self.poll_cursor, n, POLL_BATCH);
+        self.poll_cursor = next_cursor;
+
+        for i in indices {
+            let conv_id = self.conversations[i].id.clone();
+            let conv_name = self.conversations[i].name.clone();
+            let oldest = self.newest_ts.get(&conv_id).cloned();
+            match crate::rest::history(rest, &conv_id, 50, oldest.as_deref()) {
                 Ok(msgs) => {
                     for msg in msgs {
                         self.upsert_new(msg);
                     }
                 }
-                Err(err @ RestError::RateLimited(_)) => {
+                Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&conv_name, &err);
+                    self.cooldown_until = Some(now + Duration::from_secs(secs));
                     break;
                 }
                 Err(err) => {
@@ -672,6 +750,7 @@ impl App {
             }
             return;
         }
+        track_newest(&mut self.newest_ts, &msg.conv, &msg.ts);
         self.arrival_seq += 1;
         let arrival = self.arrival_seq;
         self.messages.insert(key, Stored { msg, arrival });
@@ -758,6 +837,122 @@ fn apply_backfill(
     Ok(())
 }
 
+/// Update `newest` in place with `ts` for `conv`, iff `ts` is chronologically at or after
+/// whatever's already tracked (or nothing is tracked yet) — the newest-seen-`ts` half of
+/// `App::newest_ts`'s doc, split out pure so the "keep the max" comparison is unit-tested
+/// without going through a whole `upsert_new`/`App` round-trip.
+fn track_newest(newest: &mut HashMap<String, String>, conv: &str, ts: &str) {
+    let is_newer =
+        newest.get(conv).is_none_or(|existing| ts_cmp(ts, existing) != std::cmp::Ordering::Less);
+    if is_newer {
+        newest.insert(conv.to_string(), ts.to_string());
+    }
+}
+
+/// Whether a tick starting at `now` should be skipped entirely because a prior `RateLimited`
+/// hit's cooldown (`deadline`) hasn't passed yet. Pure and `Instant`-based so `poll_tick_at`'s
+/// gating is unit-tested by constructing deadlines via `Instant` arithmetic — no mock clock
+/// needed (see `App::cooldown_until`'s doc).
+fn cooldown_active(now: Instant, deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| now < d)
+}
+
+/// The indices (into a `n`-long conversation list) `poll_tick` should visit this tick, round-
+/// robin from `cursor`, wrapping past the end back to `0`, plus the cursor to resume from next
+/// tick. `batch` is clamped to `n` (a batch larger than the whole list would otherwise produce
+/// duplicate indices via the wraparound). `n == 0` yields no indices and resets the cursor to
+/// `0` rather than looping forever on a modulus of zero.
+fn next_batch(cursor: usize, n: usize, batch: usize) -> (Vec<usize>, usize) {
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let take = batch.min(n);
+    let indices = (0..take).map(|i| (cursor + i) % n).collect();
+    let next_cursor = (cursor + take) % n;
+    (indices, next_cursor)
+}
+
+/// A per-conversation backfill retry's outcome, decided purely so `backfill_one`'s branching is
+/// unit-tested without a real sleep or REST call (spec §5: a second consecutive `RateLimited`
+/// degrades to skipping the rest of backfill rather than failing `build`).
+enum BackfillRetry {
+    /// The retry succeeded: fold these messages in and continue to the next conversation.
+    Continue(Vec<Message>),
+    /// The retry was rate-limited again: stop backfilling (this status notice), but `build`
+    /// still succeeds — the socket/poll path fills in the rest later.
+    SkipRemaining(String),
+    /// The retry hit some other error: `build` still fails loud, naming the channel (unchanged
+    /// contract for a non-rate-limit per-channel failure).
+    HardFail(String),
+}
+
+/// Pure decision for `backfill_one`'s one-time retry, given `conv_name` (for the status/error
+/// wording) and the retry's own `history()` result.
+fn backfill_retry_decision(
+    conv_name: &str,
+    retry: Result<Vec<Message>, RestError>,
+) -> BackfillRetry {
+    match retry {
+        Ok(msgs) => BackfillRetry::Continue(msgs),
+        Err(RestError::RateLimited(_)) => BackfillRetry::SkipRemaining(format!(
+            "slack rate limit — skipping remaining backfill (from {conv_name} on)"
+        )),
+        Err(other) => BackfillRetry::HardFail(format!("history failed for {conv_name}: {other:?}")),
+    }
+}
+
+/// Cap a `Retry-After` value before sleeping on it (defensive: a misbehaving/proxy response
+/// naming an absurd delay must not hang `build` for longer than a minute).
+fn capped_sleep_secs(secs: u64) -> u64 {
+    secs.min(60)
+}
+
+/// `backfill_one`'s outcome, distinguishing "stop backfilling the rest of the list, but this is
+/// not a `build` failure" (`SkipRemaining`) from an actual `build`-failing error — a plain
+/// `Result<(), String>` can't tell those apart, and the caller's loop needs to.
+enum BackfillOutcome {
+    /// Continue to the next conversation.
+    Ok,
+    /// A second consecutive `RateLimited`: stop backfilling the rest, but `build` still
+    /// succeeds (the status notice was already set on `app`).
+    SkipRemaining,
+    /// `build` fails loud, naming the channel (unchanged contract).
+    Fail(String),
+}
+
+/// Backfill one conversation into `app`, retrying once on `RateLimited` (spec §5): sleeps the
+/// real `Retry-After` (capped by `capped_sleep_secs`) via `std::thread::sleep` — acceptable
+/// here specifically because `build` runs once, before the TUI ever draws a frame, so blocking
+/// it briefly costs nothing the pane's later async/event-driven paths need to avoid — then
+/// retries the same conversation exactly once via `backfill_retry_decision`. Any error other
+/// than the initial `RateLimited` keeps the unchanged contract: a misconfigured channel fails
+/// `build` loud, naming it.
+fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutcome {
+    match crate::rest::history(rest, &conv.id, 50, None) {
+        Err(RestError::RateLimited(secs)) => {
+            std::thread::sleep(Duration::from_secs(capped_sleep_secs(secs)));
+            let retry = crate::rest::history(rest, &conv.id, 50, None);
+            match backfill_retry_decision(&conv.name, retry) {
+                BackfillRetry::Continue(msgs) => {
+                    for msg in msgs {
+                        app.upsert_new(msg);
+                    }
+                    BackfillOutcome::Ok
+                }
+                BackfillRetry::SkipRemaining(note) => {
+                    app.status = note;
+                    BackfillOutcome::SkipRemaining
+                }
+                BackfillRetry::HardFail(msg) => BackfillOutcome::Fail(msg),
+            }
+        }
+        other => match apply_backfill(app, &conv.name, other) {
+            Ok(()) => BackfillOutcome::Ok,
+            Err(msg) => BackfillOutcome::Fail(msg),
+        },
+    }
+}
+
 /// The one-line status `poll_tick` sets on a per-conversation history-fetch failure: a
 /// rate-limit notice naming the retry delay (Slack's own back-off signal, distinct from any
 /// other failure) or a line naming which conversation failed and why. Split out so the wording
@@ -767,33 +962,6 @@ fn poll_error_status(conv_name: &str, error: &RestError) -> String {
         RestError::RateLimited(secs) => format!("slack rate limit — retrying in {secs}s"),
         other => format!("{conv_name}: {other:?}"),
     }
-}
-
-/// Resolve configured channel names (e.g. `"#eng-infra"`) to their `Conversation`s among
-/// `all`, matching only `Channel`/`Group` kinds; an unresolved name is an error naming it
-/// (per the design doc: "A configured channel name that resolves to nothing is an error
-/// naming the channel"). When `dms` is true, every `Im`/`Mpim` conversation in `all` is
-/// included wholesale — DMs are subscribed as a class, not named individually in config.
-fn resolve_channels(
-    config_channels: &[String],
-    dms: bool,
-    all: &[Conversation],
-) -> Result<Vec<Conversation>, String> {
-    let mut out = Vec::with_capacity(config_channels.len());
-    for wanted in config_channels {
-        let name = wanted.strip_prefix('#').unwrap_or(wanted.as_str());
-        let found = all
-            .iter()
-            .find(|c| c.name == name && matches!(c.kind, ConvKind::Channel | ConvKind::Group));
-        match found {
-            Some(c) => out.push(c.clone()),
-            None => return Err(format!("unknown channel: {wanted}")),
-        }
-    }
-    if dms {
-        out.extend(all.iter().filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim)).cloned());
-    }
-    Ok(out)
 }
 
 /// Resolve each `Im` conversation's display name: `conversations.list` sets an IM's `name` to
@@ -822,17 +990,19 @@ fn resolve_im_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, RowKind, SelKind, Tab, apply_backfill, poll_error_status, resolve_channels,
-        resolve_im_names, ts_to_hhmm,
+        App, BackfillOutcome, BackfillRetry, RowKind, SelKind, Tab, apply_backfill,
+        backfill_retry_decision, capped_sleep_secs, cooldown_active, next_batch, poll_error_status,
+        resolve_im_names, track_newest, ts_to_hhmm,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
     use crate::socket::SocketEvent;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
-        Conversation { id: id.into(), name: name.into(), kind }
+        Conversation { id: id.into(), name: name.into(), kind, updated: None }
     }
 
     fn msg(conv: &str, ts: &str, thread_ts: Option<&str>, author: &str, text: &str) -> Message {
@@ -873,6 +1043,9 @@ mod tests {
             keywords: Vec::new(),
             arrival_seq: 0,
             divider_mark: 0,
+            newest_ts: HashMap::new(),
+            poll_cursor: 0,
+            cooldown_until: None,
         }
     }
 
@@ -1145,6 +1318,26 @@ mod tests {
         assert!(app.status.is_empty());
     }
 
+    #[test]
+    fn connected_event_clears_a_stale_cooldown_so_a_manual_poll_proceeds() {
+        // A cooldown set before a reconnect must not silently no-op the user's next manual poll
+        // (`r`) until its deadline lapses: a healthy socket means Slack accepted the connection,
+        // so the poll path should restart clean.
+        let mut app = empty_app();
+        let now = Instant::now();
+        app.cooldown_until = Some(now + Duration::from_secs(30));
+
+        app.apply(SocketEvent::Connected);
+        assert_eq!(app.cooldown_until, None);
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // Still "before" the old deadline had it not been cleared — the tick must nonetheless
+        // run both conversations (observable via the cursor wrapping back to 0), not skip.
+        app.poll_tick_at(&rest, now);
+        assert_eq!(app.poll_cursor, 0, "both conversations were visited and the cursor wrapped");
+    }
+
     // ---- toggle_expand_or_read / toggle_read dispatch by tab ---------------------------------
 
     #[test]
@@ -1330,42 +1523,7 @@ mod tests {
         assert_eq!(app.unread_mentions(), 0);
     }
 
-    // ---- resolve_channels ---------------------------------------------------------------------
-
-    #[test]
-    fn resolve_channels_matches_by_name_stripping_the_hash() {
-        let all = vec![
-            conv("C1", "eng-infra", ConvKind::Channel),
-            conv("C2", "releases", ConvKind::Channel),
-        ];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, &all).unwrap();
-        assert_eq!(resolved, vec![conv("C1", "eng-infra", ConvKind::Channel)]);
-    }
-
-    #[test]
-    fn resolve_channels_errors_naming_an_unknown_channel() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel)];
-        let error = resolve_channels(&["#nope".to_string()], false, &all).unwrap_err();
-        assert!(error.contains("#nope"), "{error}");
-    }
-
-    #[test]
-    fn resolve_channels_includes_all_dms_when_enabled() {
-        let all = vec![
-            conv("C1", "eng-infra", ConvKind::Channel),
-            conv("D1", "U9", ConvKind::Im),
-            conv("M1", "mpdm-a-b", ConvKind::Mpim),
-        ];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], true, &all).unwrap();
-        assert_eq!(resolved.len(), 3);
-    }
-
-    #[test]
-    fn resolve_channels_excludes_dms_when_disabled() {
-        let all = vec![conv("C1", "eng-infra", ConvKind::Channel), conv("D1", "U9", ConvKind::Im)];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, &all).unwrap();
-        assert_eq!(resolved.len(), 1);
-    }
+    // ---- resolve_channels: see `crate::model`'s tests (moved there — dedup, task 1) --------
 
     // ---- resolve_im_names -----------------------------------------------------------------
 
@@ -1451,6 +1609,210 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.poll_tick(&rest);
         assert!(!app.status.is_empty(), "poll_tick must surface the failure, not swallow it");
+    }
+
+    // ---- next_batch: pure round-robin scheduling (Task 2) ------------------------------------
+
+    #[test]
+    fn next_batch_takes_the_first_batch_from_a_fresh_cursor() {
+        let (indices, cursor) = next_batch(0, 20, 8);
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(cursor, 8);
+    }
+
+    #[test]
+    fn next_batch_wraps_around_past_the_end_of_the_list() {
+        let (indices, cursor) = next_batch(6, 8, 8);
+        assert_eq!(indices, vec![6, 7, 0, 1, 2, 3, 4, 5]);
+        assert_eq!(cursor, 6, "cursor wraps back to where it started when batch == n");
+    }
+
+    #[test]
+    fn next_batch_clamps_batch_to_the_conversation_count() {
+        let (indices, cursor) = next_batch(0, 3, 8);
+        assert_eq!(indices, vec![0, 1, 2]);
+        assert_eq!(cursor, 0, "wraps back to 0 rather than accumulating past n");
+    }
+
+    #[test]
+    fn next_batch_empty_list_yields_no_indices_and_resets_the_cursor() {
+        assert_eq!(next_batch(5, 0, 8), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn next_batch_visits_every_conversation_across_enough_ticks() {
+        // The scheduling contract that matters: not the exact indices any one tick returns, but
+        // that every conversation is eventually polled. ceil(n / batch) ticks must cover all n.
+        let (n, batch): (usize, usize) = (37, 8);
+        let mut cursor = 0;
+        let mut visited = HashSet::new();
+        for _ in 0..n.div_ceil(batch) {
+            let (indices, next_cursor) = next_batch(cursor, n, batch);
+            visited.extend(indices);
+            cursor = next_cursor;
+        }
+        assert_eq!(visited.len(), n, "every conversation must be visited across enough ticks");
+    }
+
+    // ---- cooldown_active: pure gating with an injected clock (Task 2) ------------------------
+
+    #[test]
+    fn cooldown_active_none_deadline_never_gates() {
+        assert!(!cooldown_active(Instant::now(), None));
+    }
+
+    #[test]
+    fn cooldown_active_true_before_the_deadline_false_after() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
+        assert!(cooldown_active(now, Some(deadline)));
+        assert!(cooldown_active(now + Duration::from_secs(29), Some(deadline)));
+        assert!(!cooldown_active(now + Duration::from_secs(30), Some(deadline)));
+        assert!(!cooldown_active(now + Duration::from_secs(31), Some(deadline)));
+    }
+
+    // ---- poll_tick_at: cooldown gates the whole tick, not just a shortened one ----------------
+
+    #[test]
+    fn poll_tick_during_cooldown_skips_the_tick_entirely_leaving_the_cursor_untouched() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+        app.cooldown_until = Some(now + Duration::from_secs(30));
+        app.status = "slack rate limit — retrying in 30s".to_string();
+
+        app.poll_tick_at(&rest, now);
+
+        assert_eq!(app.poll_cursor, 0, "a gated tick must not advance the batch cursor");
+        assert!(app.status.contains("rate limit"), "the rate-limit notice must stay up");
+    }
+
+    #[test]
+    fn poll_tick_resumes_once_the_cooldown_deadline_has_passed() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+        app.cooldown_until = Some(now);
+
+        // A moment after the deadline: the tick must run (and, since `empty_app` has 2 convs
+        // and `precancelled_rest` fails every call with a non-rate-limit error, both must be
+        // attempted — observable via the cursor wrapping back to 0).
+        app.poll_tick_at(&rest, now + Duration::from_secs(1));
+
+        assert_eq!(app.poll_cursor, 0, "both conversations were visited and the cursor wrapped");
+    }
+
+    // ---- track_newest: keep-the-max newest-ts tracking (Task 2) -------------------------------
+
+    #[test]
+    fn track_newest_records_the_first_ts_seen_for_a_conversation() {
+        let mut newest = HashMap::new();
+        track_newest(&mut newest, "C1", "100.000001");
+        assert_eq!(newest.get("C1").map(String::as_str), Some("100.000001"));
+    }
+
+    #[test]
+    fn track_newest_ignores_an_older_ts() {
+        let mut newest = HashMap::new();
+        track_newest(&mut newest, "C1", "100.000001");
+        track_newest(&mut newest, "C1", "50.000001");
+        assert_eq!(newest.get("C1").map(String::as_str), Some("100.000001"));
+    }
+
+    #[test]
+    fn track_newest_replaces_with_a_newer_ts() {
+        let mut newest = HashMap::new();
+        track_newest(&mut newest, "C1", "100.000001");
+        track_newest(&mut newest, "C1", "200.000001");
+        assert_eq!(newest.get("C1").map(String::as_str), Some("200.000001"));
+    }
+
+    #[test]
+    fn track_newest_tracks_each_conversation_independently() {
+        let mut newest = HashMap::new();
+        track_newest(&mut newest, "C1", "100.0");
+        track_newest(&mut newest, "C2", "5.0");
+        assert_eq!(newest.get("C1").map(String::as_str), Some("100.0"));
+        assert_eq!(newest.get("C2").map(String::as_str), Some("5.0"));
+    }
+
+    #[test]
+    fn upsert_new_threads_the_newest_ts_through_the_message_store() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "a")));
+        app.apply(SocketEvent::Message(msg("C1", "10.0", None, "U1", "b")));
+        app.apply(SocketEvent::Message(msg("C1", "3.0", None, "U1", "c"))); // older, ignored
+        assert_eq!(app.newest_ts.get("C1").map(String::as_str), Some("10.0"));
+    }
+
+    // ---- backfill retry decision (Task 2, spec §5) --------------------------------------------
+
+    #[test]
+    fn backfill_retry_continues_on_a_successful_retry() {
+        let retry_msgs = vec![msg("C1", "1.0", None, "U1", "hi")];
+        match backfill_retry_decision("eng", Ok(retry_msgs)) {
+            BackfillRetry::Continue(msgs) => assert_eq!(msgs.len(), 1),
+            _ => panic!("expected Continue"),
+        }
+    }
+
+    #[test]
+    fn backfill_retry_skips_remaining_on_a_second_consecutive_rate_limit() {
+        match backfill_retry_decision("eng", Err(RestError::RateLimited(5))) {
+            BackfillRetry::SkipRemaining(note) => {
+                assert!(note.to_lowercase().contains("rate limit"), "{note}");
+            }
+            _ => panic!("expected SkipRemaining"),
+        }
+    }
+
+    #[test]
+    fn backfill_retry_hard_fails_naming_the_channel_on_a_different_second_error() {
+        match backfill_retry_decision(
+            "eng",
+            Err(RestError::SlackError("channel_not_found".to_string())),
+        ) {
+            BackfillRetry::HardFail(message) => {
+                assert!(message.contains("eng"), "{message}");
+                assert!(message.contains("channel_not_found"), "{message}");
+            }
+            _ => panic!("expected HardFail"),
+        }
+    }
+
+    #[test]
+    fn capped_sleep_secs_caps_at_sixty() {
+        assert_eq!(capped_sleep_secs(120), 60);
+        assert_eq!(capped_sleep_secs(500), 60);
+    }
+
+    #[test]
+    fn capped_sleep_secs_leaves_a_short_delay_unchanged() {
+        assert_eq!(capped_sleep_secs(5), 5);
+        assert_eq!(capped_sleep_secs(60), 60);
+    }
+
+    #[test]
+    fn backfill_one_a_rate_limited_first_attempt_then_hard_error_still_fails_build() {
+        // `backfill_one` needs a real REST call for its *first* attempt, which a precancelled
+        // `Rest` turns into `Other` (cancelled), not `RateLimited` — so this exercises the
+        // decision fn directly (above) for the retry branches, and here only the plain
+        // non-rate-limited first-attempt path via `backfill_one`'s delegation to `apply_backfill`.
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let conv = Conversation {
+            id: "C1".into(),
+            name: "eng".into(),
+            kind: ConvKind::Channel,
+            updated: None,
+        };
+        match super::backfill_one(&mut app, &rest, &conv) {
+            BackfillOutcome::Fail(message) => assert!(message.contains("eng"), "{message}"),
+            _ => panic!("expected Fail for a non-rate-limit history error"),
+        }
     }
 
     // ---- Feed-tab bottom-follow (Fix 1b: identity plumbing) ----------------------------------

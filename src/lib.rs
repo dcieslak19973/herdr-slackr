@@ -19,6 +19,7 @@ pub mod socket;
 pub mod theme;
 pub mod tokens;
 pub mod ui;
+pub mod users_cache;
 
 use std::io::{self, Write as _};
 use std::path::PathBuf;
