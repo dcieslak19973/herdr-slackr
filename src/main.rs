@@ -6,6 +6,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
+    if herdr_slackr::cli::owns(&args) {
+        return herdr_slackr::cli::run(args);
+    }
+
     if std::env::var_os("HERDR_PLUGIN_CONFIG_DIR").is_none() {
         eprintln!("herdr-slackr: the pane must run inside herdr (set HERDR_PLUGIN_CONFIG_DIR)");
         return std::process::ExitCode::FAILURE;

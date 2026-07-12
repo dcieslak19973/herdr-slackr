@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod browser;
+pub mod cli;
 pub mod config;
 pub mod entities;
 #[macro_use]
