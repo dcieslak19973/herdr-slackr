@@ -45,8 +45,8 @@ requests, and nothing else.
    - `mpim:read`, `mpim:history`
    - `users:read`
 
-   (Ten scopes total, listed as five pairs above — one `:read` and one `:history` per
-   conversation kind, plus `users:read` for the display-name cache.)
+   (Nine scopes total: four `:read`/`:history` pairs above, one per conversation kind, plus
+   `users:read` for the display-name cache.)
 3. **Socket Mode → Enable Socket Mode.** This generates the app-level token.
 4. **Basic Information → App-Level Tokens → Generate Token and Scopes** — add the
    `connections:open` scope. Copy the token (`xapp-…`); this is `SLACK_APP_TOKEN` /
@@ -178,9 +178,13 @@ Slack's servers) — it's covered here instead, by hand, before each release:
 2. **See a live message.** Post in a subscribed channel or DM from another client. It should
    appear in the Feed tab within a second or two, and on the Mentions tab too if it's a DM or
    mentions you or hits a keyword.
-3. **Kill the network** (disconnect Wi-Fi, or block outbound to `slack.com` at the firewall).
-   Within roughly 30 seconds (one backoff cycle) the status line should show
-   `socket unavailable (…) — polling`.
+3. **Kill the network.** A hard disconnect (turn off Wi-Fi) breaks the TCP connection outright,
+   so the socket errors immediately and the status line should show `socket unavailable (…) —
+   polling` within roughly 30 seconds (one backoff cycle). A firewall block instead (drop
+   outbound to `slack.com` with no reply, rather than refusing it) produces dead air with no
+   socket error, so the read loop has to wait out its 90-second liveness deadline (three 30s read
+   timeouts) before it gives up and reconnects — expect the same status line within roughly 2
+   minutes in that case.
 4. **Verify polling still delivers.** Post another message while still offline-from-socket but
    with REST reachable (or restore just enough connectivity for `conversations.history` to
    answer) — it should appear within `poll_fallback_secs` of its send time.

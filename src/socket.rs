@@ -11,7 +11,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -122,6 +122,31 @@ fn message_from(v: &Value, conv: &str) -> Message {
     }
 }
 
+/// Dead-air liveness deadline for the read loop in [`connect_and_pump_inner`]: the longest
+/// stretch of nothing-but-`WouldBlock`/`TimedOut` ticks (each one bounded by the TCP read
+/// timeout set in [`connect_tls`]) the loop will tolerate before it gives up on the socket and
+/// returns an error, so the normal `Down` + reconnect/backoff path can engage.
+///
+/// This exists because a firewall that silently drops outbound packets (no FIN, no RST) never
+/// produces a socket error — `ws.read()` just keeps timing out forever, and without this
+/// deadline the loop would sit in that state indefinitely instead of ever emitting `Down`,
+/// leaving the polling fallback unable to kick in. 90 seconds is three read-timeout ticks (3 ×
+/// the 30s `set_read_timeout` in `connect_tls`): generous enough that a merely slow-but-live
+/// connection is never mistaken for dead, since Slack pings a healthy socket far more often
+/// than that and tungstenite answers/consumes pings as ordinary reads (each one resets the
+/// clock), but short enough that a truly dead connection is caught well within one manual smoke
+/// test's patience.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Pure predicate behind the liveness deadline: has more than [`LIVENESS_DEADLINE`] elapsed
+/// since the last successfully read frame? Split out from the read loop so the boundary
+/// behavior is unit-testable without a real socket — see [`connect_and_pump_inner`] for the
+/// wiring.
+#[must_use]
+fn silence_exceeded(last_frame: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_frame) > LIVENESS_DEADLINE
+}
+
 /// Reconnect schedule: attempt n (0-based) → seconds, before jitter: `1, 2, 4, 8, ...` capped
 /// at 60, then `jitter` is applied to that base (injected so tests can pin it, e.g. identity
 /// or a fixed +25%).
@@ -217,10 +242,13 @@ fn default_jitter(base: u64) -> u64 {
 /// a `hello` means the session was healthy at least for a while.
 ///
 /// The underlying TCP read has a 30s timeout (set in [`connect_tls`]); Slack pings far more
-/// often than that on a healthy socket, so the timeout firing means true silence, not a slow
-/// but live connection. On timeout the loop just re-checks `cancelled` and reads again — it is
-/// not treated as connection death — which is what lets `cancelled` actually interrupt a
-/// blocked read in a timely fashion instead of waiting out an indefinitely silent socket.
+/// often than that on a healthy socket, so one timeout tick means only a quiet moment, not a
+/// dead connection. On each tick the loop re-checks `cancelled` and reads again — which is what
+/// lets `cancelled` actually interrupt a blocked read in a timely fashion rather than waiting
+/// out an indefinitely silent socket — *unless* ticks have piled up past [`LIVENESS_DEADLINE`]
+/// since the last frame actually read, in which case the silence is presumed to be a dead
+/// connection (e.g. a firewall dropping packets with no FIN/RST) and the loop returns an error
+/// so the normal `Down` + reconnect/backoff path engages.
 fn connect_and_pump(
     app_token: &str,
     tx: &Sender<SocketEvent>,
@@ -245,6 +273,7 @@ fn connect_and_pump_inner(
     let (mut ws, _response) = tungstenite::client::client_with_config(&url, stream, None)
         .map_err(|e| format!("websocket handshake failed: {e}"))?;
 
+    let mut last_frame = Instant::now();
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Ok(());
@@ -257,11 +286,23 @@ fn connect_and_pump_inner(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                // Read timeout tick, not a dead connection: loop back to the cancelled check.
+                // Read timeout tick, not by itself a dead connection — see `connect_and_pump`'s
+                // doc comment. But if ticks like this have piled up past `LIVENESS_DEADLINE`
+                // since the last frame actually read, the silence is no longer explained by a
+                // merely slow socket; treat it as dead so `Down` + reconnect/backoff engages
+                // (this is what lets a firewall's silent packet drop — no FIN/RST, no read
+                // error — still surface as a failure instead of hanging forever).
+                if silence_exceeded(last_frame, Instant::now()) {
+                    return Err(format!(
+                        "no frames for {}s — connection presumed dead",
+                        LIVENESS_DEADLINE.as_secs()
+                    ));
+                }
                 continue;
             }
             Err(e) => return Err(format!("read failed: {e}")),
         };
+        last_frame = Instant::now();
         let tungstenite::Message::Text(text) = msg else {
             continue;
         };
@@ -507,6 +548,29 @@ mod tests {
     fn next_attempt_resets_to_zero_once_hello_was_seen() {
         assert_eq!(next_attempt(0, true), 0);
         assert_eq!(next_attempt(7, true), 0);
+    }
+
+    // ---- silence_exceeded -----------------------------------------------------------------
+
+    #[test]
+    fn silence_exceeded_is_false_before_the_liveness_deadline() {
+        let last_frame = std::time::Instant::now();
+        let now = last_frame + Duration::from_secs(89);
+        assert!(!silence_exceeded(last_frame, now));
+    }
+
+    #[test]
+    fn silence_exceeded_is_false_exactly_at_the_liveness_deadline() {
+        let last_frame = std::time::Instant::now();
+        let now = last_frame + LIVENESS_DEADLINE;
+        assert!(!silence_exceeded(last_frame, now));
+    }
+
+    #[test]
+    fn silence_exceeded_is_true_once_past_the_liveness_deadline() {
+        let last_frame = std::time::Instant::now();
+        let now = last_frame + LIVENESS_DEADLINE + Duration::from_secs(1);
+        assert!(silence_exceeded(last_frame, now));
     }
 
     // ---- url::host_from_wss -------------------------------------------------------------------

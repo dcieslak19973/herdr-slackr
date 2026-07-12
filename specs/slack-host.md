@@ -46,6 +46,7 @@ Every method above is a read. Nothing in this pane calls a `chat.postMessage`/`r
 | S5 | An unparseable frame with no recoverable `envelope_id` is dropped silently; one with an `envelope_id` is still acked, so Slack does not redeliver it forever. |
 | S6 | The reconnect backoff is `1, 2, 4, 8, …` seconds, capped at 60, jittered ±25%, reset to 0 by the next successful `hello`. |
 | S7 | The underlying TCP read has a 30s timeout; a timeout firing is treated as silence, not connection death — Slack pings a healthy socket far more often than that. |
+| S8 | If read-timeout ticks pile up for more than a 90s liveness deadline (three read timeouts) since the last frame actually read, the silence is presumed to be a dead connection (e.g. a firewall dropping packets with no FIN/RST) and the loop errors out so the `Down` + reconnect/backoff path engages — otherwise a dead-air network would never trip the polling fallback. |
 
 **Ack contract (event → emitted app events → ack):**
 
@@ -75,6 +76,7 @@ Every method above is a read. Nothing in this pane calls a `chat.postMessage`/`r
 - A channel the configured user cannot read fails `App::build` with a error naming the channel; this reaches the pane as `Blocked`, not a per-row skip.
 - Any curl transport failure (DNS, TLS, refused connection, cancelled fetch) is classified `Other` and surfaces as the calling operation's own failure path — a backfill/poll failure is swallowed per-conversation (silently skipped, not fatal to the whole pane), while a startup-critical call (`conversations.list`, `auth.test`, `users.list`) fails the whole `App::build`.
 - An unknown/unparseable socket envelope is never a crash: it is acked-and-skipped (S5) with one log line, written to `$HERDR_PLUGIN_STATE_DIR/slackr.log` when that directory is set, a no-op otherwise.
+- A socket gone silent without a read error (dead air — e.g. a firewall dropping packets rather than resetting the connection) is not treated as live forever: past a 90s liveness deadline (S8) since the last frame actually read, the loop errors out so `Down` fires and the polling fallback can engage.
 
 ## Related specs
 
