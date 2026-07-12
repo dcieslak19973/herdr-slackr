@@ -85,3 +85,12 @@ if [ -n "${HOME:-}" ] && mkdir -p "$LOCAL_BIN" 2>/dev/null && ln -sf "$BIN_DIR/$
 else
   echo "$NAME: could not link $LOCAL_BIN/$NAME (non-fatal) — run via $BIN_DIR/$NAME instead" >&2
 fi
+
+# Post-install next steps: printed to stdout on success only, never affects exit status. Points
+# at the agent skill install (the CLAUDE.md reminder it prints matters more than the pane itself
+# for agents that never open a herdr session interactively) and where tokens/config live.
+echo "$NAME: next steps"
+echo "  1) install the agent skill:  npx skills add dcieslak19973/herdr-slackr --skill herdr-slackr -g"
+echo "     (or: $NAME skill-install · or: herdr plugin action invoke skill-install --plugin dcieslak19973.slackr)"
+echo "  2) tokens:  \$HERDR_PLUGIN_CONFIG_DIR/tokens.toml (chmod 600) or SLACK_APP_TOKEN/SLACK_USER_TOKEN"
+echo "     config:  \$HERDR_PLUGIN_CONFIG_DIR/config.toml (channels = [...])"

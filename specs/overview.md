@@ -59,3 +59,4 @@ Out of scope by explicit choice, not by oversight:
 - [config](./config.md)
 - [pane](./pane.md)
 - [slack-host](./slack-host.md)
+- [agent-cli](./agent-cli.md)
