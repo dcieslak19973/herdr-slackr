@@ -1,0 +1,504 @@
+//! Slack Web API access via `curl`: read-only REST calls for conversations, messages, users,
+//! and permalinks, plus the one REST call Socket Mode needs (`apps.connections.open`). See
+//! `docs/superpowers/specs/2026-07-12-herdr-slackr-design.md`.
+//!
+//! Every call runs `curl --silent --show-error --config - <url>` with the bearer token carried
+//! on stdin as `header = "Authorization: Bearer <token>"` — never in argv, so it never appears
+//! in `ps`/`/proc`'s visible arguments (same shape as `herdr-reviewr`'s Bitbucket backend).
+//!
+//! **No `--fail`.** Slack's Web API answers HTTP 200 even on failure, wrapping the error as
+//! `{"ok": false, "error": "..."}` in the body — `--fail` only maps *HTTP status* failures to a
+//! curl exit code, so it would never see a Slack-level error and buys nothing here. Instead
+//! every response is parsed regardless of transport outcome, and `ok` is checked on every call.
+//! A `ratelimited` error is Slack's signal for HTTP 429; Slack does not echo the triggering
+//! `Retry-After` value into that JSON body, so [`RestError::RateLimited`] carries a fixed 30s
+//! default rather than a parsed one.
+#![allow(clippy::result_large_err)]
+
+use std::sync::atomic::AtomicBool;
+
+use serde_json::Value;
+
+use crate::model::{ConvKind, Conversation, Message};
+
+const BASE: &str = "https://slack.com/api/";
+
+/// One REST session: the user token (`xoxp-...`) used for every Web API call in this module
+/// except [`connections_open`], and the cancellation flag shared with the rest of the fetch.
+#[derive(Debug)]
+pub struct Rest<'a> {
+    pub user_token: &'a str,
+    pub cancelled: &'a AtomicBool,
+}
+
+/// A classified REST failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestError {
+    /// `curl` is not on `PATH`.
+    NoCurl,
+    /// Slack answered `{"ok": false, "error": "..."}`; the `error` field verbatim
+    /// (`invalid_auth`, `channel_not_found`, …).
+    SlackError(String),
+    /// Slack answered `{"ok": false, "error": "ratelimited"}`; the suggested backoff in
+    /// seconds (a fixed default — see the module doc).
+    RateLimited(u64),
+    /// Any other transport, I/O, or JSON-shape failure.
+    Other(String),
+}
+
+impl Rest<'_> {
+    /// GET `method` with `params` (percent-encoded query values), parse the JSON body, and map
+    /// a non-`ok` response, a `ratelimited` error, or a transport failure to [`RestError`].
+    pub fn get(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, RestError> {
+        let query = build_query(params);
+        let url = if query.is_empty() {
+            format!("{BASE}{method}")
+        } else {
+            format!("{BASE}{method}?{query}")
+        };
+        let config = curl_config(self.user_token);
+        let args = get_args(&url);
+        let out = crate::proc::run_tool("curl", &args, Some(&config), self.cancelled)
+            .map_err(classify)?;
+        parse_response(&out)
+    }
+}
+
+/// The socket worker's one REST need, authenticated with the APP token (`xapp-...`) instead of
+/// the user token: open a Socket Mode connection and return its `wss://` URL.
+pub fn connections_open(app_token: &str, cancelled: &AtomicBool) -> Result<String, RestError> {
+    let url = format!("{BASE}apps.connections.open");
+    let config = curl_config(app_token);
+    let args = post_args(&url);
+    let out = crate::proc::run_tool("curl", &args, Some(&config), cancelled).map_err(classify)?;
+    let v = parse_response(&out)?;
+    v["url"].as_str().map(str::to_string).ok_or_else(|| RestError::Other("missing url".to_string()))
+}
+
+/// All subscribed conversations (channels, groups, IMs, MPIMs), paginated to completion.
+pub fn list_conversations(rest: &Rest) -> Result<Vec<Conversation>, RestError> {
+    let mut cursor = String::new();
+    let mut out = Vec::new();
+    loop {
+        let params = [
+            ("types", "public_channel,private_channel,im,mpim"),
+            ("limit", "200"),
+            ("cursor", cursor.as_str()),
+        ];
+        let v = rest.get("conversations.list", &params)?;
+        out.extend(parse_conversations(&v));
+        match next_cursor(&v) {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The most recent `limit` messages in `conv`.
+pub fn history(rest: &Rest, conv: &str, limit: u32) -> Result<Vec<Message>, RestError> {
+    let limit = limit.to_string();
+    let v = rest.get("conversations.history", &[("channel", conv), ("limit", &limit)])?;
+    Ok(parse_messages(&v, conv))
+}
+
+/// All replies in the thread rooted at `thread_ts` within `conv`.
+pub fn replies(rest: &Rest, conv: &str, thread_ts: &str) -> Result<Vec<Message>, RestError> {
+    let v = rest.get("conversations.replies", &[("channel", conv), ("ts", thread_ts)])?;
+    Ok(parse_messages(&v, conv))
+}
+
+/// Every workspace member as `(id, display name)`, paginated to completion. The name is
+/// `profile.display_name` when set, else `profile.real_name`, else the top-level `real_name`,
+/// else the id itself.
+pub fn users(rest: &Rest) -> Result<Vec<(String, String)>, RestError> {
+    let mut cursor = String::new();
+    let mut out = Vec::new();
+    loop {
+        let v = rest.get("users.list", &[("limit", "200"), ("cursor", cursor.as_str())])?;
+        out.extend(parse_users(&v));
+        match next_cursor(&v) {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// A permalink URL for one message.
+pub fn permalink(rest: &Rest, conv: &str, ts: &str) -> Result<String, RestError> {
+    let v = rest.get("chat.getPermalink", &[("channel", conv), ("message_ts", ts)])?;
+    v["permalink"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| RestError::Other("missing permalink".to_string()))
+}
+
+/// The authenticated user's own id, for self-mention detection.
+pub fn auth_self(rest: &Rest) -> Result<String, RestError> {
+    let v = rest.get("auth.test", &[])?;
+    v["user_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| RestError::Other("missing user_id".to_string()))
+}
+
+// ---- Transport ------------------------------------------------------------------------------
+
+/// The stdin curl config carrying the bearer token — never argv, so it never appears in
+/// `ps`/`/proc`'s visible arguments.
+fn curl_config(token: &str) -> String {
+    format!("header = \"Authorization: Bearer {token}\"\n")
+}
+
+/// The GET args: no `--fail` (see the module doc), config from stdin (`-`).
+fn get_args(url: &str) -> Vec<&str> {
+    vec!["--silent", "--show-error", "--config", "-", url]
+}
+
+/// As [`get_args`], but forcing a POST — the only caller is [`connections_open`].
+fn post_args(url: &str) -> Vec<&str> {
+    vec!["--silent", "--show-error", "--request", "POST", "--config", "-", url]
+}
+
+/// `NotFound` → [`RestError::NoCurl`]; a cancelled/IO failure or a transport-level `curl`
+/// failure (no HTTP response at all — refused connection, DNS, TLS, timeout) → `Other`. A
+/// non-2xx HTTP status is not in this match at all: without `--fail`, curl treats it as success
+/// and this module reads Slack's `ok`/`error` fields from the body instead (module doc).
+fn classify(f: crate::proc::RunFail) -> RestError {
+    match f {
+        crate::proc::RunFail::NotFound => RestError::NoCurl,
+        crate::proc::RunFail::Cancelled => RestError::Other("request cancelled".to_string()),
+        crate::proc::RunFail::Io(message) => RestError::Other(message),
+        crate::proc::RunFail::Failed { stderr } => RestError::Other(stderr.trim().to_string()),
+    }
+}
+
+/// Parse `out` as JSON and apply [`check_ok`]. Split from `check_ok` so the ok/error decision
+/// is pure and fixture-testable without a JSON parse in the way.
+fn parse_response(out: &str) -> Result<Value, RestError> {
+    let v: Value =
+        serde_json::from_str(out).map_err(|e| RestError::Other(format!("invalid JSON: {e}")))?;
+    check_ok(v)
+}
+
+/// Slack's uniform envelope: `ok: true` passes `v` through; `ok: false` reads `error`, mapping
+/// `ratelimited` to a fixed 30s [`RestError::RateLimited`] (module doc) and anything else to
+/// [`RestError::SlackError`] verbatim.
+fn check_ok(v: Value) -> Result<Value, RestError> {
+    if v["ok"].as_bool() == Some(true) {
+        return Ok(v);
+    }
+    let error = v["error"].as_str().unwrap_or("unknown_error");
+    if error == "ratelimited" {
+        return Err(RestError::RateLimited(30));
+    }
+    Err(RestError::SlackError(error.to_string()))
+}
+
+/// Percent-encode for a URL query value: unreserved chars pass, all else `%XX`. Copied from
+/// `herdr-reviewr`'s `src/forge/mod.rs::enc`.
+fn enc(s: &str) -> String {
+    s.bytes()
+        .flat_map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{b:02X}").chars().collect(),
+        })
+        .collect()
+}
+
+/// Build a `key=value&...` query string, each key and value percent-encoded independently.
+fn build_query(params: &[(&str, &str)]) -> String {
+    params.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+}
+
+// ---- Pure parsing (unit-tested on fixtures) --------------------------------------------------
+
+/// `response_metadata.next_cursor`, treating an absent or empty cursor as "no more pages" —
+/// Slack's own convention for the last page.
+fn next_cursor(v: &Value) -> Option<String> {
+    v["response_metadata"]["next_cursor"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// `conversations.list`'s `channels[]` to [`Conversation`]s. Kind is read off Slack's four
+/// boolean flags, checked `im` → `mpim` → `group` → default `channel` (a channel object may not
+/// set `is_channel` explicitly on every API version, so it is the fallback rather than a
+/// required flag). An IM's `name` is its counterpart `user` id — Slack has no channel-style name
+/// for a DM — resolved to a display name later by pairing with [`users`]'s output. A channel's
+/// `name` prefers `name_normalized` (Slack's canonicalized form) and falls back to `name`.
+fn parse_conversations(v: &Value) -> Vec<Conversation> {
+    v["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let id = c["id"].as_str()?.to_string();
+            let kind = if c["is_im"].as_bool() == Some(true) {
+                ConvKind::Im
+            } else if c["is_mpim"].as_bool() == Some(true) {
+                ConvKind::Mpim
+            } else if c["is_group"].as_bool() == Some(true) {
+                ConvKind::Group
+            } else {
+                ConvKind::Channel
+            };
+            let name = if kind == ConvKind::Im {
+                c["user"].as_str().unwrap_or_default().to_string()
+            } else {
+                c["name_normalized"]
+                    .as_str()
+                    .or_else(|| c["name"].as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Some(Conversation { id, name, kind })
+        })
+        .collect()
+}
+
+/// `conversations.history`/`conversations.replies`'s `messages[]` to [`Message`]s, in the order
+/// Slack returned them (this module never re-sorts). `thread_ts` becomes `None` when absent *or*
+/// equal to the message's own `ts` — Slack sets a thread root's `thread_ts` to its own `ts`, and
+/// per `Message`'s contract that case is a top-level message, not a reply to itself.
+fn parse_messages(v: &Value, conv: &str) -> Vec<Message> {
+    v["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| {
+            let ts = m["ts"].as_str().unwrap_or_default().to_string();
+            let thread_ts = m["thread_ts"].as_str().filter(|t| *t != ts).map(str::to_string);
+            Message {
+                conv: conv.to_string(),
+                ts,
+                thread_ts,
+                author: m["user"].as_str().unwrap_or_default().to_string(),
+                text: m["text"].as_str().unwrap_or_default().to_string(),
+                edited: !m["edited"].is_null(),
+            }
+        })
+        .collect()
+}
+
+/// `users.list`'s `members[]` to `(id, name)` pairs; name resolution order in the function doc.
+fn parse_users(v: &Value) -> Vec<(String, String)> {
+    v["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|u| {
+            let id = u["id"].as_str()?.to_string();
+            let display = u["profile"]["display_name"].as_str().filter(|s| !s.is_empty());
+            let profile_real = u["profile"]["real_name"].as_str().filter(|s| !s.is_empty());
+            let top_real = u["real_name"].as_str().filter(|s| !s.is_empty());
+            let name = display.or(profile_real).or(top_real).unwrap_or(&id).to_string();
+            Some((id, name))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- curl-arg construction: token stays out of argv -------------------------------------
+
+    #[test]
+    fn curl_config_carries_the_bearer_token_as_a_header_line() {
+        let config = curl_config("xoxp-secret");
+        assert_eq!(config, "header = \"Authorization: Bearer xoxp-secret\"\n");
+    }
+
+    #[test]
+    fn get_args_never_puts_the_token_or_bearer_header_in_argv() {
+        let args = get_args("https://slack.com/api/auth.test");
+        assert_eq!(
+            args,
+            vec!["--silent", "--show-error", "--config", "-", "https://slack.com/api/auth.test"]
+        );
+        assert!(!args.iter().any(|a| a.contains("Bearer") || a.contains("Authorization")));
+        assert!(!args.contains(&"--fail")); // module doc: --fail is deliberately absent
+    }
+
+    #[test]
+    fn post_args_forces_post_and_still_keeps_the_token_off_argv() {
+        let args = post_args("https://slack.com/api/apps.connections.open");
+        assert!(args.contains(&"--request"));
+        assert!(args.contains(&"POST"));
+        assert!(!args.iter().any(|a| a.contains("Bearer")));
+    }
+
+    // ---- enc / query building ----------------------------------------------------------------
+
+    #[test]
+    fn enc_passes_unreserved_and_percent_encodes_everything_else() {
+        assert_eq!(enc("abcXYZ019-._~"), "abcXYZ019-._~");
+        assert_eq!(enc("a b"), "a%20b");
+        assert_eq!(enc("public_channel,im"), "public_channel%2Cim");
+        assert_eq!(enc("1752300000.000100"), "1752300000.000100");
+    }
+
+    #[test]
+    fn build_query_encodes_each_key_and_value_independently() {
+        assert_eq!(build_query(&[("channel", "C1"), ("limit", "200")]), "channel=C1&limit=200");
+        assert_eq!(build_query(&[("cursor", "a b")]), "cursor=a%20b");
+        assert_eq!(build_query(&[]), "");
+    }
+
+    // ---- ok / error envelope -------------------------------------------------------------------
+
+    #[test]
+    fn check_ok_passes_through_a_true_ok_response() {
+        let v = serde_json::json!({"ok": true, "user_id": "U1"});
+        assert_eq!(check_ok(v.clone()).unwrap(), v);
+    }
+
+    #[test]
+    fn check_ok_maps_a_named_slack_error() {
+        let v = serde_json::json!({"ok": false, "error": "invalid_auth"});
+        assert_eq!(check_ok(v).unwrap_err(), RestError::SlackError("invalid_auth".to_string()));
+    }
+
+    #[test]
+    fn check_ok_maps_ratelimited_to_a_fixed_thirty_second_backoff() {
+        let v = serde_json::json!({"ok": false, "error": "ratelimited"});
+        assert_eq!(check_ok(v).unwrap_err(), RestError::RateLimited(30));
+    }
+
+    #[test]
+    fn parse_response_surfaces_invalid_json_as_other() {
+        let err = parse_response("not json").unwrap_err();
+        assert!(matches!(err, RestError::Other(_)));
+    }
+
+    // ---- conversations.list ---------------------------------------------------------------
+
+    #[test]
+    fn parse_conversations_reads_all_four_kinds_and_the_im_name_is_the_counterpart_user_id() {
+        let v = serde_json::json!({
+            "ok": true,
+            "channels": [
+                {"id": "C1", "name": "general", "name_normalized": "general",
+                 "is_channel": true, "is_group": false, "is_im": false, "is_mpim": false},
+                {"id": "G1", "name": "priv-team", "name_normalized": "priv-team",
+                 "is_channel": false, "is_group": true, "is_im": false, "is_mpim": false},
+                {"id": "D1", "user": "U42",
+                 "is_channel": false, "is_group": false, "is_im": true, "is_mpim": false},
+                {"id": "M1", "name": "mpdm-a-b-1", "name_normalized": "mpdm-a-b-1",
+                 "is_channel": false, "is_group": true, "is_im": false, "is_mpim": true}
+            ]
+        });
+        let convs = parse_conversations(&v);
+        assert_eq!(convs.len(), 4);
+        assert_eq!(
+            convs[0],
+            Conversation { id: "C1".into(), name: "general".into(), kind: ConvKind::Channel }
+        );
+        assert_eq!(
+            convs[1],
+            Conversation { id: "G1".into(), name: "priv-team".into(), kind: ConvKind::Group }
+        );
+        // The IM's "name" is the counterpart user id, resolved to a display name later.
+        assert_eq!(
+            convs[2],
+            Conversation { id: "D1".into(), name: "U42".into(), kind: ConvKind::Im }
+        );
+        assert_eq!(
+            convs[3],
+            Conversation { id: "M1".into(), name: "mpdm-a-b-1".into(), kind: ConvKind::Mpim }
+        );
+    }
+
+    #[test]
+    fn parse_conversations_skips_entries_missing_an_id() {
+        let v = serde_json::json!({"channels": [{"name": "no-id"}]});
+        assert!(parse_conversations(&v).is_empty());
+    }
+
+    #[test]
+    fn next_cursor_treats_absent_or_empty_as_the_last_page() {
+        assert_eq!(
+            next_cursor(&serde_json::json!({"response_metadata": {"next_cursor": "abc"}})),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            next_cursor(&serde_json::json!({"response_metadata": {"next_cursor": ""}})),
+            None
+        );
+        assert_eq!(next_cursor(&serde_json::json!({})), None);
+    }
+
+    // ---- history / replies -----------------------------------------------------------------
+
+    #[test]
+    fn parse_messages_reads_ts_author_text_and_preserves_slack_ordering() {
+        let v = serde_json::json!({
+            "messages": [
+                {"ts": "1752300000.000200", "user": "U1", "text": "second"},
+                {"ts": "1752300000.000100", "user": "U2", "text": "first"}
+            ]
+        });
+        let msgs = parse_messages(&v, "C1");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].ts, "1752300000.000200"); // order preserved, not re-sorted here
+        assert_eq!(msgs[0].author, "U1");
+        assert_eq!(msgs[0].text, "second");
+        assert_eq!(msgs[0].conv, "C1");
+        assert!(!msgs[0].edited);
+    }
+
+    #[test]
+    fn parse_messages_a_thread_root_own_thread_ts_is_none_but_a_reply_carries_the_root() {
+        let v = serde_json::json!({
+            "messages": [
+                {"ts": "100.000001", "user": "U1", "text": "root", "thread_ts": "100.000001"},
+                {"ts": "100.000002", "user": "U2", "text": "reply", "thread_ts": "100.000001"}
+            ]
+        });
+        let msgs = parse_messages(&v, "C1");
+        assert_eq!(msgs[0].thread_ts, None); // root: thread_ts == its own ts
+        assert_eq!(msgs[1].thread_ts, Some("100.000001".to_string()));
+    }
+
+    #[test]
+    fn parse_messages_marks_edited_when_the_edited_object_is_present() {
+        let v = serde_json::json!({
+            "messages": [
+                {"ts": "1.1", "user": "U1", "text": "x", "edited": {"user": "U1", "ts": "1.2"}},
+                {"ts": "1.2", "user": "U1", "text": "y"}
+            ]
+        });
+        let msgs = parse_messages(&v, "C1");
+        assert!(msgs[0].edited);
+        assert!(!msgs[1].edited);
+    }
+
+    // ---- users.list -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_users_prefers_display_name_then_falls_back_to_real_name() {
+        let v = serde_json::json!({
+            "members": [
+                {"id": "U1", "real_name": "Top Real", "profile": {"display_name": "Nick", "real_name": "Profile Real"}},
+                {"id": "U2", "real_name": "Top Real", "profile": {"display_name": "", "real_name": "Profile Real"}},
+                {"id": "U3", "real_name": "Top Real", "profile": {"display_name": ""}},
+                {"id": "U4", "profile": {}}
+            ]
+        });
+        let users = parse_users(&v);
+        assert_eq!(users[0], ("U1".to_string(), "Nick".to_string()));
+        assert_eq!(users[1], ("U2".to_string(), "Profile Real".to_string()));
+        assert_eq!(users[2], ("U3".to_string(), "Top Real".to_string()));
+        assert_eq!(users[3], ("U4".to_string(), "U4".to_string())); // last resort: the id itself
+    }
+
+    // ---- auth.test --------------------------------------------------------------------------
+
+    #[test]
+    fn auth_test_response_carries_the_self_user_id() {
+        let v = serde_json::json!({"ok": true, "user_id": "U999", "team_id": "T1"});
+        assert_eq!(v["user_id"].as_str(), Some("U999"));
+    }
+}

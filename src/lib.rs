@@ -5,4 +5,6 @@
 pub mod config;
 pub mod entities;
 pub mod model;
+pub mod proc;
+pub mod rest;
 pub mod tokens;
