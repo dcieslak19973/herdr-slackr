@@ -300,6 +300,11 @@ impl App {
             SocketEvent::Connected => {
                 self.polling = false;
                 self.status.clear();
+                // A cooldown set from a `RateLimited` hit before this reconnect must not
+                // outlive it: a healthy socket means Slack accepted our connection, so the
+                // poll path restarts clean rather than silently no-oping the next manual `r`
+                // until a now-stale deadline lapses.
+                self.cooldown_until = None;
             }
             SocketEvent::Down(reason) => {
                 self.polling = true;
@@ -1311,6 +1316,26 @@ mod tests {
         app.apply(SocketEvent::Connected);
         assert!(!app.polling);
         assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn connected_event_clears_a_stale_cooldown_so_a_manual_poll_proceeds() {
+        // A cooldown set before a reconnect must not silently no-op the user's next manual poll
+        // (`r`) until its deadline lapses: a healthy socket means Slack accepted the connection,
+        // so the poll path should restart clean.
+        let mut app = empty_app();
+        let now = Instant::now();
+        app.cooldown_until = Some(now + Duration::from_secs(30));
+
+        app.apply(SocketEvent::Connected);
+        assert_eq!(app.cooldown_until, None);
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // Still "before" the old deadline had it not been cleared — the tick must nonetheless
+        // run both conversations (observable via the cursor wrapping back to 0), not skip.
+        app.poll_tick_at(&rest, now);
+        assert_eq!(app.poll_cursor, 0, "both conversations were visited and the cursor wrapped");
     }
 
     // ---- toggle_expand_or_read / toggle_read dispatch by tab ---------------------------------

@@ -67,7 +67,7 @@ Every method above is a read. Nothing in this pane calls a `chat.postMessage`/`r
 | F3  | Once polling has started, it repeats every `poll_fallback_secs` until a `Connected` event clears the streak. |
 | F4  | A message seen via both the socket and a poll re-fetch appears exactly once — `(conv, ts)` identity dedups. |
 | F5  | A poll-delivered edit (re-fetched history carrying a since-edited message) still surfaces the edit, without moving the row's position in the unread divider's arrival order. |
-| F6  | Socket recovery (`Connected`) clears `polling` and the status-bar notice silently — no separate "back online" message. |
+| F6  | Socket recovery (`Connected`) clears `polling`, the status-bar notice, and any pending rate-limit cooldown silently — no separate "back online" message. A cooldown started before the reconnect does not outlive it; a healthy socket means Slack accepted the connection, so the next poll (including a manual `r`) runs immediately rather than waiting out a now-stale deadline. |
 
 ## Failure semantics
 
