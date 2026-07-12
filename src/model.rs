@@ -52,9 +52,20 @@ fn split_ts(ts: &str) -> Option<(u64, u64)> {
     Some((secs, seq))
 }
 
+/// Derive a sortable `(seconds, sequence)` key from a Slack `ts` string, for use as a
+/// `BTreeMap` key (e.g. `crate::app`'s message store) where a total order — not a
+/// lexical-fallback comparator like [`ts_cmp`] — is what the caller needs. Delegates to the
+/// same parse [`ts_cmp`] uses; malformed input (non-numeric halves) yields `(0, 0)` rather
+/// than panicking, so a handful of garbled timestamps just collide at the front of the map
+/// instead of crashing the pane.
+#[must_use]
+pub fn ts_key(ts: &str) -> (u64, u32) {
+    split_ts(ts).map_or((0, 0), |(secs, seq)| (secs, u32::try_from(seq).unwrap_or(u32::MAX)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConvKind, ts_cmp};
+    use super::{ConvKind, ts_cmp, ts_key};
     use std::cmp::Ordering;
 
     #[test]
@@ -89,5 +100,15 @@ mod tests {
         // Not a panic site: a malformed ts still yields a total order via string compare.
         assert_eq!(ts_cmp("garbage", "garbage"), Ordering::Equal);
         assert_eq!(ts_cmp("abc", "abd"), Ordering::Less);
+    }
+
+    #[test]
+    fn ts_key_splits_seconds_and_sequence() {
+        assert_eq!(ts_key("1752300000.000100"), (1_752_300_000, 100));
+    }
+
+    #[test]
+    fn ts_key_malformed_input_is_zero_not_a_panic() {
+        assert_eq!(ts_key("garbage"), (0, 0));
     }
 }
