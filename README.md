@@ -127,6 +127,7 @@ dms = true                               # include IMs/MPIMs (default true)
 keywords = ["deploy", "oncall"]          # extra Mentions-tab triggers (default none)
 theme = "catppuccin"                     # palette name (see Theme below)
 poll_fallback_secs = 30                  # seconds between polls while the socket is down; 5..=300
+dm_limit = 20                            # cap on subscribed DMs/MPIMs when dms=true; 0..=200
 ```
 
 `channels` is the only required key; every other key has a documented default. A missing config
@@ -138,6 +139,28 @@ the pane. See [specs/config.md](specs/config.md) for the full contract.
 
 A configured channel name that doesn't resolve to a real channel is an error naming that channel.
 A channel you can't read surfaces Slack's error verbatim in the status line.
+
+### Rate limits
+
+herdr-slackr is deliberately conservative about how hard it hits Slack's Web API. The polling
+fallback (while the socket is down) fetches only 8 conversations per tick, round-robin across
+every subscribed conversation, and asks Slack only for messages newer than the last one already
+seen — a caught-up tick's response is typically empty rather than re-shipping the last 50 messages
+every time. If Slack answers with a real rate limit, the pane reads its actual `Retry-After` value
+and pauses all polling until that deadline passes, rather than guessing at a fixed backoff; a
+socket reconnect always clears a pending cooldown immediately, since a healthy socket means Slack
+has already accepted the connection. The workspace's `users.list` directory (used for display
+names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so a pane restart or a CLI
+invocation doesn't refetch the whole member list every time. Startup backfill retries a
+rate-limited conversation exactly once (sleeping the real `Retry-After` first) before giving up on
+the rest of the list for that session — the socket/poll paths fill in what backfill couldn't.
+
+`dm_limit` (default 20, valid `0..=200`) caps how many of your DMs/MPIMs are actively subscribed
+when `dms = true`, ranked by most-recently-active; `0` means no DMs are polled or backfilled at
+all, even with `dms = true`. A DM outside the cap is not completely invisible, though: if a message
+arrives on it over the live Socket Mode connection, it still shows up in the Feed/Mentions tabs —
+only the REST-driven backfill and polling paths respect the cap, since the socket subscribes to
+events for the whole workspace regardless of which conversations this pane chose to track.
 
 ### Theme
 

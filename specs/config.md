@@ -18,6 +18,7 @@ dms = false                              # default true
 keywords = ["deploy", "oncall"]          # default []
 theme = "tokyo-night"                    # default "catppuccin"
 poll_fallback_secs = 45                  # default 30
+dm_limit = 15                            # default 20
 ```
 
 | key                   | value                                                              |
@@ -27,6 +28,7 @@ poll_fallback_secs = 45                  # default 30
 | `keywords`            | array of strings; extra Mentions-tab triggers, matched case-insensitively as a substring |
 | `theme`               | a palette name (see below); an unrecognized name is a runtime warning, not a config error |
 | `poll_fallback_secs`  | integer in `5..=300`; seconds between polls while the socket is down |
+| `dm_limit`            | integer in `0..=200`; caps how many `Im`/`Mpim` conversations are subscribed when `dms = true`, ranked by most-recently-active (`conversations.list`'s `updated`); `0` subscribes none even when `dms = true` |
 
 Tokens live in a separate file, `tokens.toml` in the same directory, or the environment:
 
@@ -50,6 +52,7 @@ Tokens live in a separate file, `tokens.toml` in the same directory, or the envi
 | C9 | On Unix, a `tokens.toml` readable by group or world is refused with a `chmod 600 <path>` remedy, before its contents are ever parsed. |
 | C10 | No error message constructed by config or token resolution ever contains a candidate token value. |
 | C11 | A configured channel name that resolves to no real conversation is an error naming that channel. |
+| C12 | When the subscribed DM/MPIM set exceeds `dm_limit`, the cap keeps the most-recently-active ones (`updated` descending); if any candidate is missing `updated`, ranking falls back to Slack's own list order instead of guessing, logged once. `dm_limit = 0` excludes DMs entirely, independent of `dms`. A DM outside the cap is not backfilled or polled, but a message on it can still arrive live over the socket (`slack-host.md`). |
 
 An error names the config path and the read, syntax, key, or value failure, and states the expected form when a value is invalid.
 
