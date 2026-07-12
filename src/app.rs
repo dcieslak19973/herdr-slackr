@@ -2,9 +2,13 @@
 //! `docs/superpowers/specs/2026-07-12-herdr-slackr-design.md` §The pane and §Testing.
 //!
 //! [`App`] owns every subscribed conversation's messages in one `BTreeMap` keyed by a
-//! sortable `(seconds, sequence, conv id)` tuple (`crate::model::ts_key` plus the conv id as
-//! a tiebreaker, since two conversations can in principle share a `ts`), so iterating the map
-//! in key order *is* the Feed tab's chronological, cross-conversation order for free.
+//! sortable `(seconds, sequence, conv id, ts string)` tuple (`crate::model::ts_key` plus the
+//! conv id as a tiebreaker, since two conversations can in principle share a `ts`, plus the
+//! raw `ts` string as a final tiebreaker so that distinct malformed `ts` values — which all
+//! collapse to `ts_key`'s `(0, 0)` fallback — never collide and silently overwrite one
+//! another), so iterating the map in key order *is* the Feed tab's chronological,
+//! cross-conversation order for free (the `ts`-string tiebreak only ever matters when the
+//! numeric key is otherwise equal, so well-formed ordering is unchanged).
 //!
 //! [`App::build`] is the only I/O edge: it resolves configured channel names to ids, fetches
 //! the self user id and the workspace's user list, and backfills each subscribed
@@ -58,12 +62,16 @@ struct Stored {
 
 /// A message's map key: `ts_key` (seconds, sequence) first so iteration order is
 /// chronological, then the conv id as a tiebreaker for the (practically impossible, but not
-/// forbidden) case of two conversations sharing a `ts`.
-type Key = (u64, u32, String);
+/// forbidden) case of two conversations sharing a `ts`, then the raw `ts` string itself as a
+/// final tiebreaker. That last field is what keeps distinct malformed timestamps from
+/// colliding: `ts_key` maps every unparseable `ts` to `(0, 0)`, so without the `ts` string in
+/// the key, two different garbled messages in the same conv would land on the same key and
+/// the second `upsert_new`/`upsert_edit` would silently clobber the first.
+type Key = (u64, u32, String, String);
 
 fn key_for(conv: &str, ts: &str) -> Key {
     let (secs, seq) = ts_key(ts);
-    (secs, seq, conv.to_string())
+    (secs, seq, conv.to_string(), ts.to_string())
 }
 
 /// A row plus the arrival counter used only to place the unread divider (see
@@ -80,7 +88,10 @@ type IdRow = (Option<(String, String)>, Row);
 pub struct App {
     pub tab: Tab,
     /// Index into `visible_rows()` of the active tab (`feed_rows()` for `Tab::Feed`,
-    /// `mention_rows()` for `Tab::Mentions`).
+    /// `mention_rows()` for `Tab::Mentions`). Positional, but kept in sync with `selected` by
+    /// `resync_cursor` after every row-set change, so it stays pointed at the same identity
+    /// rather than silently retargeting when rows are inserted/removed elsewhere — see
+    /// `move_cursor`.
     pub cursor: usize,
     /// One-line notice (socket down, rate limit, …); empty when there's nothing to say.
     pub status: String,
@@ -97,6 +108,13 @@ pub struct App {
     expanded: HashSet<(String, String)>,
     /// Mentions marked read, keyed by `(conv, ts)`. Absence means unread.
     read_mentions: HashSet<(String, String)>,
+    /// Identity (`(conv, ts)`) of the currently selected row, independent of its position in
+    /// the active tab's row list. `move_cursor` sets this when the cursor moves; `resync_cursor`
+    /// re-derives the public `cursor` index from it after any row-set change (insert/delete),
+    /// so an action taken right after e.g. a poll backfill still lands on the row the user
+    /// actually selected rather than whatever now happens to sit at the old index. `None`
+    /// before any selection has been made, or once the selected row list is empty.
+    selected: Option<(String, String)>,
     self_id: String,
     keywords: Vec<String>,
     /// Monotonic counter, incremented once per newly-seen message (see [`Stored::arrival`]).
@@ -145,6 +163,7 @@ impl App {
             messages: BTreeMap::new(),
             expanded: HashSet::new(),
             read_mentions: HashSet::new(),
+            selected: None,
             self_id,
             keywords: config.keywords().to_vec(),
             arrival_seq: 0,
@@ -161,6 +180,7 @@ impl App {
         // Everything just backfilled counts as already-seen: the divider only ever marks
         // messages that arrive after this point.
         app.touch();
+        app.resync_cursor();
 
         Ok(app)
     }
@@ -183,6 +203,7 @@ impl App {
             SocketEvent::Changed(msg) => self.upsert_edit(msg),
             SocketEvent::Deleted { conv, ts } => self.remove(&conv, &ts),
         }
+        self.resync_cursor();
     }
 
     /// Fallback mode: re-pull the last 50 messages of every subscribed conversation.
@@ -197,6 +218,83 @@ impl App {
                 }
             }
         }
+        self.resync_cursor();
+    }
+
+    /// Move the cursor by `delta` rows within the active tab's current row list, clamping to
+    /// its bounds, and record the newly-selected row's identity so a later row-set change can
+    /// re-find it by identity rather than position (see `resync_cursor`). The method Task 7's
+    /// event loop calls on up/down key presses.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let ids = self.current_ids();
+        if ids.is_empty() {
+            self.cursor = 0;
+            self.selected = None;
+            return;
+        }
+        let max = ids.len() as isize - 1;
+        let new_pos = (self.cursor as isize + delta).clamp(0, max);
+        #[allow(clippy::cast_sign_loss)]
+        let new_pos = new_pos as usize;
+        self.cursor = new_pos;
+        self.selected.clone_from(&ids[new_pos]);
+    }
+
+    /// The active tab's current row identities, in row order (`None` only ever appears for the
+    /// Feed tab's synthetic `Divider` row).
+    fn current_ids(&self) -> Vec<Option<(String, String)>> {
+        match self.tab {
+            Tab::Feed => self.feed_rows_with_ids().into_iter().map(|(id, _)| id).collect(),
+            Tab::Mentions => {
+                self.mention_rows_with_ids().into_iter().map(|(id, _)| Some(id)).collect()
+            }
+        }
+    }
+
+    /// Re-derive `cursor` from `selected` after a row-set change: if the previously-selected
+    /// identity still names a row in the active tab, `cursor` snaps to its new position;
+    /// otherwise `cursor` is clamped into bounds and `selected` follows it to whatever row now
+    /// sits there (or `None` if the row list is now empty).
+    fn resync_cursor(&mut self) {
+        let ids = self.current_ids();
+        if ids.is_empty() {
+            self.cursor = 0;
+            self.selected = None;
+            return;
+        }
+        if let Some(sel) = self.selected.clone()
+            && let Some(pos) = ids.iter().position(|id| id.as_ref() == Some(&sel))
+        {
+            self.cursor = pos;
+            return;
+        }
+        self.cursor = self.cursor.min(ids.len() - 1);
+        self.selected.clone_from(&ids[self.cursor]);
+    }
+
+    /// Resolve the Feed-tab row/id the next action (`toggle_expand`, permalink) should target:
+    /// the stored `selected` identity if it still names a row, else the positional `cursor`
+    /// (covers direct `cursor` assignment without going through `move_cursor`, as the existing
+    /// tests do).
+    fn feed_target(&self) -> Option<((String, String), Row)> {
+        let rows = self.feed_rows_with_ids();
+        if let Some(sel) = &self.selected
+            && let Some((_, row)) = rows.iter().find(|(id, _)| id.as_ref() == Some(sel))
+        {
+            return Some((sel.clone(), row.clone()));
+        }
+        rows.into_iter().nth(self.cursor).and_then(|(id, row)| id.map(|id| (id, row)))
+    }
+
+    /// As `feed_target`, for the Mentions tab (whose rows always carry an id).
+    fn mention_target(&self) -> Option<((String, String), Row)> {
+        let rows = self.mention_rows_with_ids();
+        if let Some(sel) = &self.selected
+            && let Some((_, row)) = rows.iter().find(|(id, _)| id == sel)
+        {
+            return Some((sel.clone(), row.clone()));
+        }
+        rows.into_iter().nth(self.cursor)
     }
 
     /// The Feed tab: every top-level message (and thread root) in chronological order, with
@@ -211,8 +309,22 @@ impl App {
     fn feed_rows_with_ids(&self) -> Vec<IdRow> {
         let mut rows: Vec<ArrivalRow> = Vec::new();
         for stored in self.messages.values() {
-            if stored.msg.thread_ts.is_some() {
-                continue; // a reply; rendered below, attached to its root.
+            if let Some(root_ts) = stored.msg.thread_ts.clone() {
+                if self.messages.contains_key(&key_for(&stored.msg.conv, &root_ts)) {
+                    continue; // a reply to a known root; rendered below, attached to its root.
+                }
+                // Orphaned reply: its root predates our backfill horizon (or was otherwise
+                // never seen), so without this branch it would never render at all. Render it
+                // as a normal inline row instead, marked with a "↳ " prefix so it still reads
+                // as thread context rather than a plain top-level message.
+                let mut row = self.message_row(&stored.msg);
+                row.text = format!("\u{21b3} {}", row.text);
+                rows.push((
+                    stored.arrival,
+                    Some((stored.msg.conv.clone(), stored.msg.ts.clone())),
+                    row,
+                ));
+                continue;
             }
             let conv = stored.msg.conv.clone();
             let root_ts = stored.msg.ts.clone();
@@ -337,15 +449,12 @@ impl App {
     }
 
     /// A permalink for the selected row's message, if any (e.g. the cursor is past the end,
-    /// or sits on the synthetic `Divider` row).
+    /// or sits on the synthetic `Divider` row). Resolves via the selected identity, not raw
+    /// row position — see `feed_target`/`mention_target`.
     pub fn permalink_of_selected(&self, rest: &Rest) -> Option<String> {
         let id = match self.tab {
-            Tab::Feed => {
-                self.feed_rows_with_ids().into_iter().nth(self.cursor).and_then(|(id, _)| id)
-            }
-            Tab::Mentions => {
-                self.mention_rows_with_ids().into_iter().nth(self.cursor).map(|(id, _)| id)
-            }
+            Tab::Feed => self.feed_target().map(|(id, _)| id),
+            Tab::Mentions => self.mention_target().map(|(id, _)| id),
         }?;
         crate::rest::permalink(rest, &id.0, &id.1).ok()
     }
@@ -353,9 +462,7 @@ impl App {
     // ---- Feed tab: thread expand (thin REST edge over the pure `toggle_thread`) ----------
 
     fn toggle_expand(&mut self, rest: &Rest) {
-        let Some((Some((conv, root_ts)), row)) =
-            self.feed_rows_with_ids().into_iter().nth(self.cursor)
-        else {
+        let Some(((conv, root_ts), row)) = self.feed_target() else {
             return;
         };
         if !matches!(row.kind, RowKind::ThreadMarker { .. }) {
@@ -376,7 +483,7 @@ impl App {
     /// tests so expand/collapse behavior is checked without a real REST call.
     fn toggle_thread(&mut self, conv: &str, root_ts: &str, fetched: Vec<Message>) -> bool {
         let key = (conv.to_string(), root_ts.to_string());
-        if self.expanded.remove(&key) {
+        let now_expanded = if self.expanded.remove(&key) {
             false
         } else {
             self.expanded.insert(key);
@@ -384,13 +491,15 @@ impl App {
                 self.upsert_new(msg);
             }
             true
-        }
+        };
+        self.resync_cursor();
+        now_expanded
     }
 
     // ---- Mentions tab: read toggle ------------------------------------------------------
 
     fn toggle_read(&mut self) {
-        let Some((id, _)) = self.mention_rows_with_ids().into_iter().nth(self.cursor) else {
+        let Some((id, _)) = self.mention_target() else {
             return;
         };
         self.toggle_mention_read(&id.0, &id.1);
@@ -408,13 +517,15 @@ impl App {
 
     // ---- Message store: insert / edit / delete ------------------------------------------
 
-    /// Insert a newly-seen message, or refresh an already-known one's fields in place without
-    /// disturbing its original arrival order — this is what makes a message arriving via both
-    /// a poll and the socket collapse to one entry (`(conv, ts)` is the key either way).
+    /// Insert a newly-seen message. Insert-if-absent: if `(conv, ts)` is already known, this is
+    /// a no-op and the existing entry is left untouched. This is what makes a message arriving
+    /// via both a poll and the socket collapse to one entry, and — critically — what stops a
+    /// stale `history()` poll response from clobbering a `SocketEvent::Changed` edit that
+    /// landed in between: only `upsert_edit` (driven by an explicit `Changed` event) is allowed
+    /// to replace an existing entry's content.
     fn upsert_new(&mut self, msg: Message) {
         let key = key_for(&msg.conv, &msg.ts);
-        if let Some(stored) = self.messages.get_mut(&key) {
-            stored.msg = msg;
+        if self.messages.contains_key(&key) {
             return;
         }
         self.arrival_seq += 1;
@@ -424,6 +535,8 @@ impl App {
 
     /// Replace an edited message's fields in place; if it was never seen before (e.g. its
     /// original arrival predates this session), insert it fresh instead of dropping the edit.
+    /// That insert-fresh path deliberately assigns a brand-new `arrival_seq` (rather than, say,
+    /// backdating it) so the edit surfaces under the unread divider like any other new arrival.
     fn upsert_edit(&mut self, msg: Message) {
         let key = key_for(&msg.conv, &msg.ts);
         if let Some(stored) = self.messages.get_mut(&key) {
@@ -437,6 +550,9 @@ impl App {
 
     fn remove(&mut self, conv: &str, ts: &str) {
         self.messages.remove(&key_for(conv, ts));
+        let id = (conv.to_string(), ts.to_string());
+        self.read_mentions.remove(&id);
+        self.expanded.remove(&id);
     }
 
     // ---- Row/label rendering helpers ------------------------------------------------------
@@ -576,6 +692,7 @@ mod tests {
             messages: BTreeMap::new(),
             expanded: HashSet::new(),
             read_mentions: HashSet::new(),
+            selected: None,
             self_id: "SELF".to_string(),
             keywords: Vec::new(),
             arrival_seq: 0,
@@ -595,6 +712,23 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "first conv, earlier");
         assert_eq!(rows[1].text, "second conv, later");
+    }
+
+    // ---- distinct malformed-ts messages never collide in the message store ----------------
+
+    #[test]
+    fn distinct_malformed_ts_messages_both_survive_and_render() {
+        let mut app = empty_app();
+        // Both malformed ts values parse via ts_key's (0, 0) fallback; the map key must still
+        // tell them apart (via the raw ts string) or the second upsert clobbers the first.
+        app.apply(SocketEvent::Message(msg("C1", "garbage-1", None, "U1", "malformed one")));
+        app.apply(SocketEvent::Message(msg("C1", "garbage-2", None, "U1", "malformed two")));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.text == "malformed one"));
+        assert!(rows.iter().any(|r| r.text == "malformed two"));
     }
 
     // ---- edit updates in place -------------------------------------------------------------
@@ -677,6 +811,28 @@ mod tests {
         assert_eq!(rows[1].text, "fetched reply");
     }
 
+    // ---- orphaned thread replies (root not locally known) still render --------------------
+
+    #[test]
+    fn a_reply_whose_root_is_unknown_renders_as_a_normal_row() {
+        let mut app = empty_app();
+        // No root "1.000001" was ever stored (e.g. it's older than the backfill horizon), but
+        // a reply to it arrives — it must still render, not vanish.
+        app.apply(SocketEvent::Message(msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "reply to a root we never saw",
+        )));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, RowKind::Message);
+        assert_eq!(rows[0].text, "\u{21b3} reply to a root we never saw");
+    }
+
     // ---- divider placement after touch -------------------------------------------------------
 
     #[test]
@@ -750,15 +906,37 @@ mod tests {
     // ---- poll dedup ---------------------------------------------------------------------------
 
     #[test]
-    fn a_message_seen_via_socket_and_poll_appears_once() {
+    fn a_message_seen_via_socket_and_poll_appears_once_and_keeps_its_original_content() {
         let mut app = empty_app();
         // Simulates the same (conv, ts) arriving twice: once via the socket, once via a poll
         // backfill re-fetch (poll_tick re-runs history() and re-applies through the same
-        // upsert path apply() uses).
+        // upsert path apply() uses). upsert_new is insert-if-absent, so the second arrival
+        // must not overwrite the first (see the stale-poll-vs-edit test below for why).
         app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "hello")));
-        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "hello")));
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "hello (stale poll copy)")));
         app.touch();
-        assert_eq!(app.feed_rows().len(), 1);
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "hello");
+    }
+
+    #[test]
+    fn a_stale_poll_message_does_not_revert_a_socket_edit() {
+        let mut app = empty_app();
+        let original = msg("C1", "1.0", None, "U1", "original");
+        app.apply(SocketEvent::Message(original.clone()));
+        app.apply(SocketEvent::Changed(Message {
+            edited: true,
+            ..msg("C1", "1.0", None, "U1", "edited text")
+        }));
+        // A history() poll response landing after the edit, carrying the pre-edit content —
+        // upsert_new (insert-if-absent) must leave the edited entry alone.
+        app.apply(SocketEvent::Message(original));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "edited text");
     }
 
     #[test]
@@ -802,6 +980,63 @@ mod tests {
         app.cursor = 0;
         app.toggle_read();
         assert_eq!(app.unread_mentions(), 0);
+    }
+
+    // ---- cursor is identity-based, not positional ------------------------------------------
+
+    #[test]
+    fn selection_identity_survives_an_earlier_insert_reindexing_the_feed() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "row A")));
+        app.apply(SocketEvent::Message(msg("C1", "10.0", None, "U1", "row B")));
+        app.touch();
+
+        app.move_cursor(1); // select "row B" at index 1
+        assert_eq!(app.feed_rows()[app.cursor].text, "row B");
+        assert_eq!(app.selected, Some(("C1".to_string(), "10.0".to_string())));
+
+        // An earlier message arrives (e.g. a poll backfill), which sorts ahead of both
+        // existing rows (and, being a fresh arrival, also introduces the unread divider),
+        // reindexing "row B" further down the list.
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "row earliest")));
+
+        assert_eq!(
+            app.selected,
+            Some(("C1".to_string(), "10.0".to_string())),
+            "selected identity must not change just because an earlier row was inserted"
+        );
+        let rows = app.feed_rows();
+        let expected_pos = rows.iter().position(|r| r.text == "row B").unwrap();
+        assert_eq!(app.cursor, expected_pos, "cursor re-derives to the identity's new position");
+        assert_eq!(rows[app.cursor].text, "row B");
+    }
+
+    #[test]
+    fn toggle_read_targets_the_selected_identity_after_a_reorder() {
+        let mut app = empty_app();
+        app.conv_kinds.insert("D1".to_string(), ConvKind::Im);
+        app.apply(SocketEvent::Message(msg("D1", "10.0", None, "U1", "row X")));
+        app.apply(SocketEvent::Message(msg("D1", "5.0", None, "U1", "row Y")));
+        app.tab = Tab::Mentions;
+        app.touch();
+
+        app.move_cursor(1); // newest-first: [X(10), Y(5)] -> index 1 selects Y
+        assert_eq!(app.mention_rows()[app.cursor].text, "row Y");
+
+        // A message between X and Y arrives, shifting Y from index 1 to index 2.
+        app.apply(SocketEvent::Message(msg("D1", "7.0", None, "U1", "row Z")));
+        assert_eq!(app.cursor, 2);
+        assert_eq!(app.mention_rows()[app.cursor].text, "row Y");
+
+        app.toggle_read();
+        assert!(
+            app.read_mentions.contains(&("D1".to_string(), "5.0".to_string())),
+            "the read toggle must land on row Y (the selected identity)"
+        );
+        assert!(
+            !app.read_mentions.contains(&("D1".to_string(), "7.0".to_string())),
+            "not on whatever row now sits at the stale index"
+        );
     }
 
     // ---- resolve_channels ---------------------------------------------------------------------
