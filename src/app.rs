@@ -51,6 +51,26 @@ pub enum RowKind {
     Mention { read: bool },
 }
 
+/// Which row-kind a selected `(conv, ts)` identity refers to. Needed because a thread root's
+/// `Message` row and its collapsed `ThreadMarker` row share the very same `(conv, ts)` id (the
+/// marker's id is the root's ts) — without this discriminant, identity resolution can only ever
+/// find whichever of the two rows happens to come first, so a marker selection would silently
+/// resolve to its root message instead. `Divider` never carries an id so it never needs a kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelKind {
+    Message,
+    ThreadMarker,
+    Mention,
+}
+
+fn sel_kind_of(row: &Row) -> SelKind {
+    match row.kind {
+        RowKind::ThreadMarker { .. } => SelKind::ThreadMarker,
+        RowKind::Mention { .. } => SelKind::Mention,
+        RowKind::Message | RowKind::Divider => SelKind::Message,
+    }
+}
+
 /// A stored message plus its arrival order, used only to place the unread divider — arrival
 /// order is not the same as `ts` order (a poll backfill can insert an old message after a
 /// live one already arrived), so it is tracked independently as a monotonic counter.
@@ -108,13 +128,15 @@ pub struct App {
     expanded: HashSet<(String, String)>,
     /// Mentions marked read, keyed by `(conv, ts)`. Absence means unread.
     read_mentions: HashSet<(String, String)>,
-    /// Identity (`(conv, ts)`) of the currently selected row, independent of its position in
-    /// the active tab's row list. `move_cursor` sets this when the cursor moves; `resync_cursor`
-    /// re-derives the public `cursor` index from it after any row-set change (insert/delete),
-    /// so an action taken right after e.g. a poll backfill still lands on the row the user
-    /// actually selected rather than whatever now happens to sit at the old index. `None`
-    /// before any selection has been made, or once the selected row list is empty.
-    selected: Option<(String, String)>,
+    /// Identity (`(conv, ts)` plus the row-kind it names — see `SelKind`) of the currently
+    /// selected row, independent of its position in the active tab's row list. `move_cursor`
+    /// sets this when the cursor moves; `resync_cursor` re-derives the public `cursor` index
+    /// from it after any row-set change (insert/delete), so an action taken right after e.g. a
+    /// poll backfill still lands on the row the user actually selected rather than whatever now
+    /// happens to sit at the old index. The `SelKind` half is what lets a selected `ThreadMarker`
+    /// resolve to itself rather than the root `Message` row it shares an id with. `None` before
+    /// any selection has been made, or once the selected row list is empty.
+    selected: Option<((String, String), SelKind)>,
     self_id: String,
     keywords: Vec<String>,
     /// Monotonic counter, incremented once per newly-seen message (see [`Stored::arrival`]).
@@ -240,14 +262,20 @@ impl App {
         self.selected.clone_from(&ids[new_pos]);
     }
 
-    /// The active tab's current row identities, in row order (`None` only ever appears for the
-    /// Feed tab's synthetic `Divider` row).
-    fn current_ids(&self) -> Vec<Option<(String, String)>> {
+    /// The active tab's current row identities (each paired with its `SelKind`), in row order
+    /// (`None` only ever appears for the Feed tab's synthetic `Divider` row).
+    fn current_ids(&self) -> Vec<Option<((String, String), SelKind)>> {
         match self.tab {
-            Tab::Feed => self.feed_rows_with_ids().into_iter().map(|(id, _)| id).collect(),
-            Tab::Mentions => {
-                self.mention_rows_with_ids().into_iter().map(|(id, _)| Some(id)).collect()
-            }
+            Tab::Feed => self
+                .feed_rows_with_ids()
+                .into_iter()
+                .map(|(id, row)| id.map(|i| (i, sel_kind_of(&row))))
+                .collect(),
+            Tab::Mentions => self
+                .mention_rows_with_ids()
+                .into_iter()
+                .map(|(id, _)| Some((id, SelKind::Mention)))
+                .collect(),
         }
     }
 
@@ -278,21 +306,25 @@ impl App {
     /// tests do).
     fn feed_target(&self) -> Option<((String, String), Row)> {
         let rows = self.feed_rows_with_ids();
-        if let Some(sel) = &self.selected
-            && let Some((_, row)) = rows.iter().find(|(id, _)| id.as_ref() == Some(sel))
+        if let Some((sel_id, sel_kind)) = &self.selected
+            && let Some((_, row)) = rows
+                .iter()
+                .find(|(id, row)| id.as_ref() == Some(sel_id) && sel_kind_of(row) == *sel_kind)
         {
-            return Some((sel.clone(), row.clone()));
+            return Some((sel_id.clone(), row.clone()));
         }
         rows.into_iter().nth(self.cursor).and_then(|(id, row)| id.map(|id| (id, row)))
     }
 
-    /// As `feed_target`, for the Mentions tab (whose rows always carry an id).
+    /// As `feed_target`, for the Mentions tab (whose rows always carry an id and are always
+    /// `SelKind::Mention`).
     fn mention_target(&self) -> Option<((String, String), Row)> {
         let rows = self.mention_rows_with_ids();
-        if let Some(sel) = &self.selected
-            && let Some((_, row)) = rows.iter().find(|(id, _)| id == sel)
+        if let Some((sel_id, sel_kind)) = &self.selected
+            && *sel_kind == SelKind::Mention
+            && let Some((_, row)) = rows.iter().find(|(id, _)| id == sel_id)
         {
-            return Some((sel.clone(), row.clone()));
+            return Some((sel_id.clone(), row.clone()));
         }
         rows.into_iter().nth(self.cursor)
     }
@@ -438,6 +470,19 @@ impl App {
         self.divider_mark = self.arrival_seq;
     }
 
+    /// Switch the active tab and resync selection for it. The two tabs' row lists are
+    /// independent (different lengths, different identities), so a `cursor`/`selected` left
+    /// over from the previous tab means nothing here: this clears `selected` and re-derives
+    /// both from scratch via `resync_cursor`, which clamps `cursor` into the new tab's bounds
+    /// and anchors `selected` to whatever row now sits there. Task 7 should call this on tab
+    /// switch rather than assigning `tab` directly, so a stale cursor from a longer previous
+    /// tab can never point past the end of a shorter one.
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.selected = None;
+        self.resync_cursor();
+    }
+
     /// `Enter` semantics per tab: on the Feed tab, expand/collapse the selected thread
     /// (fetching replies via REST on first expand); on the Mentions tab, toggle the selected
     /// row's read state.
@@ -517,15 +562,23 @@ impl App {
 
     // ---- Message store: insert / edit / delete ------------------------------------------
 
-    /// Insert a newly-seen message. Insert-if-absent: if `(conv, ts)` is already known, this is
-    /// a no-op and the existing entry is left untouched. This is what makes a message arriving
-    /// via both a poll and the socket collapse to one entry, and — critically — what stops a
-    /// stale `history()` poll response from clobbering a `SocketEvent::Changed` edit that
-    /// landed in between: only `upsert_edit` (driven by an explicit `Changed` event) is allowed
-    /// to replace an existing entry's content.
+    /// Insert a newly-seen message, or — if `(conv, ts)` is already known — replace its content
+    /// iff the incoming copy is itself marked edited and actually differs from what's stored.
+    /// That guard is what lets a poll fallback (which only ever learns of an edit by re-fetching
+    /// history and re-running it through this same path — there is no separate "poll saw an
+    /// edit" event) surface the edit, while still stopping a stale pre-edit poll copy (always
+    /// `edited: false`) from clobbering a live `SocketEvent::Changed` that landed in between: a
+    /// `Changed` event goes through `upsert_edit`, not here, but a poll's re-fetch of that same
+    /// message is a `SocketEvent::Message` routed through `upsert_new` (see `poll_tick`), so
+    /// without this guard the poll's `edited: false` copy would silently overwrite the edit.
+    /// The original `arrival` is preserved on an edit-through-poll so the unread divider doesn't
+    /// jump for a message that isn't actually new.
     fn upsert_new(&mut self, msg: Message) {
         let key = key_for(&msg.conv, &msg.ts);
-        if self.messages.contains_key(&key) {
+        if let Some(stored) = self.messages.get_mut(&key) {
+            if msg.edited && msg != stored.msg {
+                stored.msg = msg;
+            }
             return;
         }
         self.arrival_seq += 1;
@@ -650,10 +703,12 @@ fn resolve_im_names(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, RowKind, Tab, resolve_channels, resolve_im_names, ts_to_hhmm};
+    use super::{App, RowKind, SelKind, Tab, resolve_channels, resolve_im_names, ts_to_hhmm};
     use crate::model::{ConvKind, Conversation, Message};
+    use crate::rest::Rest;
     use crate::socket::SocketEvent;
     use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::atomic::AtomicBool;
 
     fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
         Conversation { id: id.into(), name: name.into(), kind }
@@ -993,7 +1048,7 @@ mod tests {
 
         app.move_cursor(1); // select "row B" at index 1
         assert_eq!(app.feed_rows()[app.cursor].text, "row B");
-        assert_eq!(app.selected, Some(("C1".to_string(), "10.0".to_string())));
+        assert_eq!(app.selected, Some((("C1".to_string(), "10.0".to_string()), SelKind::Message)));
 
         // An earlier message arrives (e.g. a poll backfill), which sorts ahead of both
         // existing rows (and, being a fresh arrival, also introduces the unread divider),
@@ -1002,7 +1057,7 @@ mod tests {
 
         assert_eq!(
             app.selected,
-            Some(("C1".to_string(), "10.0".to_string())),
+            Some((("C1".to_string(), "10.0".to_string()), SelKind::Message)),
             "selected identity must not change just because an earlier row was inserted"
         );
         let rows = app.feed_rows();
@@ -1037,6 +1092,121 @@ mod tests {
             !app.read_mentions.contains(&("D1".to_string(), "7.0".to_string())),
             "not on whatever row now sits at the stale index"
         );
+    }
+
+    // ---- marker-vs-root identity (a thread root's Message row and its collapsed ThreadMarker
+    // row share the same (conv, ts) id) ------------------------------------------------------
+
+    /// Build a `Rest` whose `cancelled` flag is already set, so any REST call it's handed to
+    /// (e.g. `conversations.replies` on thread expand) spawns curl but is killed within a
+    /// couple of poll iterations rather than depending on real network reachability — the
+    /// call's *result* doesn't matter for these tests since the reply under test is already
+    /// locally known (applied via a prior `SocketEvent::Message`), only that expand/collapse
+    /// dispatch reaches the right row.
+    fn precancelled_rest(cancelled: &AtomicBool) -> Rest<'_> {
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        Rest { user_token: "xoxp-test", cancelled }
+    }
+
+    #[test]
+    fn moving_onto_a_collapsed_threads_marker_row_and_toggling_expands_it() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+
+        app.move_cursor(1); // the collapsed thread's ThreadMarker row (index 1)
+        let rows = app.feed_rows();
+        assert_eq!(rows[app.cursor].kind, RowKind::ThreadMarker { replies: 1, expanded: false });
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.toggle_expand_or_read(&rest);
+
+        let rows = app.feed_rows();
+        assert!(
+            !rows.iter().any(|r| matches!(r.kind, RowKind::ThreadMarker { .. })),
+            "the marker must be gone once expanded, not left in place by an early return"
+        );
+        assert!(rows.iter().any(|r| r.text == "reply one"), "the reply must render inline");
+    }
+
+    #[test]
+    fn resync_keeps_the_marker_selected_after_an_unrelated_apply() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+
+        app.move_cursor(1); // the marker row
+        let rows = app.feed_rows();
+        assert_eq!(rows[app.cursor].kind, RowKind::ThreadMarker { replies: 1, expanded: false });
+
+        // An unrelated message elsewhere triggers apply()'s resync_cursor; it must not bump
+        // the marker selection back onto its root row.
+        app.apply(SocketEvent::Message(msg("C2", "0.5", None, "U1", "unrelated, sorts first")));
+
+        let rows = app.feed_rows();
+        assert_eq!(
+            rows[app.cursor].kind,
+            RowKind::ThreadMarker { replies: 1, expanded: false },
+            "resync must keep the marker selected, not snap back to the root Message row"
+        );
+    }
+
+    // ---- poll fallback must surface edits, not just dedup arrivals ---------------------------
+
+    #[test]
+    fn a_poll_delivered_edit_updates_text_and_edited_flag_without_moving_arrival() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "original")));
+        app.touch();
+        let key = super::key_for("C1", "1.0");
+        let arrival_before = app.messages.get(&key).unwrap().arrival;
+
+        // No live Changed event (socket down); the poll fallback's history() re-fetch is routed
+        // through this same upsert_new path (see poll_tick) and carries the server-side edit.
+        app.apply(SocketEvent::Message(Message {
+            edited: true,
+            ..msg("C1", "1.0", None, "U1", "edited via poll")
+        }));
+
+        let stored = app.messages.get(&key).unwrap();
+        assert_eq!(stored.msg.text, "edited via poll");
+        assert!(stored.msg.edited);
+        assert_eq!(
+            stored.arrival, arrival_before,
+            "arrival must be unchanged so the divider doesn't jump"
+        );
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "edited via poll");
+        assert!(!rows.iter().any(|r| r.kind == RowKind::Divider));
+    }
+
+    // ---- set_tab resyncs selection for the new tab --------------------------------------------
+
+    #[test]
+    fn set_tab_clamps_the_cursor_into_the_new_tabs_bounds() {
+        let mut app = empty_app();
+        app.conv_kinds.insert("D1".to_string(), ConvKind::Im);
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "feed only, no mention")));
+        app.apply(SocketEvent::Message(msg("D1", "2.0", None, "U1", "a dm is always a mention")));
+        app.touch();
+
+        assert_eq!(app.feed_rows().len(), 2);
+        assert_eq!(app.mention_rows().len(), 1);
+
+        app.cursor = 1; // valid for the 2-row feed tab, out of range for the 1-row mentions tab
+        app.set_tab(Tab::Mentions);
+
+        assert_eq!(app.tab, Tab::Mentions);
+        assert_eq!(app.cursor, 0, "cursor must clamp into the mentions tab's single row");
+
+        // A subsequent action must target the mentions tab's row, not panic or hit a stale one.
+        app.toggle_read();
+        assert_eq!(app.unread_mentions(), 0);
     }
 
     // ---- resolve_channels ---------------------------------------------------------------------
