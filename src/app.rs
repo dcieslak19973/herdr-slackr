@@ -528,8 +528,10 @@ impl App {
     ///
     /// A `RestError::RateLimited` sets a rate-limit status, starts the cooldown, and stops the
     /// rest of this tick — including skipping the conversation batch entirely if the limit hit
-    /// during the thread slots (Slack's own signal to back off now, not to keep hammering
-    /// anything else this tick); any other error sets a one-line status naming what failed and
+    /// during the thread slots, and skipping the out-of-cap DM scan below if either the thread
+    /// or the conversation batch hit it (`run_or_skip_dm_scan`; Slack's own signal to back off
+    /// now, not to keep hammering anything else this tick); any other error sets a one-line
+    /// status naming what failed and
     /// moves on to the next item in its batch rather than crashing (spec: a per-conversation or
     /// per-thread poll failure must never take down the pane). See `poll_error_status` for the
     /// pure wording decision.
@@ -556,17 +558,30 @@ impl App {
         let conv_slots = POLL_BATCH - thread_slots;
 
         let rate_limited = self.poll_active_threads(rest, &active, thread_slots, now);
-        if !rate_limited {
-            self.poll_conversations(rest, conv_slots, now);
-        }
-        self.maybe_scan_out_of_cap_dms(rest, now);
+        let rate_limited =
+            if rate_limited { true } else { self.poll_conversations(rest, conv_slots, now) };
+        self.run_or_skip_dm_scan(rest, now, rate_limited);
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
     }
 
-    /// The out-of-cap DM activity scan (spec §1): independent of, and additive to, the
-    /// `POLL_BATCH` conversation/thread budget above — never gated by `rate_limited` from that
-    /// budget, since a rate limit there is scoped to `cooldown_until`, checked once at the top of
-    /// this whole tick, not to this scan specifically. Runs at most once per [`DM_SCAN_INTERVAL`]
+    /// The tail of `poll_tick_at`: run the out-of-cap DM scan, unless the main conv/thread
+    /// budget above already hit `RateLimited` this tick — that hit stops the rest of the tick
+    /// (this fn's caller's doc), and the scan is part of "the rest of the tick" like everything
+    /// else after it, not an exception to it. Split out from the inline `if` so the gate itself
+    /// is unit-tested by injecting `rate_limited` directly, without needing a real 429 to drive
+    /// it end-to-end through `poll_active_threads`/`poll_conversations`.
+    fn run_or_skip_dm_scan(&mut self, rest: &Rest, now: Instant, rate_limited: bool) {
+        if !rate_limited {
+            self.maybe_scan_out_of_cap_dms(rest, now);
+        }
+    }
+
+    /// The out-of-cap DM activity scan (spec §1): additive to the `POLL_BATCH` conversation/
+    /// thread budget above when that budget didn't just rate limit — `poll_tick_at` only reaches
+    /// this (via `run_or_skip_dm_scan`) when `rate_limited` is false, since a `RateLimited` hit
+    /// in that budget stops the rest of the tick, this scan included (review fix: this scan used
+    /// to run unconditionally here, which contradicted `poll_tick_at`'s own "stops the rest of
+    /// this tick" contract). Runs at most once per [`DM_SCAN_INTERVAL`]
     /// (`dm_scan_due`/`next_dm_scan`); a no-op tick (not yet due) costs nothing, not even a
     /// `list_conversations` call.
     ///
@@ -667,8 +682,10 @@ impl App {
 
     /// The conversation half of `poll_tick_at`'s split budget: unchanged from before the split
     /// except that its slot count is now `conv_slots` (`POLL_BATCH` minus whatever the thread
-    /// round-robin took) rather than the full `POLL_BATCH`.
-    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) {
+    /// round-robin took) rather than the full `POLL_BATCH`. Returns whether a `RateLimited` hit
+    /// occurred, mirroring `poll_active_threads`'s own return — `poll_tick_at` combines both to
+    /// decide whether anything after this budget (the DM scan) still runs this tick.
+    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) -> bool {
         let n = self.conversations.len();
         let (indices, next_cursor) = next_batch(self.poll_cursor, n, conv_slots);
         self.poll_cursor = next_cursor;
@@ -686,13 +703,14 @@ impl App {
                 Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&conv_name, &err);
                     self.cooldown_until = Some(now + Duration::from_secs(secs));
-                    break;
+                    return true;
                 }
                 Err(err) => {
                     self.status = poll_error_status(&conv_name, &err);
                 }
             }
         }
+        false
     }
 
     /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
@@ -2822,6 +2840,46 @@ mod tests {
             app.next_dm_scan,
             Some(first_deadline + DM_SCAN_INTERVAL),
             "a due scan pushes the deadline another full interval out"
+        );
+    }
+
+    // ---- poll_tick_at: a RateLimited main budget stops the whole tick, including the DM scan
+    // (review fix: `poll_tick_at`'s own doc promises a `RateLimited` hit "stops the rest of this
+    // tick"; the DM scan must honor that too, not run unconditionally) ------------------------
+
+    #[test]
+    fn dm_scan_is_skipped_entirely_when_the_main_budget_rate_limited_this_tick() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+
+        // `rate_limited: true` stands in for the main conv/thread budget having just hit
+        // `RateLimited` this same tick (untestable end-to-end without a real 429, so it's
+        // injected directly here, exactly as `poll_tick_at` computes and passes it).
+        app.run_or_skip_dm_scan(&rest, now, true);
+
+        assert_eq!(
+            app.next_dm_scan, None,
+            "a rate-limited tick must not even check whether the scan is due, let alone run it"
+        );
+        assert!(app.status.is_empty(), "no REST call happened, so no dm-scan status either");
+        assert!(app.all_conversations.is_empty(), "list_conversations was never called");
+    }
+
+    #[test]
+    fn dm_scan_still_runs_on_a_normal_non_rate_limited_tick_when_due() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+
+        app.run_or_skip_dm_scan(&rest, now, false);
+
+        assert_eq!(
+            app.next_dm_scan,
+            Some(now + DM_SCAN_INTERVAL),
+            "not rate-limited: the scan ran exactly as before and advanced its deadline"
         );
     }
 
