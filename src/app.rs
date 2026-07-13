@@ -193,7 +193,36 @@ pub struct App {
     /// page-move issued before the first draw (or in a headless test) still moves rather than
     /// no-oping on `0`.
     viewport_rows: usize,
+    /// The unfiltered `conversations.list` snapshot — every channel/group/DM/MPIM the workspace
+    /// has, not just the `dm_limit`-capped `conversations` this `App` actually subscribes to.
+    /// Set once at `build` (before `resolve_channels` narrows it) and refreshed by every
+    /// `maybe_scan_out_of_cap_dms` scan, so [`pick_changed_dm`] always has a "what did we see
+    /// last time" baseline for conversations this `App` otherwise never looks at again (spec
+    /// §1: "previous messages stay capped, new ones always arrive" in polling mode too).
+    all_conversations: Vec<Conversation>,
+    /// The newest `updated` (Slack's millisecond-epoch conversation-activity stamp) this `App`
+    /// has actually issued a `history` call for, per out-of-cap DM/MPIM conversation id — the
+    /// watermark `maybe_scan_out_of_cap_dms` both selects against (via [`pick_changed_dm`]) and
+    /// threads into that call's `oldest` (via [`updated_ms_to_ts`]), so a DM already caught up
+    /// to isn't re-fetched from scratch on the next scan just because `all_conversations` also
+    /// changed for some other reason. Populated lazily — a DM with no entry here has never had
+    /// a scan-triggered `history` call, so its `oldest` is `None` (full-window fetch, matching
+    /// spec §1: "or None if first time").
+    dm_last_seen: HashMap<String, u64>,
+    /// The next `Instant` at or after which `maybe_scan_out_of_cap_dms`'s 5-minute out-of-cap DM
+    /// activity scan (spec §1) is due; `None` before the very first tick, which is always due.
+    /// `Instant`-based, injected via `poll_tick_at`'s `now` parameter, for the same testability
+    /// reason as `cooldown_until` (see its doc) — entirely independent of `cooldown_until`
+    /// itself, since a rate-limit cooldown must not also silently delay this lower-frequency
+    /// scan past its own schedule once the cooldown lifts.
+    next_dm_scan: Option<Instant>,
 }
+
+/// How often [`App::poll_tick_at`]'s out-of-cap DM activity scan (spec §1) may run: at most once
+/// per this interval, tracked via `next_dm_scan`, independent of the per-tick conversation/thread
+/// budget (`POLL_BATCH`) — a much lower frequency because it exists only to catch a DM/MPIM this
+/// `App` isn't otherwise polling at all, not to keep already-subscribed conversations fresh.
+const DM_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Ticks poll at most this many conversations, round-robin, per call — request count is what
 /// Slack's rate limits meter, so a tick over every subscribed conversation every time is what
@@ -266,6 +295,9 @@ impl App {
             cooldown_until: None,
             pending_new: 0,
             viewport_rows: 20,
+            all_conversations: all_convs,
+            dm_last_seen: HashMap::new(),
+            next_dm_scan: None,
         };
 
         for conv in app.conversations.clone() {
@@ -315,6 +347,9 @@ impl App {
             cooldown_until: None,
             pending_new: 0,
             viewport_rows: 20,
+            all_conversations: Vec::new(),
+            dm_last_seen: HashMap::new(),
+            next_dm_scan: None,
         }
     }
 
@@ -524,7 +559,73 @@ impl App {
         if !rate_limited {
             self.poll_conversations(rest, conv_slots, now);
         }
+        self.maybe_scan_out_of_cap_dms(rest, now);
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
+    }
+
+    /// The out-of-cap DM activity scan (spec §1): independent of, and additive to, the
+    /// `POLL_BATCH` conversation/thread budget above — never gated by `rate_limited` from that
+    /// budget, since a rate limit there is scoped to `cooldown_until`, checked once at the top of
+    /// this whole tick, not to this scan specifically. Runs at most once per [`DM_SCAN_INTERVAL`]
+    /// (`dm_scan_due`/`next_dm_scan`); a no-op tick (not yet due) costs nothing, not even a
+    /// `list_conversations` call.
+    ///
+    /// When due: re-fetches the full conversation list, hands it plus the previous snapshot
+    /// (`all_conversations`) to [`pick_changed_dm`] to find at most one out-of-cap DM/MPIM whose
+    /// activity moved, stores the fresh list as the new baseline for next time, and — if one was
+    /// picked — issues exactly one `history` call for it (`oldest` from `dm_last_seen`'s watermark,
+    /// converted via [`updated_ms_to_ts`], or `None` on a DM's first-ever scan fetch), folding the
+    /// result in through the normal `upsert_new` path so mention detection and Focus qualification
+    /// follow automatically, same as every other arrival. A `list_conversations` or `history`
+    /// failure here sets `status` (and, on `RateLimited`, `cooldown_until`) exactly like the
+    /// conversation/thread budget's own failures — this scan is a REST call like any other and
+    /// must surface, not swallow, an error — but never fails the tick itself.
+    fn maybe_scan_out_of_cap_dms(&mut self, rest: &Rest, now: Instant) {
+        if !dm_scan_due(now, self.next_dm_scan) {
+            return;
+        }
+        self.next_dm_scan = Some(now + DM_SCAN_INTERVAL);
+
+        let new_all = match crate::rest::list_conversations(rest) {
+            Ok(v) => v,
+            Err(err @ RestError::RateLimited(secs)) => {
+                self.status = poll_error_status("dm scan", &err);
+                self.cooldown_until = Some(now + Duration::from_secs(secs));
+                return;
+            }
+            Err(err) => {
+                self.status = poll_error_status("dm scan", &err);
+                return;
+            }
+        };
+
+        let subscribed: HashSet<String> = self.conversations.iter().map(|c| c.id.clone()).collect();
+        let picked =
+            pick_changed_dm(&self.all_conversations, &new_all, &subscribed, &self.dm_last_seen);
+        self.all_conversations = new_all;
+
+        let Some(conv) = picked else {
+            return;
+        };
+        let Some(updated) = conv.updated else {
+            return;
+        };
+        let oldest = self.dm_last_seen.get(&conv.id).copied().map(updated_ms_to_ts);
+        match crate::rest::history(rest, &conv.id, 50, oldest.as_deref()) {
+            Ok(msgs) => {
+                for msg in msgs {
+                    self.upsert_new(msg);
+                }
+                self.dm_last_seen.insert(conv.id, updated);
+            }
+            Err(err @ RestError::RateLimited(secs)) => {
+                self.status = poll_error_status(&conv.name, &err);
+                self.cooldown_until = Some(now + Duration::from_secs(secs));
+            }
+            Err(err) => {
+                self.status = poll_error_status(&conv.name, &err);
+            }
+        }
     }
 
     /// The active-thread half of `poll_tick_at`'s split budget: round-robin `thread_slots` of
@@ -1439,6 +1540,71 @@ fn cooldown_active(now: Instant, deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| now < d)
 }
 
+/// Whether `maybe_scan_out_of_cap_dms`'s 5-minute out-of-cap DM activity scan (spec §1) is due at
+/// `now`: `next_scan` is `None` before the very first tick (always due — there is nothing to wait
+/// on yet) or `Some(deadline)` set by the prior due scan (`now + DM_SCAN_INTERVAL`), due once
+/// `now` reaches (or passes) it. Pure and `Instant`-based for the same reason as
+/// [`cooldown_active`] — no mock clock needed to test the gate.
+fn dm_scan_due(now: Instant, next_scan: Option<Instant>) -> bool {
+    next_scan.is_none_or(|deadline| now >= deadline)
+}
+
+/// The single out-of-cap DM/MPIM conversation whose `updated` moved furthest since it was last
+/// observed, if any did (spec §1's polling-mode out-of-cap DM activity detection). `old` is the
+/// App's previously-stored full `conversations.list` snapshot (`App::all_conversations`, from
+/// `build` or the prior scan); `new_all` is what this scan just re-fetched; `subscribed` is the
+/// set of conversation ids already in the capped/subscribed set (out of scope here entirely —
+/// those get fresh data from the normal `POLL_BATCH` round-robin instead); `last_seen` is the
+/// watermark of the newest `updated` a scan has actually issued a `history` call for, per
+/// out-of-cap DM id (`App::dm_last_seen`).
+///
+/// A conversation's baseline "last observed" value is `last_seen`'s entry for it if one exists
+/// (the DM has already been scan-fetched before, so that watermark is authoritative), else its
+/// `updated` in `old` (never scan-fetched, but already known at the last full-list snapshot), else
+/// `0` (never seen at all before this scan — e.g. a DM created since `build` — so any `updated`
+/// counts as new activity). Only `Im`/`Mpim` conversations not in `subscribed`, with a `Some`
+/// `updated` strictly greater than that baseline, are candidates; among them the one with the
+/// greatest `updated` wins (ties broken by id, for a deterministic pick — the exact winner among
+/// simultaneous ties doesn't matter functionally, since the loser simply waits for the next scan).
+/// `None` when nothing qualifies — the common case, and why this scan usually costs zero extra
+/// requests despite re-fetching the full list every 5 minutes.
+fn pick_changed_dm(
+    old: &[Conversation],
+    new_all: &[Conversation],
+    subscribed: &HashSet<String>,
+    last_seen: &HashMap<String, u64>,
+) -> Option<Conversation> {
+    new_all
+        .iter()
+        .filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim))
+        .filter(|c| !subscribed.contains(&c.id))
+        .filter_map(|c| {
+            let updated = c.updated?;
+            let baseline = last_seen
+                .get(&c.id)
+                .copied()
+                .or_else(|| old.iter().find(|o| o.id == c.id).and_then(|o| o.updated))
+                .unwrap_or(0);
+            (updated > baseline).then_some((c, updated))
+        })
+        .max_by(|(a, au), (b, bu)| au.cmp(bu).then_with(|| a.id.cmp(&b.id)))
+        .map(|(c, _)| c.clone())
+}
+
+/// Convert a `conversations.list` `updated` stamp (Slack's millisecond-epoch conversation-
+/// activity timestamp) to a Slack message `ts` string (`<seconds>.<6-digit microseconds>`), for
+/// threading into `maybe_scan_out_of_cap_dms`'s `history(..., oldest)` call — `history`'s `oldest`
+/// wants a `ts`-shaped string, not a raw millisecond count. The sub-second remainder becomes the
+/// microsecond field (millisecond precision padded with three zero digits); this is not a real
+/// Slack `ts` (no message actually has this exact stamp), but `history`'s `oldest` only needs a
+/// chronological cutoff, not a literal message identity, and `ts_cmp`/`ts_key` compare purely
+/// numerically, so a synthetic-but-correctly-ordered value works exactly the same as a real one.
+fn updated_ms_to_ts(updated_ms: u64) -> String {
+    let secs = updated_ms / 1000;
+    let micros = (updated_ms % 1000) * 1000;
+    format!("{secs}.{micros:06}")
+}
+
 /// The indices (into a `n`-long conversation list) `poll_tick` should visit this tick, round-
 /// robin from `cursor`, wrapping past the end back to `0`, plus the cursor to resume from next
 /// tick. `batch` is clamped to `n` (a batch larger than the whole list would otherwise produce
@@ -1572,10 +1738,10 @@ fn resolve_im_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BackfillOutcome, BackfillRetry, FeedView, RowKind, SelKind, Tab, apply_backfill,
-        backfill_retry_decision, capped_sleep_secs, cooldown_active, expand_status, marker_count,
-        next_batch, poll_error_status, resolve_im_names, thread_slot_count, track_newest,
-        ts_to_hhmm,
+        App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, RowKind, SelKind, Tab,
+        apply_backfill, backfill_retry_decision, capped_sleep_secs, cooldown_active, dm_scan_due,
+        expand_status, marker_count, next_batch, pick_changed_dm, poll_error_status,
+        resolve_im_names, thread_slot_count, track_newest, ts_to_hhmm, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -1634,6 +1800,9 @@ mod tests {
             cooldown_until: None,
             pending_new: 0,
             viewport_rows: 20,
+            all_conversations: Vec::new(),
+            dm_last_seen: HashMap::new(),
+            next_dm_scan: None,
         }
     }
 
@@ -2487,6 +2656,173 @@ mod tests {
         app.poll_tick_at(&rest, now + Duration::from_secs(1));
 
         assert_eq!(app.poll_cursor, 0, "both conversations were visited and the cursor wrapped");
+    }
+
+    // ---- dm_scan_due: pure 5-minute gate for the out-of-cap DM scan (Task 2, spec §1) ---------
+
+    #[test]
+    fn dm_scan_due_with_no_prior_scan_is_always_due() {
+        assert!(dm_scan_due(Instant::now(), None));
+    }
+
+    #[test]
+    fn dm_scan_due_true_at_and_after_the_deadline_false_before() {
+        let now = Instant::now();
+        let deadline = now + DM_SCAN_INTERVAL;
+        assert!(!dm_scan_due(now, Some(deadline)));
+        assert!(!dm_scan_due(now + (DM_SCAN_INTERVAL - Duration::from_secs(1)), Some(deadline)));
+        assert!(dm_scan_due(deadline, Some(deadline)));
+        assert!(dm_scan_due(deadline + Duration::from_secs(1), Some(deadline)));
+    }
+
+    // ---- pick_changed_dm: pure diff-and-pick-one over two conversation snapshots (Task 2,
+    // spec §1) -----------------------------------------------------------------------------
+
+    fn dm(id: &str, name: &str, updated: u64) -> Conversation {
+        Conversation {
+            id: id.into(),
+            name: name.into(),
+            kind: ConvKind::Im,
+            updated: Some(updated),
+        }
+    }
+
+    #[test]
+    fn pick_changed_dm_returns_none_when_nothing_changed() {
+        let old = vec![dm("D1", "alice", 100)];
+        let new_all = vec![dm("D1", "alice", 100)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    #[test]
+    fn pick_changed_dm_picks_the_single_most_recently_updated_among_several_changed() {
+        let old = vec![dm("D1", "alice", 100), dm("D2", "bob", 100), dm("D3", "carol", 100)];
+        let new_all = vec![dm("D1", "alice", 150), dm("D2", "bob", 300), dm("D3", "carol", 200)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        let picked = pick_changed_dm(&old, &new_all, &subscribed, &last_seen);
+        assert_eq!(picked.map(|c| c.id), Some("D2".to_string()), "bob moved the furthest (300)");
+    }
+
+    #[test]
+    fn pick_changed_dm_ignores_conversations_already_in_the_subscribed_set() {
+        let old = vec![dm("D1", "alice", 100)];
+        let new_all = vec![dm("D1", "alice", 300)];
+        let subscribed = HashSet::from(["D1".to_string()]);
+        let last_seen = HashMap::new();
+        assert_eq!(
+            pick_changed_dm(&old, &new_all, &subscribed, &last_seen),
+            None,
+            "in-cap conversations are covered by the normal poll batch, not this scan"
+        );
+    }
+
+    #[test]
+    fn pick_changed_dm_ignores_channel_and_group_kinds() {
+        let old = vec![Conversation { updated: Some(100), ..dm("C1", "eng", 100) }];
+        let mut changed = dm("C1", "eng", 300);
+        changed.kind = ConvKind::Channel;
+        let new_all = vec![changed];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    #[test]
+    fn pick_changed_dm_picks_up_a_conversation_absent_from_the_old_snapshot() {
+        // Brand new since `build`/the last scan — never observed before, so any `updated` at
+        // all counts as "changed" (baseline defaults to 0).
+        let old: Vec<Conversation> = Vec::new();
+        let new_all = vec![dm("D1", "alice", 50)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(
+            pick_changed_dm(&old, &new_all, &subscribed, &last_seen).map(|c| c.id),
+            Some("D1".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_changed_dm_uses_last_seen_as_the_baseline_over_the_old_snapshot() {
+        // Already fetched up to 200 by a prior scan (tracked in `last_seen`), even though the
+        // stale `old` snapshot still shows 100 — a re-diff against `old` alone would wrongly
+        // treat 150 as an advance.
+        let old = vec![dm("D1", "alice", 100)];
+        let new_all = vec![dm("D1", "alice", 150)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::from([("D1".to_string(), 200)]);
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    #[test]
+    fn pick_changed_dm_skips_a_conversation_missing_updated() {
+        let old: Vec<Conversation> = Vec::new();
+        let new_all = vec![conv("D1", "alice", ConvKind::Im)]; // `updated: None`
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    // ---- updated_ms_to_ts: pure ms-epoch -> Slack ts conversion (Task 2) -----------------------
+
+    #[test]
+    fn updated_ms_to_ts_formats_seconds_and_microseconds() {
+        assert_eq!(updated_ms_to_ts(1_752_300_000_123), "1752300000.123000");
+    }
+
+    #[test]
+    fn updated_ms_to_ts_zero_sub_second_remainder() {
+        assert_eq!(updated_ms_to_ts(1_752_300_000_000), "1752300000.000000");
+    }
+
+    // ---- poll_tick_at: the out-of-cap DM scan runs at most once per 5-minute interval (Task 2,
+    // spec §1) -------------------------------------------------------------------------------
+
+    #[test]
+    fn poll_tick_sets_the_next_dm_scan_deadline_on_the_first_tick() {
+        let mut app = empty_app();
+        assert_eq!(app.next_dm_scan, None);
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+
+        app.poll_tick_at(&rest, now);
+
+        assert_eq!(app.next_dm_scan, Some(now + DM_SCAN_INTERVAL));
+    }
+
+    #[test]
+    fn poll_tick_does_not_rerun_the_dm_scan_before_the_next_interval() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+        app.poll_tick_at(&rest, now);
+        let deadline = app.next_dm_scan;
+
+        app.poll_tick_at(&rest, now + Duration::from_secs(1));
+
+        assert_eq!(deadline, app.next_dm_scan, "deadline unchanged — scan is not due yet");
+    }
+
+    #[test]
+    fn poll_tick_reruns_the_dm_scan_once_the_interval_has_elapsed() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+        app.poll_tick_at(&rest, now);
+        let first_deadline = app.next_dm_scan.unwrap();
+
+        app.poll_tick_at(&rest, first_deadline);
+
+        assert_eq!(
+            app.next_dm_scan,
+            Some(first_deadline + DM_SCAN_INTERVAL),
+            "a due scan pushes the deadline another full interval out"
+        );
     }
 
     // ---- track_newest: keep-the-max newest-ts tracking (Task 2) -------------------------------
