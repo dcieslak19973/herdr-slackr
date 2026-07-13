@@ -1388,14 +1388,16 @@ fn marker_count(root_reply_count: Option<u32>, local_replies: usize) -> usize {
 
 /// The status line `toggle_expand` sets after a successful expand/collapse (spec §5):
 /// `"thread expanded — n replies"` (`reply_count` is the thread's locally-known reply count
-/// right after the toggle, including anything just fetched) when expanding, or a plain
-/// `"thread collapsed"` note when collapsing. Pure so the wording is unit-tested without a REST
-/// call — `toggle_expand` is the only caller, threading in `local_reply_count` after
-/// `toggle_thread` runs; a failed fetch bypasses this entirely so the existing `"replies
-/// failed: ..."` wording is never overwritten (spec: "error wording unchanged").
+/// right after the toggle, including anything just fetched) when expanding — singular `"1 reply"`
+/// rather than `"1 replies"` for the one-reply case — or a plain `"thread collapsed"` note when
+/// collapsing. Pure so the wording is unit-tested without a REST call — `toggle_expand` is the
+/// only caller, threading in `local_reply_count` after `toggle_thread` runs; a failed fetch
+/// bypasses this entirely so the existing `"replies failed: ..."` wording is never overwritten
+/// (spec: "error wording unchanged").
 fn expand_status(now_expanded: bool, reply_count: usize) -> String {
     if now_expanded {
-        format!("thread expanded — {reply_count} replies")
+        let noun = if reply_count == 1 { "reply" } else { "replies" };
+        format!("thread expanded — {reply_count} {noun}")
     } else {
         "thread collapsed".to_string()
     }
@@ -1868,6 +1870,11 @@ mod tests {
     #[test]
     fn expand_status_names_the_reply_count_when_expanding() {
         assert_eq!(expand_status(true, 3), "thread expanded — 3 replies");
+    }
+
+    #[test]
+    fn expand_status_uses_singular_reply_for_exactly_one() {
+        assert_eq!(expand_status(true, 1), "thread expanded — 1 reply");
     }
 
     #[test]

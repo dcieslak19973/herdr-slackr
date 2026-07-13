@@ -6,10 +6,10 @@ Slack stays visible beside it, so you never alt-tab to check whether something n
 What you get, in one persistent pane:
 
 - **Feed tab** — a live, chronological stream of the channels and DMs you subscribe to, one
-  conversation history across all of them. Threads collapse under their root with `↳ n replies`;
-  `Enter` expands one.
+  conversation history across all of them, oldest at the top and newest at the bottom — like any
+  chat client. Threads collapse under their root with `↳ n replies`; `Enter` expands one.
 - **Mentions tab** — only what needs you: `@you` mentions, every DM/MPIM message, and your own
-  keyword hits, newest first, with a per-row read marker.
+  keyword hits, oldest at the top and newest at the bottom, with a per-row read marker.
 - **Real-time delivery** via Slack Socket Mode, degrading to polling `conversations.history` when
   the socket can't run (a strict corporate proxy, a network blip) — the pane stays live either
   way, just slower.
@@ -180,6 +180,38 @@ Every row is color-segmented by field, not one flat color, under whichever palet
 conversation label in the accent color, the author name in green, the time/thread markers in a
 muted tone, and the message text in the default foreground.
 
+## Navigation
+
+Every tab and every Feed projection reads top-to-bottom chronological, oldest at the top and
+newest at the bottom — the same direction a chat client scrolls. **This is a change for the
+Mentions tab and the Threads view**, which used to list newest-first; both now match the Feed
+Timeline's direction instead of each having their own.
+
+Real navigation keys move the cursor beyond one row at a time:
+
+| Key                         | Action                                                        |
+| ---------------------------- | ---------------------------------------------------------------|
+| `G` / `End`                 | Jump to the newest row (the bottom)                            |
+| `g` / `Home`                | Jump to the oldest row (the top)                                |
+| `PageDown` / `PageUp`       | Move a full page (the pane's current on-screen row count)       |
+| `Ctrl-d` / `Ctrl-u`         | Move a half page                                                |
+
+**The `↓ n new` indicator.** When the cursor is scrolled up from the bottom of the active tab and
+new messages arrive, a muted `↓ n new` overlay appears at the bottom-right of the row list,
+counting every arrival since you last left the bottom. It clears the moment the cursor reaches the
+bottom again, by any means — `j`/`↓`, `G`/`End`, a page move that lands there, or scrolling all the
+way down manually. If the cursor is already sitting at the bottom when a message arrives, the view
+follows it there automatically instead (like a chat client scrolled to "now") and the counter never
+appears at all.
+
+The counter is global, not scoped to what the active tab actually displays: it counts every new
+message that lands anywhere in the message store (any subscribed conversation) while you're
+scrolled up on the tab you're currently viewing, not only messages that would have added a visible
+row to that tab. Scrolled up on the Mentions tab, for instance, a plain channel message that is
+neither a DM nor a keyword/`@you` hit still bumps the counter, even though it never becomes a
+Mentions row — it only ever shows up on the Feed tab. Treat it as "something arrived while you
+were looking elsewhere," not as a precise per-tab row count.
+
 ## Threads view
 
 `t` toggles the Feed tab (only) between two projections of the same message store:
@@ -189,13 +221,28 @@ muted tone, and the message text in the default foreground.
 - **Threads** — a digest of threads only. Every thread with at least one reply (Slack's own
   `reply_count` metadata, or a locally-known reply, whichever is greater) gets one entry, ordered
   by latest activity — the newest reply's time, or the root's own time if it has none yet —
-  newest first, so a thread that just got a reply jumps back to the top. The root and every
-  locally-known reply render nested beneath it, always expanded here — there is no
-  collapsed/expanded state in this view the way the Timeline has. Non-threaded messages (anything
-  that never got a reply) are excluded entirely.
+  ascending, newest at the bottom (see [Navigation](#navigation)), so a thread that just got a
+  reply jumps back to the bottom. The root and every locally-known reply render nested beneath it,
+  always expanded here — there is no collapsed/expanded state in this view the way the Timeline
+  has. Non-threaded messages (anything that never got a reply) are excluded entirely.
 - **`Enter` in the Threads view** always (re)fetches the selected thread's replies over REST,
   rather than the Timeline's expand/collapse toggle — there is no "collapsed" state here for a
   toggle to mean.
+- **Discoverable expansion, anywhere on a thread.** In the Timeline, `Enter` expands/collapses a
+  thread not just from its collapsed `↳ n replies` marker row, but also from the thread's own root
+  message row, any of its nested replies once expanded, or a collapsed thread's reply activity rows
+  (below) — you no longer have to hunt for the exact marker row. Expanding or collapsing sets a
+  one-line status confirming what happened: `thread expanded — n replies` (`thread expanded — 1
+  reply` for exactly one) or `thread collapsed`. The footer also shows an `enter expand/collapse
+  thread` hint whenever the selected row would actually do something thread-related.
+- **Reply activity rows.** A reply to a *collapsed* thread no longer just disappears into its
+  root's `↳ n replies` count — it also renders its own row at its actual chronological position in
+  the Timeline, styled like any other message but with its text prefixed `↳ @author replied:
+  <text>`. The collapsed root keeps its usual `↳ n replies` marker at the same time — the marker
+  and the activity rows for its replies coexist (the marker names the total, the activity rows show
+  which messages it's hiding and when they landed) — and `Enter` on an activity row expands the
+  thread it belongs to, same as `Enter` on the marker. Once a thread is expanded, its replies go
+  back to nesting under the root as before and stop emitting activity rows (no double-counting).
 - **Orphaned threads self-heal.** A reply whose root was never backfilled or seen still shows up
   here, as a synthetic entry headed `(thread — root not loaded)` instead of being dropped.
   Selecting it and hitting `Enter` fetches the real root over REST like any other refresh; once
@@ -214,7 +261,11 @@ muted tone, and the message text in the default foreground.
 | `1` `2`       | Switch tab — Feed / Mentions                                     |
 | `Tab`         | Switch tab (Feed ↔ Mentions)                                      |
 | `j` `k` · `↑` `↓` | Move the cursor                                              |
-| `Enter`       | Feed timeline: expand/collapse the selected thread. Feed threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
+| `G` · `End`   | Jump to the newest row (the bottom) — see [Navigation](#navigation) |
+| `g` · `Home`  | Jump to the oldest row (the top)                                  |
+| `PageDown` · `PageUp` | Move a full page                                          |
+| `Ctrl-d` · `Ctrl-u` | Move a half page                                            |
+| `Enter`       | Feed timeline: expand/collapse the selected thread (root, marker, reply, or activity row — see [Threads view](#threads-view)). Feed threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
 | `t`           | Feed tab only: toggle the Feed between the Timeline and the Threads-only view |
 | `o`           | Open the selected message's permalink in the browser             |
 | `r`           | Manual refresh (re-pull the last 50 messages of every conversation) |
