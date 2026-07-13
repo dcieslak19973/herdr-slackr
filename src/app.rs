@@ -884,9 +884,13 @@ impl App {
     /// original arrival predates this session), insert it fresh instead of dropping the edit.
     /// That insert-fresh path deliberately assigns a brand-new `arrival_seq` (rather than, say,
     /// backdating it) so the edit surfaces under the unread divider like any other new arrival.
-    fn upsert_edit(&mut self, msg: Message) {
+    fn upsert_edit(&mut self, mut msg: Message) {
         let key = key_for(&msg.conv, &msg.ts);
         if let Some(stored) = self.messages.get_mut(&key) {
+            // A live `message_changed` event's payload never carries `reply_count` (see
+            // `socket::message_from`), so an incoming `None` here means "field not reported",
+            // not "no replies" — inherit whatever was already known rather than clobbering it.
+            msg.reply_count = msg.reply_count.or(stored.msg.reply_count);
             stored.msg = msg;
         } else {
             self.arrival_seq += 1;
@@ -975,13 +979,14 @@ fn marker_count(root_reply_count: Option<u32>, local_replies: usize) -> usize {
 }
 
 /// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
-/// round-robin this tick: `0` when there are no active threads (the full budget goes to
-/// conversations instead — see `App::active_threads`), else a fixed `2`, regardless of how
-/// many active threads there actually are (a single active thread still reserves 2 slots; the
-/// second round-robin cursor's own `next_batch` clamps to however many are actually visited).
-/// Spec §2: "up to 2 of the 8 slots rotate round-robin over active threads."
+/// round-robin this tick: the number of active threads, capped at `2` — so `0` active threads
+/// reserves nothing (the full budget goes to conversations instead — see `App::active_threads`),
+/// exactly `1` active thread reserves exactly `1` slot (reserving a flat 2 here would waste a
+/// slot no thread exists to fill; `poll_conversations` picks up the difference), and `2` or more
+/// active threads reserves the full `2`. Spec §2: "up to 2 of the 8 slots rotate round-robin
+/// over active threads."
 fn thread_slot_count(active_threads: usize) -> usize {
-    if active_threads == 0 { 0 } else { 2 }
+    active_threads.min(2)
 }
 
 /// Update `newest` in place with `ts` for `conv`, iff `ts` is chronologically at or after
@@ -1243,6 +1248,34 @@ mod tests {
         let rows = app.feed_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "edited text");
+    }
+
+    #[test]
+    fn changed_event_without_reply_count_preserves_the_stored_reply_count() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(5),
+            ..msg("C1", "1.0", None, "U1", "root")
+        }));
+        // A live `message_changed` event carries no `reply_count` field at all (see
+        // `socket::message_from`), so the parsed `Message` has `reply_count: None` — that must
+        // not clobber the `Some(5)` already known for this root.
+        app.apply(SocketEvent::Changed(Message {
+            edited: true,
+            ..msg("C1", "1.0", None, "U1", "edited text")
+        }));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows[0].text, "edited text");
+        // Proxy assertion: reply_count isn't otherwise exposed, but active_threads() only
+        // treats a root as active when its (possibly-stale) reply_count exceeds locally-known
+        // replies — that stays true here (0 local < 5) only if reply_count survived the edit.
+        assert_eq!(
+            app.active_threads(),
+            vec![("C1".to_string(), "1.0".to_string())],
+            "reply_count must still be Some(5) after the edit, so the count-gap keeps it active"
+        );
     }
 
     // ---- delete removes ---------------------------------------------------------------------
@@ -1958,8 +1991,15 @@ mod tests {
     }
 
     #[test]
-    fn thread_slot_count_is_two_with_any_active_threads() {
-        assert_eq!(thread_slot_count(1), 2);
+    fn thread_slot_count_matches_active_count_below_the_cap() {
+        // Exactly 1 active thread only ever issues 1 replies() call, so reserving a flat 2
+        // wastes a slot the conversation round-robin could have used instead.
+        assert_eq!(thread_slot_count(1), 1);
+        assert_eq!(thread_slot_count(2), 2);
+    }
+
+    #[test]
+    fn thread_slot_count_is_capped_at_two_with_more_active_threads() {
         assert_eq!(thread_slot_count(5), 2);
     }
 
@@ -2077,7 +2117,10 @@ mod tests {
     }
 
     #[test]
-    fn poll_tick_reserves_only_six_conv_slots_when_threads_are_active() {
+    fn poll_tick_reserves_only_one_conv_slot_for_a_single_active_thread() {
+        // Exactly 1 active thread means only 1 replies() call actually issues; the conversation
+        // budget must pick up the slack rather than leaving the 2nd reserved slot unused — a
+        // full tick still visits all 8 of the budget's slots (1 thread + 7 conversations).
         let mut app = app_with_conversations(8);
         app.apply(SocketEvent::Message(Message {
             reply_count: Some(3),
@@ -2090,8 +2133,8 @@ mod tests {
         app.poll_tick_at(&rest, Instant::now());
 
         assert_eq!(
-            app.poll_cursor, 6,
-            "only 6 of the 8 conversations were visited — 2 slots went to the active thread"
+            app.poll_cursor, 7,
+            "all 7 remaining conversations were visited — only 1 slot went to the active thread"
         );
     }
 
