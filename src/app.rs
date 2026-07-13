@@ -754,6 +754,11 @@ impl App {
     /// `SelKind::Message` identity with their Timeline counterparts (see the module doc's
     /// `SelKind`), letting a selection made in one view still resolve correctly if the row also
     /// exists in the other.
+    ///
+    /// A reply whose root predates the backfill horizon (or was otherwise never seen) gets a
+    /// *synthetic* thread entry instead of being dropped — see the doc on the `Thread::root_msg`
+    /// field this method builds internally, and on the "(thread — root not loaded)" header text
+    /// below, for how that's rendered and how it self-heals once the real root is known.
     pub fn thread_rows(&self) -> Vec<Row> {
         self.thread_rows_with_ids().into_iter().map(|(_, row)| row).collect()
     }
@@ -761,18 +766,28 @@ impl App {
     /// As `thread_rows`, but each row is paired with the `(conv, ts)` a Threads-view action
     /// (Enter/refresh, permalink) should act on.
     fn thread_rows_with_ids(&self) -> Vec<IdRow> {
+        /// Either a real, locally-known root (`Some`) or a synthetic placeholder for a thread
+        /// whose root has never been seen (`None` — see `thread_rows`'s doc). The `(conv,
+        /// root_ts)` pair is carried alongside so the synthetic case has something to render and
+        /// key an id from even without a `Stored` root to borrow it from.
         struct Thread<'a> {
             activity: (u64, u32),
             conv: String,
-            root: &'a Stored,
+            root_ts: String,
+            root_msg: Option<&'a Stored>,
             replies: Vec<&'a Stored>,
         }
 
         let mut threads: Vec<Thread<'_>> = Vec::new();
+        // Every reply attached to a root this loop already knows about (whether or not that root
+        // clears `marker_count`) — used below to find orphaned replies, i.e. those whose
+        // `thread_ts` names a root outside this set entirely.
+        let mut seen_roots: HashSet<(&str, &str)> = HashSet::new();
         for stored in self.messages.values() {
             if stored.msg.thread_ts.is_some() {
                 continue; // only roots start a thread entry; replies are attached below.
             }
+            seen_roots.insert((stored.msg.conv.as_str(), stored.msg.ts.as_str()));
             let conv = stored.msg.conv.clone();
             let root_ts = stored.msg.ts.clone();
             let mut replies: Vec<&Stored> = self
@@ -788,16 +803,49 @@ impl App {
             }
             replies.sort_by_key(|r| ts_key(&r.msg.ts));
             let activity = replies.last().map_or_else(|| ts_key(&root_ts), |r| ts_key(&r.msg.ts));
-            threads.push(Thread { activity, conv, root: stored, replies });
+            threads.push(Thread { activity, conv, root_ts, root_msg: Some(stored), replies });
         }
+
+        // Orphaned replies: their root isn't locally known at all (unlike the roots skipped
+        // above via `count == 0`, which *are* known — just not thread-qualifying). Group them by
+        // `(conv, thread_ts)` into one synthetic thread entry each rather than dropping them, the
+        // way the Timeline's `feed_rows_with_ids` inlines them individually instead.
+        let mut orphans: BTreeMap<(String, String), Vec<&Stored>> = BTreeMap::new();
+        for stored in self.messages.values() {
+            if let Some(root_ts) = &stored.msg.thread_ts
+                && !seen_roots.contains(&(stored.msg.conv.as_str(), root_ts.as_str()))
+            {
+                orphans.entry((stored.msg.conv.clone(), root_ts.clone())).or_default().push(stored);
+            }
+        }
+        for ((conv, root_ts), mut replies) in orphans {
+            replies.sort_by_key(|r| ts_key(&r.msg.ts));
+            let activity = replies.last().map_or_else(|| ts_key(&root_ts), |r| ts_key(&r.msg.ts));
+            threads.push(Thread { activity, conv, root_ts, root_msg: None, replies });
+        }
+
         threads.sort_by(|a, b| b.activity.cmp(&a.activity)); // newest activity first
 
         let mut rows: Vec<IdRow> = Vec::new();
         for thread in threads {
-            rows.push((
-                Some((thread.conv.clone(), thread.root.msg.ts.clone())),
-                self.message_row(&thread.root.msg),
-            ));
+            let id = Some((thread.conv.clone(), thread.root_ts.clone()));
+            let root_row = match thread.root_msg {
+                Some(root) => self.message_row(&root.msg),
+                // Synthetic header: same shape/`SelKind` as a real root row (`RowKind::Message`,
+                // via `message_row`'s own default), so selecting it and hitting Enter still
+                // routes through `refresh_thread` → `conversations.replies`, which returns the
+                // real root as the first message; the next `upsert_new` inserts it under this
+                // same key, and the very next projection naturally replaces this synthetic row
+                // with the real one — no explicit cleanup needed anywhere.
+                None => Row {
+                    conv_label: self.conv_label(&thread.conv),
+                    author: String::new(),
+                    time_hhmm: ts_to_hhmm(&thread.root_ts),
+                    text: "(thread — root not loaded)".to_string(),
+                    kind: RowKind::Message,
+                },
+            };
+            rows.push((id, root_row));
             for reply in thread.replies {
                 let mut row = self.message_row(&reply.msg);
                 row.text = format!("\u{21b3} {}", row.text);
@@ -2498,6 +2546,60 @@ mod tests {
         let rows = app.thread_rows();
         assert_eq!(rows[0].text, "newer root");
         assert_eq!(rows[2].text, "old root, no replies fetched yet");
+    }
+
+    // ---- thread_rows: orphaned replies (root not locally known) get a synthetic thread --------
+
+    #[test]
+    fn thread_rows_surfaces_an_orphaned_reply_as_a_synthetic_thread() {
+        let mut app = empty_app();
+        // No root "1.000001" was ever stored (e.g. it's older than the backfill horizon), but a
+        // reply to it arrives. The Timeline (feed_rows) inlines this as a "↳ "-prefixed row; the
+        // Threads view must not simply drop it instead — it gets a synthetic thread entry.
+        app.apply(SocketEvent::Message(msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "reply to an unknown root",
+        )));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, RowKind::Message);
+        assert_eq!(rows[0].text, "(thread — root not loaded)");
+        assert_eq!(rows[1].text, "\u{21b3} reply to an unknown root");
+    }
+
+    #[test]
+    fn thread_rows_orders_a_synthetic_thread_by_its_replys_ts() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "root A")));
+        app.apply(SocketEvent::Message(msg("C1", "5.1", Some("5.0"), "U1", "reply A1")));
+        // The orphaned reply's ts (50.0) is newer than thread A's activity (5.1) — its synthetic
+        // thread must sort first.
+        app.apply(SocketEvent::Message(msg("C1", "50.0", Some("40.0"), "U1", "orphaned reply")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows[0].text, "(thread — root not loaded)");
+        assert_eq!(rows[1].text, "\u{21b3} orphaned reply");
+        assert_eq!(rows[2].text, "root A");
+    }
+
+    #[test]
+    fn thread_rows_synthetic_thread_self_heals_when_the_root_arrives() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply")));
+        assert_eq!(app.thread_rows()[0].text, "(thread — root not loaded)");
+
+        // The root arrives — e.g. `refresh_thread`'s `conversations.replies` call returns the
+        // actual root as the first message, and it goes through the normal upsert path.
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "actual root")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 2, "the synthetic header must be replaced, not duplicated");
+        assert_eq!(rows[0].text, "actual root");
+        assert_eq!(rows[1].text, "\u{21b3} reply");
     }
 
     // ---- toggle_view: Feed-tab-only projection flip (Task 2, spec §3) --------------------------
