@@ -116,6 +116,7 @@ mod tests {
             author: "U1".into(),
             text: text.into(),
             edited: false,
+            reply_count: None,
         }
     }
 

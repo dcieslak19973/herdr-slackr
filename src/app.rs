@@ -157,6 +157,11 @@ pub struct App {
     /// batch (see `next_batch`); persists across ticks so every conversation is eventually
     /// polled rather than only ever the first `POLL_BATCH`.
     poll_cursor: usize,
+    /// Round-robin position into `active_threads()`'s list for `poll_tick_at`'s thread-refresh
+    /// slots (see `thread_slot_count`); persists across ticks for the same reason `poll_cursor`
+    /// does, independently of it — the active-thread list's length has nothing to do with
+    /// `conversations`'s, so the two cursors would otherwise race each other's wraparound.
+    poll_thread_cursor: usize,
     /// Set from a `RateLimited(secs)` hit during `poll_tick`; while `Some` and unexpired, ticks
     /// are skipped entirely (not merely shortened) rather than hammering Slack again on
     /// schedule. `Instant`-based (not wall-clock) so it is monotonic and immune to clock
@@ -226,6 +231,7 @@ impl App {
             divider_mark: 0,
             newest_ts: HashMap::new(),
             poll_cursor: 0,
+            poll_thread_cursor: 0,
             cooldown_until: None,
         };
 
@@ -271,6 +277,7 @@ impl App {
             divider_mark: 0,
             newest_ts: HashMap::new(),
             poll_cursor: 0,
+            poll_thread_cursor: 0,
             cooldown_until: None,
         }
     }
@@ -347,16 +354,24 @@ impl App {
     /// (`cooldown_until`) hasn't yet passed — the status line keeps showing the notice from when
     /// the cooldown was set.
     ///
+    /// Up to [`thread_slot_count`] of the `POLL_BATCH` budget is spent first on a second
+    /// round-robin over [`App::active_threads`] — threads currently expanded, or whose root's
+    /// `reply_count` outpaces what's locally known — fetching each one's replies newer than the
+    /// thread's newest-known reply ts (spec §2). The remainder goes to conversations exactly as
+    /// before; when there are no active threads, the full `POLL_BATCH` goes to conversations, so
+    /// the reservation never wastes budget on an empty thread list.
+    ///
     /// Messages already known (same `(conv, ts)`) are deduplicated by `upsert_new` regardless
     /// (belt-and-suspenders against a re-widened `oldest` window), so a message that arrives via
     /// both a poll and the socket still appears exactly once.
     ///
     /// A `RestError::RateLimited` sets a rate-limit status, starts the cooldown, and stops the
-    /// rest of this tick's batch (Slack's own signal to back off now, not to keep hammering the
-    /// remaining conversations); any other error sets a one-line status naming the conversation
-    /// and moves on to the next one in the batch rather than crashing (spec: a per-conversation
-    /// poll failure must never take down the pane). See `poll_error_status` for the pure wording
-    /// decision.
+    /// rest of this tick — including skipping the conversation batch entirely if the limit hit
+    /// during the thread slots (Slack's own signal to back off now, not to keep hammering
+    /// anything else this tick); any other error sets a one-line status naming what failed and
+    /// moves on to the next item in its batch rather than crashing (spec: a per-conversation or
+    /// per-thread poll failure must never take down the pane). See `poll_error_status` for the
+    /// pure wording decision.
     pub fn poll_tick(&mut self, rest: &Rest) {
         self.poll_tick_at(rest, Instant::now());
     }
@@ -371,8 +386,60 @@ impl App {
         }
         self.cooldown_until = None;
 
+        let active = self.active_threads();
+        let thread_slots = thread_slot_count(active.len());
+        let conv_slots = POLL_BATCH - thread_slots;
+
+        let rate_limited = self.poll_active_threads(rest, &active, thread_slots, now);
+        if !rate_limited {
+            self.poll_conversations(rest, conv_slots, now);
+        }
+        self.resync_cursor();
+    }
+
+    /// The active-thread half of `poll_tick_at`'s split budget: round-robin `thread_slots` of
+    /// `active` via the dedicated `poll_thread_cursor`, fetching each thread's replies newer than
+    /// its newest-known reply ts (`newest_reply_ts`) and folding them in via `apply_fetched_replies`.
+    /// Returns whether a `RateLimited` hit occurred (and so the conversation batch this tick
+    /// should be skipped entirely, matching the single-batch behavior `poll_conversations` itself
+    /// applies) — the cooldown itself is set on `self` before returning, same as the
+    /// conversation path.
+    fn poll_active_threads(
+        &mut self,
+        rest: &Rest,
+        active: &[(String, String)],
+        thread_slots: usize,
+        now: Instant,
+    ) -> bool {
+        let (indices, next_cursor) =
+            next_batch(self.poll_thread_cursor, active.len(), thread_slots);
+        self.poll_thread_cursor = next_cursor;
+
+        for i in indices {
+            let (conv_id, root_ts) = active[i].clone();
+            let oldest = self.newest_reply_ts(&conv_id, &root_ts);
+            let label = format!("{conv_id} thread {root_ts}");
+            match crate::rest::replies(rest, &conv_id, &root_ts, oldest.as_deref()) {
+                Ok(msgs) => self.apply_fetched_replies(msgs),
+                Err(err @ RestError::RateLimited(secs)) => {
+                    self.status = poll_error_status(&label, &err);
+                    self.cooldown_until = Some(now + Duration::from_secs(secs));
+                    return true;
+                }
+                Err(err) => {
+                    self.status = poll_error_status(&label, &err);
+                }
+            }
+        }
+        false
+    }
+
+    /// The conversation half of `poll_tick_at`'s split budget: unchanged from before the split
+    /// except that its slot count is now `conv_slots` (`POLL_BATCH` minus whatever the thread
+    /// round-robin took) rather than the full `POLL_BATCH`.
+    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) {
         let n = self.conversations.len();
-        let (indices, next_cursor) = next_batch(self.poll_cursor, n, POLL_BATCH);
+        let (indices, next_cursor) = next_batch(self.poll_cursor, n, conv_slots);
         self.poll_cursor = next_cursor;
 
         for i in indices {
@@ -395,7 +462,63 @@ impl App {
                 }
             }
         }
-        self.resync_cursor();
+    }
+
+    /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
+    /// every root currently expanded inline (`expanded`), plus every root whose Slack-reported
+    /// `reply_count` exceeds the number of replies stored locally for it — i.e. backfill/polling
+    /// hasn't caught up to what Slack says the thread actually has. A root already covered by
+    /// `expanded` is not duplicated. Order is stable within one call (`expanded`'s arbitrary but
+    /// fixed hash order, then remaining count-gap roots in message-store order) — good enough for
+    /// `poll_thread_cursor`'s round-robin, which only needs a consistent order across ticks, not
+    /// any particular one.
+    fn active_threads(&self) -> Vec<(String, String)> {
+        let mut ids: Vec<(String, String)> = self.expanded.iter().cloned().collect();
+        for stored in self.messages.values() {
+            if stored.msg.thread_ts.is_some() {
+                continue; // only roots are candidates
+            }
+            let id = (stored.msg.conv.clone(), stored.msg.ts.clone());
+            if ids.contains(&id) {
+                continue;
+            }
+            let local = self.local_reply_count(&stored.msg.conv, &stored.msg.ts);
+            if stored.msg.reply_count.unwrap_or(0) as usize > local {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// How many replies to `root_ts` in `conv` are already stored locally.
+    fn local_reply_count(&self, conv: &str, root_ts: &str) -> usize {
+        self.messages
+            .values()
+            .filter(|s| s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts))
+            .count()
+    }
+
+    /// The newest `ts` among `root_ts`'s locally-known replies in `conv`, threaded into
+    /// `poll_active_threads`'s `replies(..., oldest)` call — `None` when no reply is known yet
+    /// locally, which fetches the whole thread (Slack's `oldest` is optional; omitting it is
+    /// exactly what a first-ever fetch of a backfilled-but-never-expanded thread wants).
+    fn newest_reply_ts(&self, conv: &str, root_ts: &str) -> Option<String> {
+        self.messages
+            .values()
+            .filter(|s| s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts))
+            .map(|s| s.msg.ts.clone())
+            .max_by(|a, b| ts_cmp(a, b))
+    }
+
+    /// Fold thread replies fetched by the polling refresh into the store via the normal
+    /// `upsert_new` path, so mention detection/dedup/arrival-ordering all follow exactly as they
+    /// do for any other newly-seen message (spec §2: "fetched replies run through the normal
+    /// upsert path, so thread mentions land in the Mentions tab"). Split out from
+    /// `poll_active_threads` so it is unit-tested without a real REST call.
+    fn apply_fetched_replies(&mut self, msgs: Vec<Message>) {
+        for msg in msgs {
+            self.upsert_new(msg);
+        }
     }
 
     /// Move the cursor by `delta` rows within the active tab's current row list, clamping to
@@ -528,7 +651,8 @@ impl App {
                     s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts.as_str())
                 })
                 .collect();
-            if replies.is_empty() {
+            let count = marker_count(stored.msg.reply_count, replies.len());
+            if count == 0 {
                 continue;
             }
             replies.sort_by(|a, b| ts_cmp(&a.msg.ts, &b.msg.ts));
@@ -555,8 +679,8 @@ impl App {
                         conv_label: self.conv_label(&conv),
                         author: String::new(),
                         time_hhmm: String::new(),
-                        text: format!("\u{21b3} {} replies", replies.len()),
-                        kind: RowKind::ThreadMarker { replies: replies.len(), expanded: false },
+                        text: format!("\u{21b3} {count} replies"),
+                        kind: RowKind::ThreadMarker { replies: count, expanded: false },
                     },
                 ));
             }
@@ -678,7 +802,7 @@ impl App {
         }
         let will_expand = !self.expanded.contains(&(conv.clone(), root_ts.clone()));
         let fetched = if will_expand {
-            match crate::rest::replies(rest, &conv, &root_ts) {
+            match crate::rest::replies(rest, &conv, &root_ts, None) {
                 Ok(msgs) => msgs,
                 Err(err) => {
                     self.status = format!("replies failed: {err:?}");
@@ -837,6 +961,29 @@ fn apply_backfill(
     Ok(())
 }
 
+/// The reply count a `ThreadMarker` row should display: the greater of Slack's own
+/// `reply_count` metadata (from a history/backfill/poll root, or a live `message_changed`
+/// update — see `Message::reply_count`'s doc) and the number of replies actually stored
+/// locally. Taking the max (rather than always preferring one or the other) is what lets a
+/// freshly-backfilled thread show its true count immediately — before any reply has been
+/// fetched, `reply_count` alone carries it — while a thread whose replies arrived live (via
+/// the socket, where roots don't carry updated metadata on every reply — see `socket.rs`'s
+/// module doc) still counts correctly from what's locally known, even if that exceeds a
+/// stale/never-set `reply_count`.
+fn marker_count(root_reply_count: Option<u32>, local_replies: usize) -> usize {
+    (root_reply_count.unwrap_or(0) as usize).max(local_replies)
+}
+
+/// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
+/// round-robin this tick: `0` when there are no active threads (the full budget goes to
+/// conversations instead — see `App::active_threads`), else a fixed `2`, regardless of how
+/// many active threads there actually are (a single active thread still reserves 2 slots; the
+/// second round-robin cursor's own `next_batch` clamps to however many are actually visited).
+/// Spec §2: "up to 2 of the 8 slots rotate round-robin over active threads."
+fn thread_slot_count(active_threads: usize) -> usize {
+    if active_threads == 0 { 0 } else { 2 }
+}
+
 /// Update `newest` in place with `ts` for `conv`, iff `ts` is chronologically at or after
 /// whatever's already tracked (or nothing is tracked yet) — the newest-seen-`ts` half of
 /// `App::newest_ts`'s doc, split out pure so the "keep the max" comparison is unit-tested
@@ -991,8 +1138,8 @@ fn resolve_im_names(
 mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, RowKind, SelKind, Tab, apply_backfill,
-        backfill_retry_decision, capped_sleep_secs, cooldown_active, next_batch, poll_error_status,
-        resolve_im_names, track_newest, ts_to_hhmm,
+        backfill_retry_decision, capped_sleep_secs, cooldown_active, marker_count, next_batch,
+        poll_error_status, resolve_im_names, thread_slot_count, track_newest, ts_to_hhmm,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -1013,6 +1160,7 @@ mod tests {
             author: author.into(),
             text: text.into(),
             edited: false,
+            reply_count: None,
         }
     }
 
@@ -1045,6 +1193,7 @@ mod tests {
             divider_mark: 0,
             newest_ts: HashMap::new(),
             poll_cursor: 0,
+            poll_thread_cursor: 0,
             cooldown_until: None,
         }
     }
@@ -1745,6 +1894,242 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "10.0", None, "U1", "b")));
         app.apply(SocketEvent::Message(msg("C1", "3.0", None, "U1", "c"))); // older, ignored
         assert_eq!(app.newest_ts.get("C1").map(String::as_str), Some("10.0"));
+    }
+
+    // ---- marker_count: max(metadata, local) (Task 1, spec §1) ----------------------------------
+
+    #[test]
+    fn marker_count_uses_metadata_when_local_is_zero() {
+        assert_eq!(marker_count(Some(5), 0), 5);
+    }
+
+    #[test]
+    fn marker_count_uses_local_when_metadata_is_absent() {
+        assert_eq!(marker_count(None, 3), 3);
+    }
+
+    #[test]
+    fn marker_count_takes_the_greater_of_the_two_when_both_are_present() {
+        assert_eq!(marker_count(Some(2), 5), 5, "local ahead of stale/smaller metadata");
+        assert_eq!(marker_count(Some(9), 4), 9, "metadata ahead of what's locally known yet");
+    }
+
+    #[test]
+    fn marker_count_is_zero_when_neither_is_present() {
+        assert_eq!(marker_count(None, 0), 0);
+    }
+
+    #[test]
+    fn a_backfilled_thread_shows_its_marker_before_any_reply_is_locally_known() {
+        // Spec §1: a root's reply_count alone must render "n replies" immediately, with zero
+        // replies actually fetched yet.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(4),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 4, expanded: false });
+    }
+
+    #[test]
+    fn a_thread_with_more_local_replies_than_stale_metadata_shows_the_local_count() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 2, expanded: false });
+    }
+
+    // ---- thread_slot_count: budget split, zero-active never wastes (Task 1, spec §2) ----------
+
+    #[test]
+    fn thread_slot_count_is_zero_with_no_active_threads() {
+        assert_eq!(thread_slot_count(0), 0);
+    }
+
+    #[test]
+    fn thread_slot_count_is_two_with_any_active_threads() {
+        assert_eq!(thread_slot_count(1), 2);
+        assert_eq!(thread_slot_count(5), 2);
+    }
+
+    // ---- active_threads: expanded ∪ count-gap roots (Task 1, spec §2) --------------------------
+
+    #[test]
+    fn active_threads_includes_an_expanded_root_even_with_no_reply_count_gap() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.toggle_thread("C1", "1.000001", Vec::new()); // expand with no replies at all
+
+        assert_eq!(app.active_threads(), vec![("C1".to_string(), "1.000001".to_string())]);
+    }
+
+    #[test]
+    fn active_threads_includes_a_collapsed_root_whose_reply_count_outpaces_local_replies() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(3),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        // Only 1 of the 3 reported replies is locally known.
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+
+        assert_eq!(app.active_threads(), vec![("C1".to_string(), "1.000001".to_string())]);
+    }
+
+    #[test]
+    fn active_threads_excludes_a_root_whose_local_replies_already_match_its_reply_count() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+
+        assert!(app.active_threads().is_empty(), "no gap and not expanded — not active");
+    }
+
+    #[test]
+    fn active_threads_is_empty_for_a_plain_thread_root_with_no_metadata_or_expansion() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        assert!(app.active_threads().is_empty());
+    }
+
+    #[test]
+    fn active_threads_does_not_duplicate_a_root_that_is_both_expanded_and_count_gapped() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(5),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.toggle_thread("C1", "1.000001", Vec::new());
+
+        assert_eq!(app.active_threads(), vec![("C1".to_string(), "1.000001".to_string())]);
+    }
+
+    // ---- newest_reply_ts / apply_fetched_replies (Task 1, spec §2) -----------------------------
+
+    #[test]
+    fn newest_reply_ts_is_none_when_no_reply_is_known_locally() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        assert_eq!(app.newest_reply_ts("C1", "1.000001"), None);
+    }
+
+    #[test]
+    fn newest_reply_ts_picks_the_chronologically_latest_known_reply() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "later")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "earlier")));
+        assert_eq!(app.newest_reply_ts("C1", "1.000001"), Some("1.000003".to_string()));
+    }
+
+    #[test]
+    fn apply_fetched_replies_upserts_each_message_through_the_normal_path() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.toggle_thread("C1", "1.000001", Vec::new()); // expanded, so the reply renders inline
+        app.apply_fetched_replies(vec![msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "fetched reply",
+        )]);
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert!(rows.iter().any(|r| r.text == "fetched reply"));
+    }
+
+    // ---- poll_tick_at: split-budget rotation over active threads (Task 1, spec §2) -------------
+
+    /// A fixture with `n` conversations (`C0`..`Cn-1`), for exercising the slot-split math at a
+    /// batch size the default 2-conversation `empty_app` can't: `POLL_BATCH` is 8, so the
+    /// conv-slot reservation (6 when threads are active) only bites with more than 6 conversations.
+    fn app_with_conversations(n: usize) -> App {
+        let mut app = App::empty("SELF");
+        for i in 0..n {
+            let id = format!("C{i}");
+            app.add_conversation(&id, &format!("conv{i}"), ConvKind::Channel);
+        }
+        app.conversations = (0..n)
+            .map(|i| Conversation {
+                id: format!("C{i}"),
+                name: format!("conv{i}"),
+                kind: ConvKind::Channel,
+                updated: None,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn poll_tick_reserves_only_six_conv_slots_when_threads_are_active() {
+        let mut app = app_with_conversations(8);
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(3),
+            ..msg("C0", "1.000001", None, "U1", "root")
+        }));
+        assert_eq!(app.active_threads().len(), 1, "one count-gapped root makes threads active");
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now());
+
+        assert_eq!(
+            app.poll_cursor, 6,
+            "only 6 of the 8 conversations were visited — 2 slots went to the active thread"
+        );
+    }
+
+    #[test]
+    fn poll_tick_spends_all_eight_slots_on_conversations_when_no_threads_are_active() {
+        let mut app = app_with_conversations(8);
+        assert!(app.active_threads().is_empty());
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now());
+
+        assert_eq!(
+            app.poll_cursor, 0,
+            "all 8 conversations were visited and the cursor wrapped — nothing reserved"
+        );
+    }
+
+    #[test]
+    fn poll_tick_thread_cursor_round_robins_across_ticks() {
+        let mut app = app_with_conversations(1);
+        // Three distinct active threads (all expanded, so no reply_count juggling needed).
+        for ts in ["1.0", "2.0", "3.0"] {
+            app.apply(SocketEvent::Message(msg("C0", ts, None, "U1", "root")));
+            app.toggle_thread("C0", ts, Vec::new());
+        }
+        assert_eq!(app.active_threads().len(), 3);
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now()); // visits 2 of the 3 active threads
+        assert_eq!(app.poll_thread_cursor, 2, "thread cursor advances by the 2-slot budget");
+
+        app.poll_tick_at(&rest, Instant::now()); // wraps: visits the 3rd, then back to the 1st
+        assert_eq!(
+            app.poll_thread_cursor, 1,
+            "thread cursor wraps round-robin across ticks, independent of the conv cursor"
+        );
     }
 
     // ---- backfill retry decision (Task 2, spec §5) --------------------------------------------

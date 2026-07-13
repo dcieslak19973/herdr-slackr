@@ -37,6 +37,14 @@ pub struct Message {
     pub author: String,
     pub text: String,
     pub edited: bool,
+    /// A thread root's reply count, from Slack's `reply_count` field on `conversations.history`/
+    /// `conversations.replies` root objects (and, when present, a `message_changed` envelope's
+    /// nested message — see `crate::socket::message_from`). `None` on a plain message, a thread
+    /// reply, or a root whose payload omitted the field. The diff-pane `ThreadMarker` count is
+    /// `max(reply_count, locally-known replies)` (see `crate::app::feed_rows_with_ids`), so a
+    /// backfilled/polled thread shows its true count immediately, before any reply has actually
+    /// been fetched.
+    pub reply_count: Option<u32>,
 }
 
 /// Compare two Slack `ts` strings (e.g. `"1752300000.000100"`) numerically, not lexically.

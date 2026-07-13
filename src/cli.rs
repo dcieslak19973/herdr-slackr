@@ -620,6 +620,7 @@ mod tests {
             author: author.to_string(),
             text: text.to_string(),
             edited: false,
+            reply_count: None,
         }
     }
 

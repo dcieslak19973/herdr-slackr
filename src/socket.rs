@@ -108,10 +108,18 @@ fn events_api(event: &Value) -> Vec<SocketEvent> {
 ///
 /// `author` is `user` if present, else `bot_id` (Slack's `bot_message` events usually carry
 /// `bot_id` and no `user`), else empty.
+///
+/// `reply_count` is read off the same object when present: Slack sends a `message_changed` event
+/// for a thread root whenever its reply count changes (a new reply posted, one deleted, …), with
+/// the nested `message` carrying the updated `reply_count` — so this cheaply picks up fresh
+/// thread metadata from the live socket path, not only from `history`/`replies` backfill
+/// (`crate::app`'s `active_threads`/marker-count logic doc has the rest of that story). A plain
+/// `message`/`bot_message` event never carries this field, so it stays `None` there.
 fn message_from(v: &Value, conv: &str) -> Message {
     let user = v["user"].as_str().filter(|s| !s.is_empty());
     let bot_id = v["bot_id"].as_str().filter(|s| !s.is_empty());
     let author = user.or(bot_id).unwrap_or_default().to_string();
+    let reply_count = v["reply_count"].as_u64().and_then(|n| u32::try_from(n).ok());
     Message {
         conv: conv.to_string(),
         ts: v["ts"].as_str().unwrap_or_default().to_string(),
@@ -119,6 +127,7 @@ fn message_from(v: &Value, conv: &str) -> Message {
         author,
         text: v["text"].as_str().unwrap_or_default().to_string(),
         edited: !v["edited"].is_null(),
+        reply_count,
     }
 }
 
@@ -404,6 +413,7 @@ mod tests {
                 author: "U1".into(),
                 text: "hi".into(),
                 edited: false,
+                reply_count: None,
             })]
         );
         assert_eq!(ack, Some("x".to_string()));
@@ -473,9 +483,26 @@ mod tests {
                 author: "U1".into(),
                 text: "edited".into(),
                 edited: true,
+                reply_count: None,
             })]
         );
         assert_eq!(ack, Some("z".to_string()));
+    }
+
+    #[test]
+    fn events_api_message_changed_carries_the_nested_messages_reply_count_when_present() {
+        // Slack sends message_changed for a thread root whenever its reply_count changes; the
+        // nested message object carries the fresh count, which message_from should pick up
+        // without waiting on the next history/replies backfill.
+        let frame = r#"{"envelope_id":"rc","type":"events_api","payload":{"event":
+            {"type":"message","subtype":"message_changed","channel":"C1",
+             "message":{"ts":"1.2","user":"U1","text":"root","reply_count":4}}}}"#;
+        let (events, ack) = handle_frame(frame);
+        match events.as_slice() {
+            [SocketEvent::Changed(m)] => assert_eq!(m.reply_count, Some(4)),
+            other => panic!("expected one Changed event, got {other:?}"),
+        }
+        assert_eq!(ack, Some("rc".to_string()));
     }
 
     #[test]

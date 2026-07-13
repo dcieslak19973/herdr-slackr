@@ -48,6 +48,7 @@ fn msg(conv: &str, ts: &str, thread_ts: Option<&str>, author: &str, text: &str) 
         author: author.into(),
         text: text.into(),
         edited: false,
+        reply_count: None,
     }
 }
 

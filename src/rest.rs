@@ -144,10 +144,34 @@ fn history_params<'a>(
     params
 }
 
-/// All replies in the thread rooted at `thread_ts` within `conv`.
-pub fn replies(rest: &Rest, conv: &str, thread_ts: &str) -> Result<Vec<Message>, RestError> {
-    let v = rest.get("conversations.replies", &[("channel", conv), ("ts", thread_ts)])?;
+/// All replies in the thread rooted at `thread_ts` within `conv`, or — when `oldest` names a
+/// `ts` — only those newer than it (same exclusive-`oldest` semantics as [`history`], used by
+/// the polling fallback's bounded thread refresh: the thread's newest-known reply ts is passed
+/// back in so a routine tick only asks Slack for replies it hasn't already stored). `None` fetches
+/// every reply, used by the interactive Enter-to-expand path (which wants the whole thread).
+pub fn replies(
+    rest: &Rest,
+    conv: &str,
+    thread_ts: &str,
+    oldest: Option<&str>,
+) -> Result<Vec<Message>, RestError> {
+    let params = replies_params(conv, thread_ts, oldest);
+    let v = rest.get("conversations.replies", &params)?;
     Ok(parse_messages(&v, conv))
+}
+
+/// Pure param-list construction for [`replies`], split out exactly like [`history_params`] so
+/// `oldest`'s presence/absence is unit-tested without a real REST call.
+fn replies_params<'a>(
+    conv: &'a str,
+    thread_ts: &'a str,
+    oldest: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut params = vec![("channel", conv), ("ts", thread_ts)];
+    if let Some(oldest) = oldest {
+        params.push(("oldest", oldest));
+    }
+    params
 }
 
 /// Every workspace member as `(id, display name)`, paginated to completion. The name is
@@ -356,7 +380,9 @@ fn parse_conversations(v: &Value) -> Vec<Conversation> {
 /// `conversations.history`/`conversations.replies`'s `messages[]` to [`Message`]s, in the order
 /// Slack returned them (this module never re-sorts). `thread_ts` becomes `None` when absent *or*
 /// equal to the message's own `ts` — Slack sets a thread root's `thread_ts` to its own `ts`, and
-/// per `Message`'s contract that case is a top-level message, not a reply to itself.
+/// per `Message`'s contract that case is a top-level message, not a reply to itself. `reply_count`
+/// is read straight off the object (only a thread root carries it; a reply or a threadless
+/// message simply has no such field, yielding `None`).
 fn parse_messages(v: &Value, conv: &str) -> Vec<Message> {
     v["messages"]
         .as_array()
@@ -365,6 +391,7 @@ fn parse_messages(v: &Value, conv: &str) -> Vec<Message> {
         .map(|m| {
             let ts = m["ts"].as_str().unwrap_or_default().to_string();
             let thread_ts = m["thread_ts"].as_str().filter(|t| *t != ts).map(str::to_string);
+            let reply_count = m["reply_count"].as_u64().and_then(|n| u32::try_from(n).ok());
             Message {
                 conv: conv.to_string(),
                 ts,
@@ -372,6 +399,7 @@ fn parse_messages(v: &Value, conv: &str) -> Vec<Message> {
                 author: m["user"].as_str().unwrap_or_default().to_string(),
                 text: m["text"].as_str().unwrap_or_default().to_string(),
                 edited: !m["edited"].is_null(),
+                reply_count,
             }
         })
         .collect()
@@ -669,6 +697,24 @@ mod tests {
         );
     }
 
+    // ---- replies_params (oldest threading, Task 1) -----------------------------------------
+
+    #[test]
+    fn replies_params_omits_oldest_when_none() {
+        assert_eq!(
+            replies_params("C1", "100.000001", None),
+            vec![("channel", "C1"), ("ts", "100.000001")]
+        );
+    }
+
+    #[test]
+    fn replies_params_includes_oldest_when_given() {
+        assert_eq!(
+            replies_params("C1", "100.000001", Some("100.000002")),
+            vec![("channel", "C1"), ("ts", "100.000001"), ("oldest", "100.000002")]
+        );
+    }
+
     // ---- history / replies -----------------------------------------------------------------
 
     #[test]
@@ -699,6 +745,19 @@ mod tests {
         let msgs = parse_messages(&v, "C1");
         assert_eq!(msgs[0].thread_ts, None); // root: thread_ts == its own ts
         assert_eq!(msgs[1].thread_ts, Some("100.000001".to_string()));
+    }
+
+    #[test]
+    fn parse_messages_reads_reply_count_on_a_root_and_none_when_absent() {
+        let v = serde_json::json!({
+            "messages": [
+                {"ts": "1.1", "user": "U1", "text": "root", "reply_count": 3},
+                {"ts": "1.2", "user": "U2", "text": "plain message"}
+            ]
+        });
+        let msgs = parse_messages(&v, "C1");
+        assert_eq!(msgs[0].reply_count, Some(3));
+        assert_eq!(msgs[1].reply_count, None);
     }
 
     #[test]
