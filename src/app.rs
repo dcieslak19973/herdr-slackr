@@ -17,7 +17,7 @@
 //! logic below — is pure and unit-tested without touching the network (house pattern: see
 //! the REST and socket modules' thin-edge-over-pure-core split).
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::PluginConfig;
 use crate::entities::{self, is_mention};
@@ -1164,7 +1164,7 @@ impl App {
                 None => Row {
                     conv_label: self.conv_label(&thread.conv),
                     author: String::new(),
-                    time_hhmm: ts_to_hhmm(&thread.root_ts),
+                    time_hhmm: format_ts(&thread.root_ts, SystemTime::now()),
                     text: "(thread — root not loaded)".to_string(),
                     kind: RowKind::Message,
                 },
@@ -1567,7 +1567,7 @@ impl App {
         Row {
             conv_label: self.conv_label(&msg.conv),
             author,
-            time_hhmm: ts_to_hhmm(&msg.ts),
+            time_hhmm: format_ts(&msg.ts, SystemTime::now()),
             text,
             kind: RowKind::Message,
         }
@@ -1605,13 +1605,51 @@ impl App {
     }
 }
 
-/// Render a Slack `ts`'s seconds as a `HH:MM` UTC clock time (no timezone crate in the closed
-/// dependency list, so this is plain epoch-seconds arithmetic). A malformed `ts` parses via
-/// `ts_key`'s `(0, 0)` fallback and renders as `00:00` rather than panicking.
-fn ts_to_hhmm(ts: &str) -> String {
+/// Three-letter month abbreviations, indexed `[month - 1]`, for [`format_ts`]'s prior-day
+/// rendering — no date/time crate in the closed dependency list, so this is a plain const table.
+const MONTH_ABBREV: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Render a Slack `ts`'s seconds as a UTC clock time, relative to `now`: the same UTC calendar
+/// day as `now` renders unchanged as `HH:MM`; any earlier UTC calendar day renders dated, as
+/// `Mon DD HH:MM` (e.g. `Jul 12 06:00`), so a message from a prior day is never confused with
+/// one from today. `now` is injected (rather than read via `SystemTime::now()` internally) so
+/// callers can pin it in tests, including UTC-midnight-boundary cases. A malformed `ts` parses
+/// via `ts_key`'s `(0, 0)` fallback (1970-01-01T00:00:00Z) rather than panicking.
+fn format_ts(ts: &str, now: SystemTime) -> String {
     let (secs, _) = ts_key(ts);
+    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let day_secs = secs % 86_400;
-    format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
+    let hhmm = format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60);
+    let msg_date = civil_from_days(i64::try_from(secs / 86_400).unwrap_or(0));
+    let now_date = civil_from_days(i64::try_from(now_secs / 86_400).unwrap_or(0));
+    if msg_date == now_date {
+        hhmm
+    } else {
+        let (_, month, day) = msg_date;
+        format!("{} {day:02} {hhmm}", MONTH_ABBREV[(month - 1) as usize])
+    }
+}
+
+/// Days-since-1970-01-01 to a proleptic Gregorian `(year, month, day)`, Howard Hinnant's
+/// widely-used `civil_from_days` algorithm — mirrors the epoch-seconds↔civil-date math used
+/// elsewhere in this project's family (e.g. herdr-reviewr's `comments::civil_from_days` /
+/// `forge::bitbucket::epoch_ms_to_iso`), so there is exactly one such algorithm to trust.
+// The civil-from-days algorithm reads naturally with the conventional short field names.
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365; // [0, 399]
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let mp = (5 * day_of_year + 2) / 153; // [0, 11]
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 /// Fold one conversation's backfill result into `app`, or produce an error naming which
@@ -1891,15 +1929,15 @@ mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, RowKind, SelKind, Tab,
         apply_backfill, backfill_retry_decision, capped_sleep_secs, cooldown_active, dm_scan_due,
-        expand_status, marker_count, next_batch, pick_changed_dm, poll_error_status,
-        resolve_im_names, thread_slot_count, track_newest, ts_to_hhmm, updated_ms_to_ts,
+        expand_status, format_ts, marker_count, next_batch, pick_changed_dm, poll_error_status,
+        resolve_im_names, thread_slot_count, track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
     use crate::socket::SocketEvent;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
         Conversation { id: id.into(), name: name.into(), kind, updated: None }
@@ -2651,17 +2689,53 @@ mod tests {
         assert_eq!(resolved[0].name, "U9");
     }
 
-    // ---- ts_to_hhmm ----------------------------------------------------------------------------
+    // ---- format_ts ------------------------------------------------------------------------------
 
     #[test]
-    fn ts_to_hhmm_formats_epoch_seconds_as_utc_clock_time() {
-        // 1_752_300_000 seconds since epoch: 2025-07-12T06:00:00Z.
-        assert_eq!(ts_to_hhmm("1752300000.000100"), "06:00");
+    fn format_ts_same_utc_day_as_now_renders_hh_mm_unchanged() {
+        // msg: 2025-07-12T06:00:00Z, now: 2025-07-12T12:00:00Z (same UTC calendar day).
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_321_600);
+        assert_eq!(format_ts("1752300000.000100", now), "06:00");
     }
 
     #[test]
-    fn ts_to_hhmm_malformed_input_renders_midnight_rather_than_panicking() {
-        assert_eq!(ts_to_hhmm("garbage"), "00:00");
+    fn format_ts_malformed_input_renders_midnight_rather_than_panicking() {
+        // ts_key's (0, 0) fallback is 1970-01-01T00:00:00Z; `now` pinned to the same day.
+        assert_eq!(format_ts("garbage", UNIX_EPOCH), "00:00");
+    }
+
+    #[test]
+    fn format_ts_earlier_utc_day_renders_month_day_and_time() {
+        // msg: 2025-07-12T06:00:00Z, now: 2025-07-13T10:00:00Z (a later UTC calendar day).
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_400_800);
+        assert_eq!(format_ts("1752300000.000100", now), "Jul 12 06:00");
+    }
+
+    #[test]
+    fn format_ts_utc_midnight_boundary_crossed_shows_the_date() {
+        // msg: 2025-07-12T23:59:00Z ("yesterday" UTC), now: 2025-07-13T00:01:00Z ("today"
+        // UTC) — only two minutes apart in wall-clock terms, but different UTC calendar days.
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_364_860);
+        assert_eq!(format_ts("1752364740.000100", now), "Jul 12 23:59");
+    }
+
+    #[test]
+    fn format_ts_utc_midnight_boundary_not_crossed_omits_the_date() {
+        // msg: 2025-07-13T00:01:00Z, now: 2025-07-13T23:59:00Z — the message is earlier the
+        // *same* UTC calendar day, so no date prefix even though the gap is nearly 24h.
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_451_140);
+        assert_eq!(format_ts("1752364860.000100", now), "00:01");
+    }
+
+    #[test]
+    fn format_ts_month_name_correctness_across_two_different_months() {
+        // msg: 2025-01-15T08:00:00Z, now: 2025-01-16T09:00:00Z.
+        let jan_now = UNIX_EPOCH + Duration::from_secs(1_737_018_000);
+        assert_eq!(format_ts("1736928000.000100", jan_now), "Jan 15 08:00");
+
+        // msg: 2025-12-25T09:30:00Z, now: 2025-12-26T01:00:00Z.
+        let dec_now = UNIX_EPOCH + Duration::from_secs(1_766_710_800);
+        assert_eq!(format_ts("1766655000.000100", dec_now), "Dec 25 09:30");
     }
 
     // ---- conv_label -----------------------------------------------------------------------------
