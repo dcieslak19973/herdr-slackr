@@ -183,7 +183,8 @@ background.
 | `1` `2`       | Switch tab — Feed / Mentions                                     |
 | `Tab`         | Switch tab (Feed ↔ Mentions)                                      |
 | `j` `k` · `↑` `↓` | Move the cursor                                              |
-| `Enter`       | Feed: expand/collapse the selected thread. Mentions: toggle read  |
+| `Enter`       | Feed timeline: expand/collapse the selected thread. Feed threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
+| `t`           | Feed tab only: toggle the Feed between the Timeline and the Threads-only view |
 | `o`           | Open the selected message's permalink in the browser             |
 | `r`           | Manual refresh (re-pull the last 50 messages of every conversation) |
 | `q`           | Quit the pane                                                     |
