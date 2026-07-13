@@ -10,8 +10,16 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-const PLUGIN_CONFIG_KEYS: [&str; 6] =
-    ["channels", "dms", "keywords", "theme", "poll_fallback_secs", "dm_limit"];
+const PLUGIN_CONFIG_KEYS: [&str; 8] = [
+    "channels",
+    "dms",
+    "keywords",
+    "theme",
+    "poll_fallback_secs",
+    "dm_limit",
+    "dm_allow",
+    "focus_keywords",
+];
 
 /// The default theme name when `config.toml` omits `theme`.
 pub const DEFAULT_THEME: &str = "catppuccin";
@@ -37,6 +45,8 @@ pub struct PluginConfig {
     theme: String,
     poll_fallback_secs: u64,
     dm_limit: u32,
+    dm_allow: Vec<String>,
+    focus_keywords: Vec<String>,
 }
 
 impl PluginConfig {
@@ -72,6 +82,23 @@ impl PluginConfig {
     /// 20; valid range is `0..=200`, where `0` means no DMs even when `dms = true`.
     pub fn dm_limit(&self) -> u32 {
         self.dm_limit
+    }
+
+    /// DM/MPIM counterpart names (Slack usernames or display names) that are always
+    /// subscribed regardless of `dm_limit`, matched exactly and case-insensitively against
+    /// the conversation's resolved name (see `crate::model::resolve_channels`). Defaults to
+    /// empty. Any non-empty string is allowed — no format restriction beyond that, since
+    /// these are free-form Slack display names, not `#`-prefixed channel names.
+    pub fn dm_allow(&self) -> &[String] {
+        &self.dm_allow
+    }
+
+    /// Focus-mode triggers (spec §3), matched case-insensitively as a substring, same rule as
+    /// `keywords` — but a *distinct* key, kept deliberately separate: `keywords` says "notify
+    /// me" (Mentions tab), `focus_keywords` says "narrow my attention" (Focus view); conflating
+    /// them would mean turning one on always affects the other. Defaults to empty.
+    pub fn focus_keywords(&self) -> &[String] {
+        &self.focus_keywords
     }
 }
 
@@ -181,7 +208,39 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         dm_limit = limit;
     }
 
-    Ok(PluginConfig { channels, dms, keywords, theme, poll_fallback_secs, dm_limit })
+    let mut dm_allow: Vec<String> = Vec::new();
+    if let Some(value) = table.get("dm_allow") {
+        let expected = "an array of non-empty strings";
+        let values = value.as_array().ok_or_else(|| value_error(path, "dm_allow", expected))?;
+        dm_allow = values
+            .iter()
+            .map(|value| value.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| value_error(path, "dm_allow", expected))?;
+    }
+
+    let mut focus_keywords: Vec<String> = Vec::new();
+    if let Some(value) = table.get("focus_keywords") {
+        let expected = "an array of strings";
+        let values =
+            value.as_array().ok_or_else(|| value_error(path, "focus_keywords", expected))?;
+        focus_keywords = values
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| value_error(path, "focus_keywords", expected))?;
+    }
+
+    Ok(PluginConfig {
+        channels,
+        dms,
+        keywords,
+        theme,
+        poll_fallback_secs,
+        dm_limit,
+        dm_allow,
+        focus_keywords,
+    })
 }
 
 fn parse_channels(
@@ -250,6 +309,8 @@ mod tests {
         assert_eq!(config.theme(), "catppuccin");
         assert_eq!(config.poll_fallback_secs(), 30);
         assert_eq!(config.dm_limit(), 20);
+        assert!(config.dm_allow().is_empty());
+        assert!(config.focus_keywords().is_empty());
     }
 
     #[test]
@@ -264,6 +325,8 @@ mod tests {
                 "theme = \"tokyo-night\"\n",
                 "poll_fallback_secs = 45\n",
                 "dm_limit = 15\n",
+                "dm_allow = [\"alice\", \"Bob Smith\"]\n",
+                "focus_keywords = [\"incident\", \"p1\"]\n",
             ),
         );
         let config = super::plugin_config_in(dir.path()).unwrap();
@@ -273,6 +336,33 @@ mod tests {
         assert_eq!(config.theme(), "tokyo-night");
         assert_eq!(config.poll_fallback_secs(), 45);
         assert_eq!(config.dm_limit(), 15);
+        assert_eq!(config.dm_allow(), ["alice", "Bob Smith"]);
+        assert_eq!(config.focus_keywords(), ["incident", "p1"]);
+    }
+
+    #[test]
+    fn focus_keywords_defaults_empty_and_is_distinct_from_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "channels = [\"#a\"]\nkeywords = [\"deploy\"]\n");
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.keywords(), ["deploy"]);
+        assert!(config.focus_keywords().is_empty());
+        write(
+            dir.path(),
+            "channels = [\"#a\"]\nkeywords = [\"deploy\"]\nfocus_keywords = [\"incident\"]\n",
+        );
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.keywords(), ["deploy"]);
+        assert_eq!(config.focus_keywords(), ["incident"]);
+    }
+
+    #[test]
+    fn dm_allow_defaults_empty_and_accepts_any_non_empty_string() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "channels = [\"#a\"]\n");
+        assert!(super::plugin_config_in(dir.path()).unwrap().dm_allow().is_empty());
+        write(dir.path(), "channels = [\"#a\"]\ndm_allow = [\"weird name #1!\"]\n");
+        assert_eq!(super::plugin_config_in(dir.path()).unwrap().dm_allow(), ["weird name #1!"]);
     }
 
     #[test]
@@ -324,6 +414,11 @@ mod tests {
             ("channels = [\"#a\"]\ndm_limit = \"20\"\n", "dm_limit"),
             ("channels = [\"#a\"]\ndm_limit = -1\n", "dm_limit"),
             ("channels = [\"#a\"]\ndm_limit = 201\n", "dm_limit"),
+            ("channels = [\"#a\"]\ndm_allow = \"alice\"\n", "dm_allow"),
+            ("channels = [\"#a\"]\ndm_allow = [1]\n", "dm_allow"),
+            ("channels = [\"#a\"]\ndm_allow = [\"\"]\n", "dm_allow"),
+            ("channels = [\"#a\"]\nfocus_keywords = \"incident\"\n", "focus_keywords"),
+            ("channels = [\"#a\"]\nfocus_keywords = [1]\n", "focus_keywords"),
         ];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

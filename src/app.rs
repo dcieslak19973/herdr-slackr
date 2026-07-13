@@ -17,7 +17,7 @@
 //! logic below — is pure and unit-tested without touching the network (house pattern: see
 //! the REST and socket modules' thin-edge-over-pure-core split).
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::PluginConfig;
 use crate::entities::{self, is_mention};
@@ -34,13 +34,27 @@ pub enum Tab {
 }
 
 /// Which projection of the Feed tab's rows is shown (spec §3): the plain chronological
-/// `feed_rows` timeline, or the threads-only digest (`thread_rows`). Only meaningful on
-/// `Tab::Feed` — `toggle_view` no-ops on `Tab::Mentions`, and the Mentions tab's own row list
-/// ignores this field entirely.
+/// `feed_rows` timeline, the threads-only digest (`thread_rows`), or the live-only Focus filter
+/// (`focus_rows`). Only meaningful on `Tab::Feed` — `toggle_view`/`toggle_focus` no-op on
+/// `Tab::Mentions`, and the Mentions tab's own row list ignores this field entirely.
+///
+/// `Threads` and `Focus` are mutually exclusive Feed-tab view modes, each driven by its own key
+/// (`t` for Threads via `toggle_view`, `f` for Focus via `toggle_focus`) rather than one shared
+/// three-way cycle: every key press sets its *own* target view, using `Timeline` as the "off"
+/// state for whichever *other* mode happened to be active — so `t` from `Focus` lands on
+/// `Threads` (not back on `Timeline` first), and symmetrically for `f` from `Threads`. Decision
+/// table (`view` before the press, across the top the key pressed):
+///
+/// | before \ key | `t`        | `f`        |
+/// |--------------|------------|------------|
+/// | `Timeline`   | `Threads`  | `Focus`    |
+/// | `Threads`    | `Timeline` | `Focus`    |
+/// | `Focus`      | `Threads`  | `Timeline` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedView {
     Timeline,
     Threads,
+    Focus,
 }
 
 /// One renderable row, identical for both tabs so Task 7 has a single render path.
@@ -193,7 +207,60 @@ pub struct App {
     /// page-move issued before the first draw (or in a headless test) still moves rather than
     /// no-oping on `0`.
     viewport_rows: usize,
+    /// The unfiltered `conversations.list` snapshot — every channel/group/DM/MPIM the workspace
+    /// has, not just the `dm_limit`-capped `conversations` this `App` actually subscribes to.
+    /// Set once at `build` (before `resolve_channels` narrows it) and refreshed by every
+    /// `maybe_scan_out_of_cap_dms` scan, so [`pick_changed_dm`] always has a "what did we see
+    /// last time" baseline for conversations this `App` otherwise never looks at again (spec
+    /// §1: "previous messages stay capped, new ones always arrive" in polling mode too).
+    all_conversations: Vec<Conversation>,
+    /// The newest `updated` (Slack's millisecond-epoch conversation-activity stamp) this `App`
+    /// has actually issued a `history` call for, per out-of-cap DM/MPIM conversation id — the
+    /// watermark `maybe_scan_out_of_cap_dms` both selects against (via [`pick_changed_dm`]) and
+    /// threads into that call's `oldest` (via [`updated_ms_to_ts`]), so a DM already caught up
+    /// to isn't re-fetched from scratch on the next scan just because `all_conversations` also
+    /// changed for some other reason. Populated lazily — a DM with no entry here has never had
+    /// a scan-triggered `history` call, so its `oldest` is `None` (full-window fetch, matching
+    /// spec §1: "or None if first time").
+    dm_last_seen: HashMap<String, u64>,
+    /// The next `Instant` at or after which `maybe_scan_out_of_cap_dms`'s 5-minute out-of-cap DM
+    /// activity scan (spec §1) is due; `None` before the very first tick, which is always due.
+    /// `Instant`-based, injected via `poll_tick_at`'s `now` parameter, for the same testability
+    /// reason as `cooldown_until` (see its doc) — entirely independent of `cooldown_until`
+    /// itself, since a rate-limit cooldown must not also silently delay this lower-frequency
+    /// scan past its own schedule once the cooldown lifts.
+    next_dm_scan: Option<Instant>,
+    /// The `arrival_seq` value as of the moment `build`'s backfill finished (set right before
+    /// `build` returns — see its doc), used by `qualifies_for_focus` as the "arrived live during
+    /// this session" cutoff (spec §3). `arrival_seq` is post-incremented per newly-seen message
+    /// (see `upsert_new`), so every message backfilled at startup gets an `arrival` at most equal
+    /// to this value, never greater — which is why `qualifies_for_focus` compares with a strict
+    /// `>`, not `>=`: an equal `arrival` still names a backfilled message (the last one inserted
+    /// before this field was set), and the "no retroactive Focus over backfilled history"
+    /// constraint (spec non-goals) must hold even for it. Every message upserted afterward
+    /// (socket, poll, DM scan) necessarily gets an `arrival` strictly greater, since `arrival_seq`
+    /// only ever increases from here. `0` on `App::empty` (no backfill ever ran there), so the
+    /// very first message added to a fixture built via `empty` (`arrival` `1`) already qualifies
+    /// structurally, matching what a real session's first live arrival would do.
+    session_watermark: u64,
+    /// Focus-mode triggers (`PluginConfig::focus_keywords`), matched case-insensitively as a
+    /// substring via `entities::keyword_hit` — deliberately not reusing `keywords` (the Mentions
+    /// trigger list); see `PluginConfig::focus_keywords`'s doc for why the two must stay distinct.
+    focus_keywords: Vec<String>,
+    /// The subscribed conversation ids that are allow-listed DMs (`PluginConfig::dm_allow`),
+    /// computed once at `build` time from the resolved `Conversation` list (case-insensitive
+    /// exact match against each Im/Mpim's name, mirroring `resolve_channels`'s own `is_allowed`
+    /// rule) rather than re-deriving it per row: `resolve_channels`'s output no longer
+    /// distinguishes an allow-listed DM from a capped-in-by-recency one once they're merged into
+    /// one `Vec<Conversation>`, so `qualifies_for_focus` needs this side-table to tell them apart.
+    dm_allow_convs: HashSet<String>,
 }
+
+/// How often [`App::poll_tick_at`]'s out-of-cap DM activity scan (spec §1) may run: at most once
+/// per this interval, tracked via `next_dm_scan`, independent of the per-tick conversation/thread
+/// budget (`POLL_BATCH`) — a much lower frequency because it exists only to catch a DM/MPIM this
+/// `App` isn't otherwise polling at all, not to keep already-subscribed conversations fresh.
+const DM_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Ticks poll at most this many conversations, round-robin, per call — request count is what
 /// Slack's rate limits meter, so a tick over every subscribed conversation every time is what
@@ -216,8 +283,13 @@ impl App {
     pub fn build(config: PluginConfig, _tokens: &Tokens, rest: &Rest) -> Result<App, String> {
         let all_convs = crate::rest::list_conversations(rest)
             .map_err(|e| format!("list_conversations failed: {e:?}"))?;
-        let selected =
-            resolve_channels(config.channels(), config.dms(), config.dm_limit(), &all_convs)?;
+        let selected = resolve_channels(
+            config.channels(),
+            config.dms(),
+            config.dm_limit(),
+            config.dm_allow(),
+            &all_convs,
+        )?;
 
         let self_id =
             crate::rest::auth_self(rest).map_err(|e| format!("auth_self failed: {e:?}"))?;
@@ -236,6 +308,20 @@ impl App {
 
         let conv_names = selected.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
         let conv_kinds = selected.iter().map(|c| (c.id.clone(), c.kind)).collect();
+        // Mirrors `resolve_channels`'s own `is_allowed` rule (case-insensitive exact match, no
+        // substring matching) — see `dm_allow_convs`'s field doc for why this can't be recovered
+        // from `selected` alone once allow-listed and capped-by-recency DMs are merged together.
+        let dm_allow_convs: HashSet<String> = selected
+            .iter()
+            .filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim))
+            .filter(|c| {
+                config
+                    .dm_allow()
+                    .iter()
+                    .any(|allowed| allowed.to_lowercase() == c.name.to_lowercase())
+            })
+            .map(|c| c.id.clone())
+            .collect();
 
         let mut app = App {
             tab: Tab::Feed,
@@ -261,6 +347,12 @@ impl App {
             cooldown_until: None,
             pending_new: 0,
             viewport_rows: 20,
+            all_conversations: all_convs,
+            dm_last_seen: HashMap::new(),
+            next_dm_scan: None,
+            session_watermark: 0,
+            focus_keywords: config.focus_keywords().to_vec(),
+            dm_allow_convs,
         };
 
         for conv in app.conversations.clone() {
@@ -277,6 +369,11 @@ impl App {
         // Chat panes open scrolled to the bottom — the common at-the-bottom state new
         // arrivals should keep following (see `apply`'s follow-bottom logic below).
         app.snap_cursor_to_last_row();
+        // Set last: every message just backfilled already has an `arrival` at or below
+        // `arrival_seq` as it stands right now, so this is the watermark Focus qualification
+        // (spec §3) needs — anything upserted after this point (socket, poll, DM scan) gets an
+        // `arrival` strictly greater than it.
+        app.session_watermark = app.arrival_seq;
 
         Ok(app)
     }
@@ -310,6 +407,12 @@ impl App {
             cooldown_until: None,
             pending_new: 0,
             viewport_rows: 20,
+            all_conversations: Vec::new(),
+            dm_last_seen: HashMap::new(),
+            next_dm_scan: None,
+            session_watermark: 0,
+            focus_keywords: Vec::new(),
+            dm_allow_convs: HashSet::new(),
         }
     }
 
@@ -322,6 +425,20 @@ impl App {
     /// Register a user's display name, for fixture setup (see `empty`).
     pub fn add_user(&mut self, id: &str, name: &str) {
         self.user_names.insert(id.to_string(), name.to_string());
+    }
+
+    /// Mark `conv_id` as an allow-listed DM for Focus qualification (spec §3), for fixture setup
+    /// (see `empty`) — `build` derives this from `PluginConfig::dm_allow` itself, but a fixture
+    /// built via `empty` never runs that resolution, so it needs a direct way in.
+    pub fn allow_focus_dm(&mut self, conv_id: &str) {
+        self.dm_allow_convs.insert(conv_id.to_string());
+    }
+
+    /// Add a Focus-mode trigger keyword (spec §3, `PluginConfig::focus_keywords`), for fixture
+    /// setup (see `empty`) — see `allow_focus_dm`'s doc for why `empty`-built fixtures need a
+    /// direct setter rather than going through `build`'s config resolution.
+    pub fn add_focus_keyword(&mut self, keyword: &str) {
+        self.focus_keywords.push(keyword.to_string());
     }
 
     /// Apply one socket event: insert a new message, replace an edited one in place, remove
@@ -488,8 +605,10 @@ impl App {
     ///
     /// A `RestError::RateLimited` sets a rate-limit status, starts the cooldown, and stops the
     /// rest of this tick — including skipping the conversation batch entirely if the limit hit
-    /// during the thread slots (Slack's own signal to back off now, not to keep hammering
-    /// anything else this tick); any other error sets a one-line status naming what failed and
+    /// during the thread slots, and skipping the out-of-cap DM scan below if either the thread
+    /// or the conversation batch hit it (`run_or_skip_dm_scan`; Slack's own signal to back off
+    /// now, not to keep hammering anything else this tick); any other error sets a one-line
+    /// status naming what failed and
     /// moves on to the next item in its batch rather than crashing (spec: a per-conversation or
     /// per-thread poll failure must never take down the pane). See `poll_error_status` for the
     /// pure wording decision.
@@ -516,10 +635,89 @@ impl App {
         let conv_slots = POLL_BATCH - thread_slots;
 
         let rate_limited = self.poll_active_threads(rest, &active, thread_slots, now);
-        if !rate_limited {
-            self.poll_conversations(rest, conv_slots, now);
-        }
+        let rate_limited =
+            if rate_limited { true } else { self.poll_conversations(rest, conv_slots, now) };
+        self.run_or_skip_dm_scan(rest, now, rate_limited);
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
+    }
+
+    /// The tail of `poll_tick_at`: run the out-of-cap DM scan, unless the main conv/thread
+    /// budget above already hit `RateLimited` this tick — that hit stops the rest of the tick
+    /// (this fn's caller's doc), and the scan is part of "the rest of the tick" like everything
+    /// else after it, not an exception to it. Split out from the inline `if` so the gate itself
+    /// is unit-tested by injecting `rate_limited` directly, without needing a real 429 to drive
+    /// it end-to-end through `poll_active_threads`/`poll_conversations`.
+    fn run_or_skip_dm_scan(&mut self, rest: &Rest, now: Instant, rate_limited: bool) {
+        if !rate_limited {
+            self.maybe_scan_out_of_cap_dms(rest, now);
+        }
+    }
+
+    /// The out-of-cap DM activity scan (spec §1): additive to the `POLL_BATCH` conversation/
+    /// thread budget above when that budget didn't just rate limit — `poll_tick_at` only reaches
+    /// this (via `run_or_skip_dm_scan`) when `rate_limited` is false, since a `RateLimited` hit
+    /// in that budget stops the rest of the tick, this scan included (review fix: this scan used
+    /// to run unconditionally here, which contradicted `poll_tick_at`'s own "stops the rest of
+    /// this tick" contract). Runs at most once per [`DM_SCAN_INTERVAL`]
+    /// (`dm_scan_due`/`next_dm_scan`); a no-op tick (not yet due) costs nothing, not even a
+    /// `list_conversations` call.
+    ///
+    /// When due: re-fetches the full conversation list, hands it plus the previous snapshot
+    /// (`all_conversations`) to [`pick_changed_dm`] to find at most one out-of-cap DM/MPIM whose
+    /// activity moved, stores the fresh list as the new baseline for next time, and — if one was
+    /// picked — issues exactly one `history` call for it (`oldest` from `dm_last_seen`'s watermark,
+    /// converted via [`updated_ms_to_ts`], or `None` on a DM's first-ever scan fetch), folding the
+    /// result in through the normal `upsert_new` path so mention detection and Focus qualification
+    /// follow automatically, same as every other arrival. A `list_conversations` or `history`
+    /// failure here sets `status` (and, on `RateLimited`, `cooldown_until`) exactly like the
+    /// conversation/thread budget's own failures — this scan is a REST call like any other and
+    /// must surface, not swallow, an error — but never fails the tick itself.
+    fn maybe_scan_out_of_cap_dms(&mut self, rest: &Rest, now: Instant) {
+        if !dm_scan_due(now, self.next_dm_scan) {
+            return;
+        }
+        self.next_dm_scan = Some(now + DM_SCAN_INTERVAL);
+
+        let new_all = match crate::rest::list_conversations(rest) {
+            Ok(v) => v,
+            Err(err @ RestError::RateLimited(secs)) => {
+                self.status = poll_error_status("dm scan", &err);
+                self.cooldown_until = Some(now + Duration::from_secs(secs));
+                return;
+            }
+            Err(err) => {
+                self.status = poll_error_status("dm scan", &err);
+                return;
+            }
+        };
+
+        let subscribed: HashSet<String> = self.conversations.iter().map(|c| c.id.clone()).collect();
+        let picked =
+            pick_changed_dm(&self.all_conversations, &new_all, &subscribed, &self.dm_last_seen);
+        self.all_conversations = new_all;
+
+        let Some(conv) = picked else {
+            return;
+        };
+        let Some(updated) = conv.updated else {
+            return;
+        };
+        let oldest = self.dm_last_seen.get(&conv.id).copied().map(updated_ms_to_ts);
+        match crate::rest::history(rest, &conv.id, 50, oldest.as_deref()) {
+            Ok(msgs) => {
+                for msg in msgs {
+                    self.upsert_new(msg);
+                }
+                self.dm_last_seen.insert(conv.id, updated);
+            }
+            Err(err @ RestError::RateLimited(secs)) => {
+                self.status = poll_error_status(&conv.name, &err);
+                self.cooldown_until = Some(now + Duration::from_secs(secs));
+            }
+            Err(err) => {
+                self.status = poll_error_status(&conv.name, &err);
+            }
+        }
     }
 
     /// The active-thread half of `poll_tick_at`'s split budget: round-robin `thread_slots` of
@@ -561,8 +759,10 @@ impl App {
 
     /// The conversation half of `poll_tick_at`'s split budget: unchanged from before the split
     /// except that its slot count is now `conv_slots` (`POLL_BATCH` minus whatever the thread
-    /// round-robin took) rather than the full `POLL_BATCH`.
-    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) {
+    /// round-robin took) rather than the full `POLL_BATCH`. Returns whether a `RateLimited` hit
+    /// occurred, mirroring `poll_active_threads`'s own return — `poll_tick_at` combines both to
+    /// decide whether anything after this budget (the DM scan) still runs this tick.
+    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) -> bool {
         let n = self.conversations.len();
         let (indices, next_cursor) = next_batch(self.poll_cursor, n, conv_slots);
         self.poll_cursor = next_cursor;
@@ -580,13 +780,14 @@ impl App {
                 Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&conv_name, &err);
                     self.cooldown_until = Some(now + Duration::from_secs(secs));
-                    break;
+                    return true;
                 }
                 Err(err) => {
                     self.status = poll_error_status(&conv_name, &err);
                 }
             }
         }
+        false
     }
 
     /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
@@ -694,6 +895,7 @@ impl App {
         match self.view {
             FeedView::Timeline => self.feed_rows_with_ids(),
             FeedView::Threads => self.thread_rows_with_ids(),
+            FeedView::Focus => self.focus_rows_with_ids(),
         }
     }
 
@@ -962,7 +1164,7 @@ impl App {
                 None => Row {
                     conv_label: self.conv_label(&thread.conv),
                     author: String::new(),
-                    time_hhmm: ts_to_hhmm(&thread.root_ts),
+                    time_hhmm: format_ts(&thread.root_ts, SystemTime::now()),
                     text: "(thread — root not loaded)".to_string(),
                     kind: RowKind::Message,
                 },
@@ -999,6 +1201,43 @@ impl App {
                 (id, row)
             })
             .collect()
+    }
+
+    /// The Focus view (spec §3): reuses the Timeline's plain row rendering (`message_row`, no
+    /// `ThreadMarker`/`Divider` synthesis), filtered to only messages that qualify for Focus (see
+    /// `qualifies_for_focus`), oldest first / newest at the bottom, same as every other view's
+    /// convention. Nothing is deleted from the model to produce this — toggling back to Timeline
+    /// still shows everything, qualifying or not.
+    pub fn focus_rows(&self) -> Vec<Row> {
+        self.focus_rows_with_ids().into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// As `focus_rows`, but each row is paired with the `(conv, ts)` a Feed-tab action (expand,
+    /// permalink) should act on — see `active_feed_rows_with_ids`'s Focus arm.
+    fn focus_rows_with_ids(&self) -> Vec<IdRow> {
+        let mut items: Vec<&Stored> =
+            self.messages.values().filter(|s| self.qualifies_for_focus(s)).collect();
+        items.sort_by(|a, b| ts_cmp(&a.msg.ts, &b.msg.ts)); // oldest first, newest at the bottom
+        items
+            .into_iter()
+            .map(|s| {
+                let id = (s.msg.conv.clone(), s.msg.ts.clone());
+                (Some(id), self.message_row(&s.msg))
+            })
+            .collect()
+    }
+
+    /// Whether `s` qualifies for the Focus view (spec §3): it must have arrived live during this
+    /// session — `s.arrival` strictly past `session_watermark` (see that field's doc for why the
+    /// comparison is strict, not `>=`) — *and* either its conversation is an allow-listed DM
+    /// (`dm_allow_convs`) or its text hits a `focus_keywords` entry (`entities::keyword_hit`, same
+    /// case-insensitive substring rule the Mentions `keywords` check uses, applied to the distinct
+    /// `focus_keywords` list). The two qualifiers are OR'd, matching the spec's "allow-list OR
+    /// keyword" framing — either alone is enough once the watermark gate passes.
+    fn qualifies_for_focus(&self, s: &Stored) -> bool {
+        s.arrival > self.session_watermark
+            && (self.dm_allow_convs.contains(&s.msg.conv)
+                || entities::keyword_hit(&s.msg.text, &self.focus_keywords))
     }
 
     /// Count of mentions not yet marked read.
@@ -1041,22 +1280,40 @@ impl App {
             return;
         }
         self.view = match self.view {
-            FeedView::Timeline => FeedView::Threads,
+            FeedView::Timeline | FeedView::Focus => FeedView::Threads,
             FeedView::Threads => FeedView::Timeline,
         };
         self.selected = None;
         self.resync_cursor();
     }
 
-    /// `Enter` semantics per tab (and, on the Feed tab, per view): the Timeline expands/collapses
-    /// the selected thread (fetching replies via REST on first expand); the Threads view instead
-    /// always (re)fetches the selected thread's replies (see `refresh_thread`'s doc for why a
+    /// Flip the Feed tab into/out of the Focus projection (spec §3, the `f` key) — the Focus
+    /// counterpart to `toggle_view`, same Feed-tab gating and selection-resync, but targeting
+    /// `Focus` instead of `Threads`; see [`FeedView`]'s doc for the full `t`/`f` decision table
+    /// governing how the two toggles interact.
+    pub fn toggle_focus(&mut self) {
+        if self.tab != Tab::Feed {
+            return;
+        }
+        self.view = match self.view {
+            FeedView::Timeline | FeedView::Threads => FeedView::Focus,
+            FeedView::Focus => FeedView::Timeline,
+        };
+        self.selected = None;
+        self.resync_cursor();
+    }
+
+    /// `Enter` semantics per tab (and, on the Feed tab, per view): the Timeline and Focus views
+    /// both expand/collapse the selected thread exactly the same way (fetching replies via REST
+    /// on first expand — Focus reuses the Timeline's plain row rendering, so the same rows and
+    /// `expand_target_root` resolution apply unchanged); the Threads view instead always
+    /// (re)fetches the selected thread's replies (see `refresh_thread`'s doc for why a
     /// collapse-toggle semantics doesn't apply there); the Mentions tab toggles the selected row's
     /// read state.
     pub fn toggle_expand_or_read(&mut self, rest: &Rest) {
         match self.tab {
             Tab::Feed => match self.view {
-                FeedView::Timeline => self.toggle_expand(rest),
+                FeedView::Timeline | FeedView::Focus => self.toggle_expand(rest),
                 FeedView::Threads => self.refresh_thread(rest),
             },
             Tab::Mentions => self.toggle_read(),
@@ -1310,7 +1567,7 @@ impl App {
         Row {
             conv_label: self.conv_label(&msg.conv),
             author,
-            time_hhmm: ts_to_hhmm(&msg.ts),
+            time_hhmm: format_ts(&msg.ts, SystemTime::now()),
             text,
             kind: RowKind::Message,
         }
@@ -1348,13 +1605,51 @@ impl App {
     }
 }
 
-/// Render a Slack `ts`'s seconds as a `HH:MM` UTC clock time (no timezone crate in the closed
-/// dependency list, so this is plain epoch-seconds arithmetic). A malformed `ts` parses via
-/// `ts_key`'s `(0, 0)` fallback and renders as `00:00` rather than panicking.
-fn ts_to_hhmm(ts: &str) -> String {
+/// Three-letter month abbreviations, indexed `[month - 1]`, for [`format_ts`]'s prior-day
+/// rendering — no date/time crate in the closed dependency list, so this is a plain const table.
+const MONTH_ABBREV: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Render a Slack `ts`'s seconds as a UTC clock time, relative to `now`: the same UTC calendar
+/// day as `now` renders unchanged as `HH:MM`; any earlier UTC calendar day renders dated, as
+/// `Mon DD HH:MM` (e.g. `Jul 12 06:00`), so a message from a prior day is never confused with
+/// one from today. `now` is injected (rather than read via `SystemTime::now()` internally) so
+/// callers can pin it in tests, including UTC-midnight-boundary cases. A malformed `ts` parses
+/// via `ts_key`'s `(0, 0)` fallback (1970-01-01T00:00:00Z) rather than panicking.
+fn format_ts(ts: &str, now: SystemTime) -> String {
     let (secs, _) = ts_key(ts);
+    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let day_secs = secs % 86_400;
-    format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
+    let hhmm = format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60);
+    let msg_date = civil_from_days(i64::try_from(secs / 86_400).unwrap_or(0));
+    let now_date = civil_from_days(i64::try_from(now_secs / 86_400).unwrap_or(0));
+    if msg_date == now_date {
+        hhmm
+    } else {
+        let (_, month, day) = msg_date;
+        format!("{} {day:02} {hhmm}", MONTH_ABBREV[(month - 1) as usize])
+    }
+}
+
+/// Days-since-1970-01-01 to a proleptic Gregorian `(year, month, day)`, Howard Hinnant's
+/// widely-used `civil_from_days` algorithm — mirrors the epoch-seconds↔civil-date math used
+/// elsewhere in this project's family (e.g. herdr-reviewr's `comments::civil_from_days` /
+/// `forge::bitbucket::epoch_ms_to_iso`), so there is exactly one such algorithm to trust.
+// The civil-from-days algorithm reads naturally with the conventional short field names.
+#[allow(clippy::many_single_char_names, clippy::similar_names)]
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365; // [0, 399]
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let mp = (5 * day_of_year + 2) / 153; // [0, 11]
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 /// Fold one conversation's backfill result into `app`, or produce an error naming which
@@ -1432,6 +1727,71 @@ fn track_newest(newest: &mut HashMap<String, String>, conv: &str, ts: &str) {
 /// needed (see `App::cooldown_until`'s doc).
 fn cooldown_active(now: Instant, deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| now < d)
+}
+
+/// Whether `maybe_scan_out_of_cap_dms`'s 5-minute out-of-cap DM activity scan (spec §1) is due at
+/// `now`: `next_scan` is `None` before the very first tick (always due — there is nothing to wait
+/// on yet) or `Some(deadline)` set by the prior due scan (`now + DM_SCAN_INTERVAL`), due once
+/// `now` reaches (or passes) it. Pure and `Instant`-based for the same reason as
+/// [`cooldown_active`] — no mock clock needed to test the gate.
+fn dm_scan_due(now: Instant, next_scan: Option<Instant>) -> bool {
+    next_scan.is_none_or(|deadline| now >= deadline)
+}
+
+/// The single out-of-cap DM/MPIM conversation whose `updated` moved furthest since it was last
+/// observed, if any did (spec §1's polling-mode out-of-cap DM activity detection). `old` is the
+/// App's previously-stored full `conversations.list` snapshot (`App::all_conversations`, from
+/// `build` or the prior scan); `new_all` is what this scan just re-fetched; `subscribed` is the
+/// set of conversation ids already in the capped/subscribed set (out of scope here entirely —
+/// those get fresh data from the normal `POLL_BATCH` round-robin instead); `last_seen` is the
+/// watermark of the newest `updated` a scan has actually issued a `history` call for, per
+/// out-of-cap DM id (`App::dm_last_seen`).
+///
+/// A conversation's baseline "last observed" value is `last_seen`'s entry for it if one exists
+/// (the DM has already been scan-fetched before, so that watermark is authoritative), else its
+/// `updated` in `old` (never scan-fetched, but already known at the last full-list snapshot), else
+/// `0` (never seen at all before this scan — e.g. a DM created since `build` — so any `updated`
+/// counts as new activity). Only `Im`/`Mpim` conversations not in `subscribed`, with a `Some`
+/// `updated` strictly greater than that baseline, are candidates; among them the one with the
+/// greatest `updated` wins (ties broken by id, for a deterministic pick — the exact winner among
+/// simultaneous ties doesn't matter functionally, since the loser simply waits for the next scan).
+/// `None` when nothing qualifies — the common case, and why this scan usually costs zero extra
+/// requests despite re-fetching the full list every 5 minutes.
+fn pick_changed_dm(
+    old: &[Conversation],
+    new_all: &[Conversation],
+    subscribed: &HashSet<String>,
+    last_seen: &HashMap<String, u64>,
+) -> Option<Conversation> {
+    new_all
+        .iter()
+        .filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim))
+        .filter(|c| !subscribed.contains(&c.id))
+        .filter_map(|c| {
+            let updated = c.updated?;
+            let baseline = last_seen
+                .get(&c.id)
+                .copied()
+                .or_else(|| old.iter().find(|o| o.id == c.id).and_then(|o| o.updated))
+                .unwrap_or(0);
+            (updated > baseline).then_some((c, updated))
+        })
+        .max_by(|(a, au), (b, bu)| au.cmp(bu).then_with(|| a.id.cmp(&b.id)))
+        .map(|(c, _)| c.clone())
+}
+
+/// Convert a `conversations.list` `updated` stamp (Slack's millisecond-epoch conversation-
+/// activity timestamp) to a Slack message `ts` string (`<seconds>.<6-digit microseconds>`), for
+/// threading into `maybe_scan_out_of_cap_dms`'s `history(..., oldest)` call — `history`'s `oldest`
+/// wants a `ts`-shaped string, not a raw millisecond count. The sub-second remainder becomes the
+/// microsecond field (millisecond precision padded with three zero digits); this is not a real
+/// Slack `ts` (no message actually has this exact stamp), but `history`'s `oldest` only needs a
+/// chronological cutoff, not a literal message identity, and `ts_cmp`/`ts_key` compare purely
+/// numerically, so a synthetic-but-correctly-ordered value works exactly the same as a real one.
+fn updated_ms_to_ts(updated_ms: u64) -> String {
+    let secs = updated_ms / 1000;
+    let micros = (updated_ms % 1000) * 1000;
+    format!("{secs}.{micros:06}")
 }
 
 /// The indices (into a `n`-long conversation list) `poll_tick` should visit this tick, round-
@@ -1567,17 +1927,17 @@ fn resolve_im_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BackfillOutcome, BackfillRetry, FeedView, RowKind, SelKind, Tab, apply_backfill,
-        backfill_retry_decision, capped_sleep_secs, cooldown_active, expand_status, marker_count,
-        next_batch, poll_error_status, resolve_im_names, thread_slot_count, track_newest,
-        ts_to_hhmm,
+        App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, RowKind, SelKind, Tab,
+        apply_backfill, backfill_retry_decision, capped_sleep_secs, cooldown_active, dm_scan_due,
+        expand_status, format_ts, marker_count, next_batch, pick_changed_dm, poll_error_status,
+        resolve_im_names, thread_slot_count, track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
     use crate::socket::SocketEvent;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
         Conversation { id: id.into(), name: name.into(), kind, updated: None }
@@ -1629,6 +1989,12 @@ mod tests {
             cooldown_until: None,
             pending_new: 0,
             viewport_rows: 20,
+            all_conversations: Vec::new(),
+            dm_last_seen: HashMap::new(),
+            next_dm_scan: None,
+            session_watermark: 0,
+            focus_keywords: Vec::new(),
+            dm_allow_convs: HashSet::new(),
         }
     }
 
@@ -2323,17 +2689,53 @@ mod tests {
         assert_eq!(resolved[0].name, "U9");
     }
 
-    // ---- ts_to_hhmm ----------------------------------------------------------------------------
+    // ---- format_ts ------------------------------------------------------------------------------
 
     #[test]
-    fn ts_to_hhmm_formats_epoch_seconds_as_utc_clock_time() {
-        // 1_752_300_000 seconds since epoch: 2025-07-12T06:00:00Z.
-        assert_eq!(ts_to_hhmm("1752300000.000100"), "06:00");
+    fn format_ts_same_utc_day_as_now_renders_hh_mm_unchanged() {
+        // msg: 2025-07-12T06:00:00Z, now: 2025-07-12T12:00:00Z (same UTC calendar day).
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_321_600);
+        assert_eq!(format_ts("1752300000.000100", now), "06:00");
     }
 
     #[test]
-    fn ts_to_hhmm_malformed_input_renders_midnight_rather_than_panicking() {
-        assert_eq!(ts_to_hhmm("garbage"), "00:00");
+    fn format_ts_malformed_input_renders_midnight_rather_than_panicking() {
+        // ts_key's (0, 0) fallback is 1970-01-01T00:00:00Z; `now` pinned to the same day.
+        assert_eq!(format_ts("garbage", UNIX_EPOCH), "00:00");
+    }
+
+    #[test]
+    fn format_ts_earlier_utc_day_renders_month_day_and_time() {
+        // msg: 2025-07-12T06:00:00Z, now: 2025-07-13T10:00:00Z (a later UTC calendar day).
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_400_800);
+        assert_eq!(format_ts("1752300000.000100", now), "Jul 12 06:00");
+    }
+
+    #[test]
+    fn format_ts_utc_midnight_boundary_crossed_shows_the_date() {
+        // msg: 2025-07-12T23:59:00Z ("yesterday" UTC), now: 2025-07-13T00:01:00Z ("today"
+        // UTC) — only two minutes apart in wall-clock terms, but different UTC calendar days.
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_364_860);
+        assert_eq!(format_ts("1752364740.000100", now), "Jul 12 23:59");
+    }
+
+    #[test]
+    fn format_ts_utc_midnight_boundary_not_crossed_omits_the_date() {
+        // msg: 2025-07-13T00:01:00Z, now: 2025-07-13T23:59:00Z — the message is earlier the
+        // *same* UTC calendar day, so no date prefix even though the gap is nearly 24h.
+        let now = UNIX_EPOCH + Duration::from_secs(1_752_451_140);
+        assert_eq!(format_ts("1752364860.000100", now), "00:01");
+    }
+
+    #[test]
+    fn format_ts_month_name_correctness_across_two_different_months() {
+        // msg: 2025-01-15T08:00:00Z, now: 2025-01-16T09:00:00Z.
+        let jan_now = UNIX_EPOCH + Duration::from_secs(1_737_018_000);
+        assert_eq!(format_ts("1736928000.000100", jan_now), "Jan 15 08:00");
+
+        // msg: 2025-12-25T09:30:00Z, now: 2025-12-26T01:00:00Z.
+        let dec_now = UNIX_EPOCH + Duration::from_secs(1_766_710_800);
+        assert_eq!(format_ts("1766655000.000100", dec_now), "Dec 25 09:30");
     }
 
     // ---- conv_label -----------------------------------------------------------------------------
@@ -2482,6 +2884,213 @@ mod tests {
         app.poll_tick_at(&rest, now + Duration::from_secs(1));
 
         assert_eq!(app.poll_cursor, 0, "both conversations were visited and the cursor wrapped");
+    }
+
+    // ---- dm_scan_due: pure 5-minute gate for the out-of-cap DM scan (Task 2, spec §1) ---------
+
+    #[test]
+    fn dm_scan_due_with_no_prior_scan_is_always_due() {
+        assert!(dm_scan_due(Instant::now(), None));
+    }
+
+    #[test]
+    fn dm_scan_due_true_at_and_after_the_deadline_false_before() {
+        let now = Instant::now();
+        let deadline = now + DM_SCAN_INTERVAL;
+        assert!(!dm_scan_due(now, Some(deadline)));
+        assert!(!dm_scan_due(now + (DM_SCAN_INTERVAL - Duration::from_secs(1)), Some(deadline)));
+        assert!(dm_scan_due(deadline, Some(deadline)));
+        assert!(dm_scan_due(deadline + Duration::from_secs(1), Some(deadline)));
+    }
+
+    // ---- pick_changed_dm: pure diff-and-pick-one over two conversation snapshots (Task 2,
+    // spec §1) -----------------------------------------------------------------------------
+
+    fn dm(id: &str, name: &str, updated: u64) -> Conversation {
+        Conversation {
+            id: id.into(),
+            name: name.into(),
+            kind: ConvKind::Im,
+            updated: Some(updated),
+        }
+    }
+
+    #[test]
+    fn pick_changed_dm_returns_none_when_nothing_changed() {
+        let old = vec![dm("D1", "alice", 100)];
+        let new_all = vec![dm("D1", "alice", 100)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    #[test]
+    fn pick_changed_dm_picks_the_single_most_recently_updated_among_several_changed() {
+        let old = vec![dm("D1", "alice", 100), dm("D2", "bob", 100), dm("D3", "carol", 100)];
+        let new_all = vec![dm("D1", "alice", 150), dm("D2", "bob", 300), dm("D3", "carol", 200)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        let picked = pick_changed_dm(&old, &new_all, &subscribed, &last_seen);
+        assert_eq!(picked.map(|c| c.id), Some("D2".to_string()), "bob moved the furthest (300)");
+    }
+
+    #[test]
+    fn pick_changed_dm_ignores_conversations_already_in_the_subscribed_set() {
+        let old = vec![dm("D1", "alice", 100)];
+        let new_all = vec![dm("D1", "alice", 300)];
+        let subscribed = HashSet::from(["D1".to_string()]);
+        let last_seen = HashMap::new();
+        assert_eq!(
+            pick_changed_dm(&old, &new_all, &subscribed, &last_seen),
+            None,
+            "in-cap conversations are covered by the normal poll batch, not this scan"
+        );
+    }
+
+    #[test]
+    fn pick_changed_dm_ignores_channel_and_group_kinds() {
+        let old = vec![Conversation { updated: Some(100), ..dm("C1", "eng", 100) }];
+        let mut changed = dm("C1", "eng", 300);
+        changed.kind = ConvKind::Channel;
+        let new_all = vec![changed];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    #[test]
+    fn pick_changed_dm_picks_up_a_conversation_absent_from_the_old_snapshot() {
+        // Brand new since `build`/the last scan — never observed before, so any `updated` at
+        // all counts as "changed" (baseline defaults to 0).
+        let old: Vec<Conversation> = Vec::new();
+        let new_all = vec![dm("D1", "alice", 50)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(
+            pick_changed_dm(&old, &new_all, &subscribed, &last_seen).map(|c| c.id),
+            Some("D1".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_changed_dm_uses_last_seen_as_the_baseline_over_the_old_snapshot() {
+        // Already fetched up to 200 by a prior scan (tracked in `last_seen`), even though the
+        // stale `old` snapshot still shows 100 — a re-diff against `old` alone would wrongly
+        // treat 150 as an advance.
+        let old = vec![dm("D1", "alice", 100)];
+        let new_all = vec![dm("D1", "alice", 150)];
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::from([("D1".to_string(), 200)]);
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    #[test]
+    fn pick_changed_dm_skips_a_conversation_missing_updated() {
+        let old: Vec<Conversation> = Vec::new();
+        let new_all = vec![conv("D1", "alice", ConvKind::Im)]; // `updated: None`
+        let subscribed = HashSet::new();
+        let last_seen = HashMap::new();
+        assert_eq!(pick_changed_dm(&old, &new_all, &subscribed, &last_seen), None);
+    }
+
+    // ---- updated_ms_to_ts: pure ms-epoch -> Slack ts conversion (Task 2) -----------------------
+
+    #[test]
+    fn updated_ms_to_ts_formats_seconds_and_microseconds() {
+        assert_eq!(updated_ms_to_ts(1_752_300_000_123), "1752300000.123000");
+    }
+
+    #[test]
+    fn updated_ms_to_ts_zero_sub_second_remainder() {
+        assert_eq!(updated_ms_to_ts(1_752_300_000_000), "1752300000.000000");
+    }
+
+    // ---- poll_tick_at: the out-of-cap DM scan runs at most once per 5-minute interval (Task 2,
+    // spec §1) -------------------------------------------------------------------------------
+
+    #[test]
+    fn poll_tick_sets_the_next_dm_scan_deadline_on_the_first_tick() {
+        let mut app = empty_app();
+        assert_eq!(app.next_dm_scan, None);
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+
+        app.poll_tick_at(&rest, now);
+
+        assert_eq!(app.next_dm_scan, Some(now + DM_SCAN_INTERVAL));
+    }
+
+    #[test]
+    fn poll_tick_does_not_rerun_the_dm_scan_before_the_next_interval() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+        app.poll_tick_at(&rest, now);
+        let deadline = app.next_dm_scan;
+
+        app.poll_tick_at(&rest, now + Duration::from_secs(1));
+
+        assert_eq!(deadline, app.next_dm_scan, "deadline unchanged — scan is not due yet");
+    }
+
+    #[test]
+    fn poll_tick_reruns_the_dm_scan_once_the_interval_has_elapsed() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+        app.poll_tick_at(&rest, now);
+        let first_deadline = app.next_dm_scan.unwrap();
+
+        app.poll_tick_at(&rest, first_deadline);
+
+        assert_eq!(
+            app.next_dm_scan,
+            Some(first_deadline + DM_SCAN_INTERVAL),
+            "a due scan pushes the deadline another full interval out"
+        );
+    }
+
+    // ---- poll_tick_at: a RateLimited main budget stops the whole tick, including the DM scan
+    // (review fix: `poll_tick_at`'s own doc promises a `RateLimited` hit "stops the rest of this
+    // tick"; the DM scan must honor that too, not run unconditionally) ------------------------
+
+    #[test]
+    fn dm_scan_is_skipped_entirely_when_the_main_budget_rate_limited_this_tick() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+
+        // `rate_limited: true` stands in for the main conv/thread budget having just hit
+        // `RateLimited` this same tick (untestable end-to-end without a real 429, so it's
+        // injected directly here, exactly as `poll_tick_at` computes and passes it).
+        app.run_or_skip_dm_scan(&rest, now, true);
+
+        assert_eq!(
+            app.next_dm_scan, None,
+            "a rate-limited tick must not even check whether the scan is due, let alone run it"
+        );
+        assert!(app.status.is_empty(), "no REST call happened, so no dm-scan status either");
+        assert!(app.all_conversations.is_empty(), "list_conversations was never called");
+    }
+
+    #[test]
+    fn dm_scan_still_runs_on_a_normal_non_rate_limited_tick_when_due() {
+        let mut app = empty_app();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        let now = Instant::now();
+
+        app.run_or_skip_dm_scan(&rest, now, false);
+
+        assert_eq!(
+            app.next_dm_scan,
+            Some(now + DM_SCAN_INTERVAL),
+            "not rate-limited: the scan ran exactly as before and advanced its deadline"
+        );
     }
 
     // ---- track_newest: keep-the-max newest-ts tracking (Task 2) -------------------------------
@@ -3034,6 +3643,160 @@ mod tests {
         assert_eq!(app.view, FeedView::Threads);
         assert_eq!(app.cursor, 0, "the 1-row threads projection clamps the stale cursor");
         assert_eq!(app.thread_rows()[app.cursor].text, "a thread root");
+    }
+
+    // ---- toggle_focus / mutual exclusion with Threads (Task 3, spec §3) ------------------------
+
+    #[test]
+    fn toggle_focus_flips_between_timeline_and_focus_on_the_feed_tab() {
+        let mut app = empty_app();
+        assert_eq!(app.view, FeedView::Timeline);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Timeline);
+    }
+
+    #[test]
+    fn toggle_focus_is_a_no_op_off_the_feed_tab() {
+        let mut app = empty_app();
+        app.tab = Tab::Mentions;
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Timeline, "the toggle key is Feed-only");
+    }
+
+    #[test]
+    fn t_from_focus_switches_to_threads_leaving_focus_per_the_decision_table() {
+        let mut app = empty_app();
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads, "t from Focus lands on Threads, not Timeline");
+    }
+
+    #[test]
+    fn f_from_threads_switches_to_focus_leaving_threads_per_the_decision_table() {
+        let mut app = empty_app();
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus, "f from Threads lands on Focus, not Timeline");
+    }
+
+    #[test]
+    fn t_from_threads_and_f_from_focus_both_return_to_timeline() {
+        let mut app = empty_app();
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Timeline);
+
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Timeline);
+    }
+
+    #[test]
+    fn toggle_focus_resyncs_the_cursor_into_the_new_projections_bounds() {
+        let mut app = empty_app();
+        app.dm_allow_convs.insert("C1".to_string());
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "backfilled, excluded")));
+        app.session_watermark = app.arrival_seq; // simulate build()'s end-of-backfill cut
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "focused live message")));
+        app.touch();
+        app.move_cursor(1); // selects the live message in the 2-row timeline
+
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        assert_eq!(app.cursor, 0, "the 1-row focus projection clamps the stale cursor");
+        assert_eq!(app.focus_rows()[app.cursor].text, "focused live message");
+    }
+
+    // ---- focus_rows_with_ids: qualification, arrival-watermark AND (allow-list OR keyword) -----
+    // (Task 3, spec §3)
+
+    #[test]
+    fn focus_excludes_a_message_at_the_watermark_boundary_even_if_it_matches() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["urgent".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "urgent backfilled message")));
+        app.session_watermark = app.arrival_seq; // as if build() just finished backfill here
+        assert!(
+            app.focus_rows().is_empty(),
+            "a message whose arrival equals the watermark is the last backfilled one, not live"
+        );
+    }
+
+    #[test]
+    fn focus_includes_a_matching_message_strictly_past_the_watermark() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["urgent".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "backfilled, no match")));
+        app.session_watermark = app.arrival_seq;
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "urgent live message")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "urgent live message");
+    }
+
+    #[test]
+    fn focus_includes_an_allow_listed_dm_message_with_no_keyword_match() {
+        let mut app = empty_app();
+        app.add_conversation("D1", "alice", ConvKind::Im);
+        app.dm_allow_convs.insert("D1".to_string());
+        app.apply(SocketEvent::Message(msg("D1", "1.0", None, "U1", "just checking in")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "just checking in");
+    }
+
+    #[test]
+    fn focus_includes_a_keyword_match_in_a_non_allow_listed_conversation() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["incident".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "there is an incident")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "there is an incident");
+    }
+
+    #[test]
+    fn focus_excludes_a_live_message_matching_neither_allow_list_nor_keyword() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["incident".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "ordinary update")));
+        assert!(app.focus_rows().is_empty());
+    }
+
+    #[test]
+    fn focus_includes_a_message_matching_both_allow_list_and_keyword_exactly_once() {
+        let mut app = empty_app();
+        app.add_conversation("D1", "alice", ConvKind::Im);
+        app.dm_allow_convs.insert("D1".to_string());
+        app.focus_keywords = vec!["incident".to_string()];
+        app.apply(SocketEvent::Message(msg("D1", "1.0", None, "U1", "incident update")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1, "OR semantics: matching both must not duplicate the row");
+    }
+
+    #[test]
+    fn focus_rows_are_ascending_and_reuse_the_timeline_message_row_shape() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["x".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "x second")));
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "x first")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "x first");
+        assert_eq!(rows[1].text, "x second");
+        assert_eq!(rows[0].kind, RowKind::Message);
+    }
+
+    #[test]
+    fn focus_rows_is_empty_when_nothing_qualifies_yet() {
+        let app = empty_app();
+        assert!(app.focus_rows().is_empty());
     }
 
     // ---- refresh_thread: Enter in the Threads view (re)fetches replies (Task 2, spec §3) -------

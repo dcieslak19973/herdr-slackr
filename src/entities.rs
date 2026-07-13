@@ -91,7 +91,18 @@ pub fn is_mention(msg: &Message, kind: ConvKind, self_id: &str, keywords: &[Stri
     if msg.text.contains(&mention_token) {
         return true;
     }
-    let lower = msg.text.to_lowercase();
+    keyword_hit(&msg.text, keywords)
+}
+
+/// Case-insensitive substring keyword test shared by `is_mention`'s keyword branch and Focus
+/// mode's `focus_keywords` check (`crate::app::qualifies_for_focus`) — same matching rule,
+/// deliberately not word-bounded (see `is_mention`'s doc for why), applied to two distinct
+/// config keys (`keywords` for Mentions, `focus_keywords` for Focus) that must never be
+/// conflated even though the substring rule they use is identical. An empty keyword is skipped
+/// rather than matching every message.
+#[must_use]
+pub fn keyword_hit(text: &str, keywords: &[String]) -> bool {
+    let lower = text.to_lowercase();
     keywords.iter().any(|kw| !kw.is_empty() && lower.contains(&kw.to_lowercase()))
 }
 

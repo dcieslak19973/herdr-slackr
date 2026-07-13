@@ -72,6 +72,40 @@ same message store, tracked as `FeedView`:
 | T6  | Root and reply rows in this view share `SelKind::Message` identity with their Timeline counterparts (same `(conv, ts)`), so a selection made in one view still resolves in the other if the row exists there too. |
 | T7  | Switching views (`t`) resyncs cursor/selection into the new projection exactly like switching tabs (P8): the old selected identity is kept if it still names a row in the new view, otherwise cursor/selection are clamped/re-derived from scratch. |
 
+## Focus view
+
+`f` toggles the Feed tab (Feed only — a no-op on the Mentions tab) into and out of a third
+`FeedView`, **Focus** — a live-only filter over the same message store, narrower than either the
+Timeline or Threads.
+
+| view    | shows                                                                                          |
+| -------- | ------------------------------------------------------------------------------------------------|
+| Focus   | messages that arrived live during this session *and* qualify (allow-list or keyword — see below), oldest at the top / newest at the bottom, rendered with the Timeline's plain row shapes (no `ThreadMarker`/divider synthesis) |
+
+**Focus view behavior:**
+
+| #   | Always true                                                                                        |
+| --- | -----------------------------------------------------------------------------------------------------|
+| FC1 | A message qualifies for Focus only if it arrived *strictly after* `session_watermark` — the `arrival_seq` value as of the moment `App::build`'s startup backfill finished. Every backfilled message's arrival is at or below that watermark, so a strict (not `>=`) comparison excludes the whole backfill, including a message backfilled at the exact instant the watermark was captured; every message upserted afterward (socket, poll, out-of-cap DM scan) is strictly newer, so it is eligible. `session_watermark` is fixed once per pane session — restarting the pane re-backfills and resets it. |
+| FC2 | Given FC1 passes, a message additionally qualifies if its conversation is an allow-listed DM/MPIM (`dm_allow`, config.md C13) **or** its text hits a `focus_keywords` entry (case-insensitive substring, same rule as the Mentions `keywords` check, config.md C14) — the two conditions are OR'd; either alone is sufficient. |
+| FC3 | Focus never deletes or hides anything from the underlying store — toggling back to the Timeline still shows every message, qualifying or not, exactly as before Focus was entered. |
+| FC4 | `Enter` in the Focus view behaves exactly like the Timeline's expand/collapse toggle (T-view's own `Enter` is the one exception) — Focus reuses the Timeline's row rendering and `expand_target_root` resolution unchanged. |
+| FC5 | `t` and `f` are mutually exclusive Feed-tab view toggles, each driven by its own key rather than a single shared cycle: every key press sets its own target view, using `Timeline` as the "off" state for whichever other mode happened to be active. Decision table (row = view before the press, column = key pressed): |
+
+| before → key | `t`        | `f`        |
+| ------------- | ---------- | ---------- |
+| `Timeline`    | `Threads`  | `Focus`    |
+| `Threads`     | `Timeline` | `Focus`    |
+| `Focus`       | `Threads`  | `Timeline` |
+
+So `t` pressed while already in `Focus` lands on `Threads` (not back through `Timeline` first),
+and symmetrically `f` pressed while in `Threads` lands on `Focus` directly.
+
+| #   | Always true (continued)                                                                            |
+| --- | -----------------------------------------------------------------------------------------------------|
+| FC6 | Toggling into or out of Focus resyncs cursor/selection into the new projection exactly like `t` does for Threads (T7/P8): the old selected identity is kept if it still names a row in the new view, otherwise cursor/selection are clamped/re-derived from scratch. |
+| FC7 | An empty Focus view (no message has qualified yet this session) renders as a normal empty row list — no special placeholder text — same as any other view with zero rows. |
+
 ## Behavior
 
 | #  | Always true                                                                                                     |
@@ -90,6 +124,7 @@ same message store, tracked as `FeedView`:
 | P9 | Message text is plain text: Slack mrkdwn styling is not interpreted, but `<@U…>`, `<#C…\|name>`, `<url\|label>`, and HTML escapes are resolved to display form. |
 | P10 | A per-tab `pending_new` counter (`App::pending_new`) counts arrivals since the cursor last left the active tab's bottom row; an arrival landing while the cursor already sits at the bottom instead follows it there (like a chat client scrolled to "now") and never touches the counter. Reaching the bottom by any means — `j`/`↓`, `G`/`End`, a page move, or the follow-snap itself — clears it to `0`. The counter increments on any arrival anywhere in the message store while scrolled up on the active tab, not only one that would add a visible row to that tab (e.g. scrolled up on Mentions, a plain channel message that isn't a mention still counts, even though it never becomes a Mentions row) — global, not tab-scoped to what actually rendered. |
 | P11 | While `pending_new` is nonzero, a `↓ n new` overlay renders at the bottom-right of the body viewport, in the muted marker accent; hidden whenever `pending_new` is `0`. |
+| P12 | A row's `HH:MM` timestamp is relative to the current moment (`format_ts`): the same UTC calendar day renders unchanged as `HH:MM`; any earlier UTC calendar day renders dated, as `Mon DD HH:MM` (e.g. `Jul 12 06:00`), so a message from a prior day is never confused with one from today. A malformed `ts` renders as the Unix epoch (`00:00`, no date) rather than panicking. |
 
 **Keys:**
 
@@ -104,6 +139,7 @@ same message store, tracked as `FeedView`:
 | `Ctrl-d` / `Ctrl-u`   | move a half page (`±viewport_rows / 2`) — `App::page_move`        |
 | `Enter`               | Feed Timeline: expand/collapse the selected thread (root/marker/reply/activity row — P2). Feed Threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
 | `t`                   | Feed tab only: toggle between the Timeline and the Threads-only view (see below) |
+| `f`                   | Feed tab only: toggle into/out of the Focus view (see above) — mutually exclusive with `t`'s Threads toggle |
 | `o`                   | open the selected row's Slack permalink (`chat.getPermalink`) in the browser |
 | `r`                   | manual refresh: re-pull the last 50 messages of every subscribed conversation |
 | `q`                   | quit the pane                                                     |

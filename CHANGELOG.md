@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-07-13
+
+### Fixed
+- **`dm_limit` could leave a DM going silent in polling mode.** A message on a DM outside the
+  `dm_limit` cap always showed up over a live Socket Mode connection, but in polling-fallback mode
+  it had no path to the pane at all until that DM happened to rank back inside the cap. Polling
+  mode now runs a dedicated out-of-cap DM activity scan every 5 minutes: it re-checks every DM
+  outside the cap for new activity and fetches the single most-recently-active one that changed (at
+  most one extra request per tick, regardless of how many changed at once — the rest wait for the
+  next scan), so a new message in *any* DM reaches the pane in both delivery modes now, with a
+  bounded worst-case delay in polling mode instead of indefinite silence. This scan is skipped
+  outright during an active rate-limit cooldown, so it never adds pressure on top of a 429.
+
+### Added
+- **`dm_allow` config key.** Names DMs/MPIMs (Slack display names, matched exactly and
+  case-insensitively) that are always subscribed and actively polled, regardless of `dm_limit` —
+  for the handful of people you never want to fall out of the cap by inactivity. `dms = false`
+  still suppresses them, same as any other DM.
+- **Focus mode (`f`).** A third Feed-tab view, alongside Timeline and Threads: only messages that
+  arrived live during the current pane session (nothing from startup backfill) *and* either came
+  from an allow-listed DM (`dm_allow`) or hit a `focus_keywords` entry — a config key distinct from
+  the existing Mentions-tab `keywords`. `t` (Threads) and `f` (Focus) are mutually exclusive views,
+  each toggled by its own key rather than a shared cycle: pressing one while the other is active
+  switches straight to it instead of bouncing through the Timeline first.
+- **Dated timestamps.** A message from a UTC calendar day earlier than today now renders
+  `Mon DD HH:MM` (e.g. `Jul 12 06:00`) instead of a bare `HH:MM` that could be mistaken for today.
+
 ## [0.1.4] — 2026-07-12
 
 ### Changed
