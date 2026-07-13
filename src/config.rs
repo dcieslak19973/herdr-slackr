@@ -10,8 +10,16 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-const PLUGIN_CONFIG_KEYS: [&str; 7] =
-    ["channels", "dms", "keywords", "theme", "poll_fallback_secs", "dm_limit", "dm_allow"];
+const PLUGIN_CONFIG_KEYS: [&str; 8] = [
+    "channels",
+    "dms",
+    "keywords",
+    "theme",
+    "poll_fallback_secs",
+    "dm_limit",
+    "dm_allow",
+    "focus_keywords",
+];
 
 /// The default theme name when `config.toml` omits `theme`.
 pub const DEFAULT_THEME: &str = "catppuccin";
@@ -38,6 +46,7 @@ pub struct PluginConfig {
     poll_fallback_secs: u64,
     dm_limit: u32,
     dm_allow: Vec<String>,
+    focus_keywords: Vec<String>,
 }
 
 impl PluginConfig {
@@ -82,6 +91,14 @@ impl PluginConfig {
     /// these are free-form Slack display names, not `#`-prefixed channel names.
     pub fn dm_allow(&self) -> &[String] {
         &self.dm_allow
+    }
+
+    /// Focus-mode triggers (spec §3), matched case-insensitively as a substring, same rule as
+    /// `keywords` — but a *distinct* key, kept deliberately separate: `keywords` says "notify
+    /// me" (Mentions tab), `focus_keywords` says "narrow my attention" (Focus view); conflating
+    /// them would mean turning one on always affects the other. Defaults to empty.
+    pub fn focus_keywords(&self) -> &[String] {
+        &self.focus_keywords
     }
 }
 
@@ -202,7 +219,28 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             .ok_or_else(|| value_error(path, "dm_allow", expected))?;
     }
 
-    Ok(PluginConfig { channels, dms, keywords, theme, poll_fallback_secs, dm_limit, dm_allow })
+    let mut focus_keywords: Vec<String> = Vec::new();
+    if let Some(value) = table.get("focus_keywords") {
+        let expected = "an array of strings";
+        let values =
+            value.as_array().ok_or_else(|| value_error(path, "focus_keywords", expected))?;
+        focus_keywords = values
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| value_error(path, "focus_keywords", expected))?;
+    }
+
+    Ok(PluginConfig {
+        channels,
+        dms,
+        keywords,
+        theme,
+        poll_fallback_secs,
+        dm_limit,
+        dm_allow,
+        focus_keywords,
+    })
 }
 
 fn parse_channels(
@@ -272,6 +310,7 @@ mod tests {
         assert_eq!(config.poll_fallback_secs(), 30);
         assert_eq!(config.dm_limit(), 20);
         assert!(config.dm_allow().is_empty());
+        assert!(config.focus_keywords().is_empty());
     }
 
     #[test]
@@ -287,6 +326,7 @@ mod tests {
                 "poll_fallback_secs = 45\n",
                 "dm_limit = 15\n",
                 "dm_allow = [\"alice\", \"Bob Smith\"]\n",
+                "focus_keywords = [\"incident\", \"p1\"]\n",
             ),
         );
         let config = super::plugin_config_in(dir.path()).unwrap();
@@ -297,6 +337,23 @@ mod tests {
         assert_eq!(config.poll_fallback_secs(), 45);
         assert_eq!(config.dm_limit(), 15);
         assert_eq!(config.dm_allow(), ["alice", "Bob Smith"]);
+        assert_eq!(config.focus_keywords(), ["incident", "p1"]);
+    }
+
+    #[test]
+    fn focus_keywords_defaults_empty_and_is_distinct_from_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "channels = [\"#a\"]\nkeywords = [\"deploy\"]\n");
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.keywords(), ["deploy"]);
+        assert!(config.focus_keywords().is_empty());
+        write(
+            dir.path(),
+            "channels = [\"#a\"]\nkeywords = [\"deploy\"]\nfocus_keywords = [\"incident\"]\n",
+        );
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.keywords(), ["deploy"]);
+        assert_eq!(config.focus_keywords(), ["incident"]);
     }
 
     #[test]
@@ -360,6 +417,8 @@ mod tests {
             ("channels = [\"#a\"]\ndm_allow = \"alice\"\n", "dm_allow"),
             ("channels = [\"#a\"]\ndm_allow = [1]\n", "dm_allow"),
             ("channels = [\"#a\"]\ndm_allow = [\"\"]\n", "dm_allow"),
+            ("channels = [\"#a\"]\nfocus_keywords = \"incident\"\n", "focus_keywords"),
+            ("channels = [\"#a\"]\nfocus_keywords = [1]\n", "focus_keywords"),
         ];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

@@ -61,6 +61,7 @@ fn render_tab_bar(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let feed_label = match app.view {
         FeedView::Timeline => "1 Feed",
         FeedView::Threads => "1 Threads",
+        FeedView::Focus => "1 Focus",
     };
     let line = Line::from(vec![
         Span::raw(" "),
@@ -88,6 +89,7 @@ fn render_body(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
         Tab::Feed => match app.view {
             FeedView::Timeline => app.feed_rows(),
             FeedView::Threads => app.thread_rows(),
+            FeedView::Focus => app.focus_rows(),
         },
         Tab::Mentions => app.mention_rows(),
     };
@@ -190,8 +192,9 @@ fn cell_style(fg: Color, bg: Option<Color>) -> Style {
 }
 
 /// `app.status`, with a `polling` marker appended when in fallback mode and not already named
-/// in the status text, a `t: toggle view` key hint on the Feed tab (spec §3: "`t` appears in
-/// the footer"), a context-aware `enter expand/collapse thread` hint (spec §5) whenever
+/// in the status text, `t: toggle view` and `f: toggle focus` key hints on the Feed tab (spec
+/// §3: "`t` appears in the footer" — `f` rides alongside it, since Focus and Threads are both
+/// Feed-tab view-mode toggles), a context-aware `enter expand/collapse thread` hint (spec §5) whenever
 /// `App::selected_is_thread_related` says Enter would actually do something thread-related, and
 /// a `g/G: top/bottom` nav-key hint on every tab (spec §2 — jumping applies uniformly now that
 /// ordering is unified newest-at-bottom everywhere) — this pane has no separate footer row, so
@@ -210,6 +213,8 @@ fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
             text.push_str(" · ");
         }
         text.push_str("t: toggle view");
+        text.push_str(" · ");
+        text.push_str("f: toggle focus");
     }
     if app.selected_is_thread_related() {
         if !text.is_empty() {

@@ -34,13 +34,27 @@ pub enum Tab {
 }
 
 /// Which projection of the Feed tab's rows is shown (spec §3): the plain chronological
-/// `feed_rows` timeline, or the threads-only digest (`thread_rows`). Only meaningful on
-/// `Tab::Feed` — `toggle_view` no-ops on `Tab::Mentions`, and the Mentions tab's own row list
-/// ignores this field entirely.
+/// `feed_rows` timeline, the threads-only digest (`thread_rows`), or the live-only Focus filter
+/// (`focus_rows`). Only meaningful on `Tab::Feed` — `toggle_view`/`toggle_focus` no-op on
+/// `Tab::Mentions`, and the Mentions tab's own row list ignores this field entirely.
+///
+/// `Threads` and `Focus` are mutually exclusive Feed-tab view modes, each driven by its own key
+/// (`t` for Threads via `toggle_view`, `f` for Focus via `toggle_focus`) rather than one shared
+/// three-way cycle: every key press sets its *own* target view, using `Timeline` as the "off"
+/// state for whichever *other* mode happened to be active — so `t` from `Focus` lands on
+/// `Threads` (not back on `Timeline` first), and symmetrically for `f` from `Threads`. Decision
+/// table (`view` before the press, across the top the key pressed):
+///
+/// | before \ key | `t`        | `f`        |
+/// |--------------|------------|------------|
+/// | `Timeline`   | `Threads`  | `Focus`    |
+/// | `Threads`    | `Timeline` | `Focus`    |
+/// | `Focus`      | `Threads`  | `Timeline` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedView {
     Timeline,
     Threads,
+    Focus,
 }
 
 /// One renderable row, identical for both tabs so Task 7 has a single render path.
@@ -216,6 +230,30 @@ pub struct App {
     /// itself, since a rate-limit cooldown must not also silently delay this lower-frequency
     /// scan past its own schedule once the cooldown lifts.
     next_dm_scan: Option<Instant>,
+    /// The `arrival_seq` value as of the moment `build`'s backfill finished (set right before
+    /// `build` returns — see its doc), used by `qualifies_for_focus` as the "arrived live during
+    /// this session" cutoff (spec §3). `arrival_seq` is post-incremented per newly-seen message
+    /// (see `upsert_new`), so every message backfilled at startup gets an `arrival` at most equal
+    /// to this value, never greater — which is why `qualifies_for_focus` compares with a strict
+    /// `>`, not `>=`: an equal `arrival` still names a backfilled message (the last one inserted
+    /// before this field was set), and the "no retroactive Focus over backfilled history"
+    /// constraint (spec non-goals) must hold even for it. Every message upserted afterward
+    /// (socket, poll, DM scan) necessarily gets an `arrival` strictly greater, since `arrival_seq`
+    /// only ever increases from here. `0` on `App::empty` (no backfill ever ran there), so the
+    /// very first message added to a fixture built via `empty` (`arrival` `1`) already qualifies
+    /// structurally, matching what a real session's first live arrival would do.
+    session_watermark: u64,
+    /// Focus-mode triggers (`PluginConfig::focus_keywords`), matched case-insensitively as a
+    /// substring via `entities::keyword_hit` — deliberately not reusing `keywords` (the Mentions
+    /// trigger list); see `PluginConfig::focus_keywords`'s doc for why the two must stay distinct.
+    focus_keywords: Vec<String>,
+    /// The subscribed conversation ids that are allow-listed DMs (`PluginConfig::dm_allow`),
+    /// computed once at `build` time from the resolved `Conversation` list (case-insensitive
+    /// exact match against each Im/Mpim's name, mirroring `resolve_channels`'s own `is_allowed`
+    /// rule) rather than re-deriving it per row: `resolve_channels`'s output no longer
+    /// distinguishes an allow-listed DM from a capped-in-by-recency one once they're merged into
+    /// one `Vec<Conversation>`, so `qualifies_for_focus` needs this side-table to tell them apart.
+    dm_allow_convs: HashSet<String>,
 }
 
 /// How often [`App::poll_tick_at`]'s out-of-cap DM activity scan (spec §1) may run: at most once
@@ -270,6 +308,20 @@ impl App {
 
         let conv_names = selected.iter().map(|c| (c.id.clone(), c.name.clone())).collect();
         let conv_kinds = selected.iter().map(|c| (c.id.clone(), c.kind)).collect();
+        // Mirrors `resolve_channels`'s own `is_allowed` rule (case-insensitive exact match, no
+        // substring matching) — see `dm_allow_convs`'s field doc for why this can't be recovered
+        // from `selected` alone once allow-listed and capped-by-recency DMs are merged together.
+        let dm_allow_convs: HashSet<String> = selected
+            .iter()
+            .filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim))
+            .filter(|c| {
+                config
+                    .dm_allow()
+                    .iter()
+                    .any(|allowed| allowed.to_lowercase() == c.name.to_lowercase())
+            })
+            .map(|c| c.id.clone())
+            .collect();
 
         let mut app = App {
             tab: Tab::Feed,
@@ -298,6 +350,9 @@ impl App {
             all_conversations: all_convs,
             dm_last_seen: HashMap::new(),
             next_dm_scan: None,
+            session_watermark: 0,
+            focus_keywords: config.focus_keywords().to_vec(),
+            dm_allow_convs,
         };
 
         for conv in app.conversations.clone() {
@@ -314,6 +369,11 @@ impl App {
         // Chat panes open scrolled to the bottom — the common at-the-bottom state new
         // arrivals should keep following (see `apply`'s follow-bottom logic below).
         app.snap_cursor_to_last_row();
+        // Set last: every message just backfilled already has an `arrival` at or below
+        // `arrival_seq` as it stands right now, so this is the watermark Focus qualification
+        // (spec §3) needs — anything upserted after this point (socket, poll, DM scan) gets an
+        // `arrival` strictly greater than it.
+        app.session_watermark = app.arrival_seq;
 
         Ok(app)
     }
@@ -350,6 +410,9 @@ impl App {
             all_conversations: Vec::new(),
             dm_last_seen: HashMap::new(),
             next_dm_scan: None,
+            session_watermark: 0,
+            focus_keywords: Vec::new(),
+            dm_allow_convs: HashSet::new(),
         }
     }
 
@@ -362,6 +425,20 @@ impl App {
     /// Register a user's display name, for fixture setup (see `empty`).
     pub fn add_user(&mut self, id: &str, name: &str) {
         self.user_names.insert(id.to_string(), name.to_string());
+    }
+
+    /// Mark `conv_id` as an allow-listed DM for Focus qualification (spec §3), for fixture setup
+    /// (see `empty`) — `build` derives this from `PluginConfig::dm_allow` itself, but a fixture
+    /// built via `empty` never runs that resolution, so it needs a direct way in.
+    pub fn allow_focus_dm(&mut self, conv_id: &str) {
+        self.dm_allow_convs.insert(conv_id.to_string());
+    }
+
+    /// Add a Focus-mode trigger keyword (spec §3, `PluginConfig::focus_keywords`), for fixture
+    /// setup (see `empty`) — see `allow_focus_dm`'s doc for why `empty`-built fixtures need a
+    /// direct setter rather than going through `build`'s config resolution.
+    pub fn add_focus_keyword(&mut self, keyword: &str) {
+        self.focus_keywords.push(keyword.to_string());
     }
 
     /// Apply one socket event: insert a new message, replace an edited one in place, remove
@@ -818,6 +895,7 @@ impl App {
         match self.view {
             FeedView::Timeline => self.feed_rows_with_ids(),
             FeedView::Threads => self.thread_rows_with_ids(),
+            FeedView::Focus => self.focus_rows_with_ids(),
         }
     }
 
@@ -1125,6 +1203,43 @@ impl App {
             .collect()
     }
 
+    /// The Focus view (spec §3): reuses the Timeline's plain row rendering (`message_row`, no
+    /// `ThreadMarker`/`Divider` synthesis), filtered to only messages that qualify for Focus (see
+    /// `qualifies_for_focus`), oldest first / newest at the bottom, same as every other view's
+    /// convention. Nothing is deleted from the model to produce this — toggling back to Timeline
+    /// still shows everything, qualifying or not.
+    pub fn focus_rows(&self) -> Vec<Row> {
+        self.focus_rows_with_ids().into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// As `focus_rows`, but each row is paired with the `(conv, ts)` a Feed-tab action (expand,
+    /// permalink) should act on — see `active_feed_rows_with_ids`'s Focus arm.
+    fn focus_rows_with_ids(&self) -> Vec<IdRow> {
+        let mut items: Vec<&Stored> =
+            self.messages.values().filter(|s| self.qualifies_for_focus(s)).collect();
+        items.sort_by(|a, b| ts_cmp(&a.msg.ts, &b.msg.ts)); // oldest first, newest at the bottom
+        items
+            .into_iter()
+            .map(|s| {
+                let id = (s.msg.conv.clone(), s.msg.ts.clone());
+                (Some(id), self.message_row(&s.msg))
+            })
+            .collect()
+    }
+
+    /// Whether `s` qualifies for the Focus view (spec §3): it must have arrived live during this
+    /// session — `s.arrival` strictly past `session_watermark` (see that field's doc for why the
+    /// comparison is strict, not `>=`) — *and* either its conversation is an allow-listed DM
+    /// (`dm_allow_convs`) or its text hits a `focus_keywords` entry (`entities::keyword_hit`, same
+    /// case-insensitive substring rule the Mentions `keywords` check uses, applied to the distinct
+    /// `focus_keywords` list). The two qualifiers are OR'd, matching the spec's "allow-list OR
+    /// keyword" framing — either alone is enough once the watermark gate passes.
+    fn qualifies_for_focus(&self, s: &Stored) -> bool {
+        s.arrival > self.session_watermark
+            && (self.dm_allow_convs.contains(&s.msg.conv)
+                || entities::keyword_hit(&s.msg.text, &self.focus_keywords))
+    }
+
     /// Count of mentions not yet marked read.
     pub fn unread_mentions(&self) -> usize {
         self.messages
@@ -1165,22 +1280,40 @@ impl App {
             return;
         }
         self.view = match self.view {
-            FeedView::Timeline => FeedView::Threads,
+            FeedView::Timeline | FeedView::Focus => FeedView::Threads,
             FeedView::Threads => FeedView::Timeline,
         };
         self.selected = None;
         self.resync_cursor();
     }
 
-    /// `Enter` semantics per tab (and, on the Feed tab, per view): the Timeline expands/collapses
-    /// the selected thread (fetching replies via REST on first expand); the Threads view instead
-    /// always (re)fetches the selected thread's replies (see `refresh_thread`'s doc for why a
+    /// Flip the Feed tab into/out of the Focus projection (spec §3, the `f` key) — the Focus
+    /// counterpart to `toggle_view`, same Feed-tab gating and selection-resync, but targeting
+    /// `Focus` instead of `Threads`; see [`FeedView`]'s doc for the full `t`/`f` decision table
+    /// governing how the two toggles interact.
+    pub fn toggle_focus(&mut self) {
+        if self.tab != Tab::Feed {
+            return;
+        }
+        self.view = match self.view {
+            FeedView::Timeline | FeedView::Threads => FeedView::Focus,
+            FeedView::Focus => FeedView::Timeline,
+        };
+        self.selected = None;
+        self.resync_cursor();
+    }
+
+    /// `Enter` semantics per tab (and, on the Feed tab, per view): the Timeline and Focus views
+    /// both expand/collapse the selected thread exactly the same way (fetching replies via REST
+    /// on first expand — Focus reuses the Timeline's plain row rendering, so the same rows and
+    /// `expand_target_root` resolution apply unchanged); the Threads view instead always
+    /// (re)fetches the selected thread's replies (see `refresh_thread`'s doc for why a
     /// collapse-toggle semantics doesn't apply there); the Mentions tab toggles the selected row's
     /// read state.
     pub fn toggle_expand_or_read(&mut self, rest: &Rest) {
         match self.tab {
             Tab::Feed => match self.view {
-                FeedView::Timeline => self.toggle_expand(rest),
+                FeedView::Timeline | FeedView::Focus => self.toggle_expand(rest),
                 FeedView::Threads => self.refresh_thread(rest),
             },
             Tab::Mentions => self.toggle_read(),
@@ -1821,6 +1954,9 @@ mod tests {
             all_conversations: Vec::new(),
             dm_last_seen: HashMap::new(),
             next_dm_scan: None,
+            session_watermark: 0,
+            focus_keywords: Vec::new(),
+            dm_allow_convs: HashSet::new(),
         }
     }
 
@@ -3433,6 +3569,160 @@ mod tests {
         assert_eq!(app.view, FeedView::Threads);
         assert_eq!(app.cursor, 0, "the 1-row threads projection clamps the stale cursor");
         assert_eq!(app.thread_rows()[app.cursor].text, "a thread root");
+    }
+
+    // ---- toggle_focus / mutual exclusion with Threads (Task 3, spec §3) ------------------------
+
+    #[test]
+    fn toggle_focus_flips_between_timeline_and_focus_on_the_feed_tab() {
+        let mut app = empty_app();
+        assert_eq!(app.view, FeedView::Timeline);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Timeline);
+    }
+
+    #[test]
+    fn toggle_focus_is_a_no_op_off_the_feed_tab() {
+        let mut app = empty_app();
+        app.tab = Tab::Mentions;
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Timeline, "the toggle key is Feed-only");
+    }
+
+    #[test]
+    fn t_from_focus_switches_to_threads_leaving_focus_per_the_decision_table() {
+        let mut app = empty_app();
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads, "t from Focus lands on Threads, not Timeline");
+    }
+
+    #[test]
+    fn f_from_threads_switches_to_focus_leaving_threads_per_the_decision_table() {
+        let mut app = empty_app();
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus, "f from Threads lands on Focus, not Timeline");
+    }
+
+    #[test]
+    fn t_from_threads_and_f_from_focus_both_return_to_timeline() {
+        let mut app = empty_app();
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Timeline);
+
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Timeline);
+    }
+
+    #[test]
+    fn toggle_focus_resyncs_the_cursor_into_the_new_projections_bounds() {
+        let mut app = empty_app();
+        app.dm_allow_convs.insert("C1".to_string());
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "backfilled, excluded")));
+        app.session_watermark = app.arrival_seq; // simulate build()'s end-of-backfill cut
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "focused live message")));
+        app.touch();
+        app.move_cursor(1); // selects the live message in the 2-row timeline
+
+        app.toggle_focus();
+        assert_eq!(app.view, FeedView::Focus);
+        assert_eq!(app.cursor, 0, "the 1-row focus projection clamps the stale cursor");
+        assert_eq!(app.focus_rows()[app.cursor].text, "focused live message");
+    }
+
+    // ---- focus_rows_with_ids: qualification, arrival-watermark AND (allow-list OR keyword) -----
+    // (Task 3, spec §3)
+
+    #[test]
+    fn focus_excludes_a_message_at_the_watermark_boundary_even_if_it_matches() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["urgent".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "urgent backfilled message")));
+        app.session_watermark = app.arrival_seq; // as if build() just finished backfill here
+        assert!(
+            app.focus_rows().is_empty(),
+            "a message whose arrival equals the watermark is the last backfilled one, not live"
+        );
+    }
+
+    #[test]
+    fn focus_includes_a_matching_message_strictly_past_the_watermark() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["urgent".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "backfilled, no match")));
+        app.session_watermark = app.arrival_seq;
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "urgent live message")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "urgent live message");
+    }
+
+    #[test]
+    fn focus_includes_an_allow_listed_dm_message_with_no_keyword_match() {
+        let mut app = empty_app();
+        app.add_conversation("D1", "alice", ConvKind::Im);
+        app.dm_allow_convs.insert("D1".to_string());
+        app.apply(SocketEvent::Message(msg("D1", "1.0", None, "U1", "just checking in")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "just checking in");
+    }
+
+    #[test]
+    fn focus_includes_a_keyword_match_in_a_non_allow_listed_conversation() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["incident".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "there is an incident")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "there is an incident");
+    }
+
+    #[test]
+    fn focus_excludes_a_live_message_matching_neither_allow_list_nor_keyword() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["incident".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "ordinary update")));
+        assert!(app.focus_rows().is_empty());
+    }
+
+    #[test]
+    fn focus_includes_a_message_matching_both_allow_list_and_keyword_exactly_once() {
+        let mut app = empty_app();
+        app.add_conversation("D1", "alice", ConvKind::Im);
+        app.dm_allow_convs.insert("D1".to_string());
+        app.focus_keywords = vec!["incident".to_string()];
+        app.apply(SocketEvent::Message(msg("D1", "1.0", None, "U1", "incident update")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 1, "OR semantics: matching both must not duplicate the row");
+    }
+
+    #[test]
+    fn focus_rows_are_ascending_and_reuse_the_timeline_message_row_shape() {
+        let mut app = empty_app();
+        app.focus_keywords = vec!["x".to_string()];
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "x second")));
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "x first")));
+        let rows = app.focus_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "x first");
+        assert_eq!(rows[1].text, "x second");
+        assert_eq!(rows[0].kind, RowKind::Message);
+    }
+
+    #[test]
+    fn focus_rows_is_empty_when_nothing_qualifies_yet() {
+        let app = empty_app();
+        assert!(app.focus_rows().is_empty());
     }
 
     // ---- refresh_thread: Enter in the Threads view (re)fetches replies (Task 2, spec §3) -------

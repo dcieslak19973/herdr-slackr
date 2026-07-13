@@ -315,6 +315,97 @@ fn tab_bar_names_the_active_feed_view_mode() {
     assert!(out.contains("1 Threads"), "{out}");
 }
 
+// ---- Focus view (Task 3, spec §3) -----------------------------------------------------------
+
+#[test]
+fn tab_bar_names_focus_when_the_focus_view_is_active() {
+    let mut app = App::empty("SELF");
+    app.toggle_focus();
+    let out = render_ready(&app);
+    assert!(out.contains("1 Focus"), "{out}");
+}
+
+#[test]
+fn focus_view_shows_only_qualifying_live_messages_like_the_timeline() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.add_focus_keyword("urgent");
+    app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "an urgent update")));
+    app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "a plain message")));
+    app.touch();
+    app.toggle_focus();
+
+    let out = render_ready(&app);
+    assert!(out.contains("an urgent update"), "{out}");
+    assert!(
+        !out.contains("a plain message"),
+        "a non-matching message must not show in Focus:\n{out}"
+    );
+    // Same row shape as the Timeline: conv label, author, time all present (spec: "reuses the
+    // timeline row layout").
+    assert!(out.contains("#eng"), "{out}");
+    assert!(out.contains("@dan"), "{out}");
+}
+
+#[test]
+fn focus_view_includes_an_allow_listed_dm_message_with_no_keyword_needed() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("D1", "alice", ConvKind::Im);
+    app.allow_focus_dm("D1");
+    app.apply(SocketEvent::Message(msg("D1", "1.0", None, "U1", "just checking in")));
+    app.touch();
+    app.toggle_focus();
+
+    let out = render_ready(&app);
+    assert!(out.contains("just checking in"), "{out}");
+}
+
+#[test]
+fn focus_view_is_empty_when_nothing_qualifies_yet() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "nothing matches")));
+    app.touch();
+    app.toggle_focus();
+
+    let out = render_ready(&app);
+    assert!(!out.contains("nothing matches"), "{out}");
+}
+
+#[test]
+fn f_key_toggle_is_mutually_exclusive_with_threads() {
+    let mut app = App::empty("SELF");
+    app.toggle_view(); // t: Timeline -> Threads
+    let out = render_ready(&app);
+    assert!(out.contains("1 Threads"), "{out}");
+
+    app.toggle_focus(); // f from Threads lands on Focus, not Timeline
+    let out = render_ready(&app);
+    assert!(out.contains("1 Focus"), "{out}");
+
+    app.toggle_view(); // t from Focus lands on Threads, not Timeline
+    let out = render_ready(&app);
+    assert!(out.contains("1 Threads"), "{out}");
+}
+
+// ---- status-line `f` hint on the Feed tab ----------------------------------------------------
+
+#[test]
+fn feed_tab_status_hints_the_f_toggle_focus_key() {
+    let app = App::empty("SELF");
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("toggle focus"), "{out}");
+}
+
+#[test]
+fn mentions_tab_status_has_no_f_hint() {
+    let mut app = App::empty("SELF");
+    app.set_tab(Tab::Mentions);
+    let out = render_ready(&app);
+    assert!(!out.to_lowercase().contains("toggle focus"), "{out}");
+}
+
 #[test]
 fn t_key_toggle_flips_the_feed_view_and_the_timeline_survives_a_flip_back() {
     let mut app = App::empty("SELF");
