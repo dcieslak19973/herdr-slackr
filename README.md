@@ -128,6 +128,8 @@ keywords = ["deploy", "oncall"]          # extra Mentions-tab triggers (default 
 theme = "catppuccin"                     # palette name (see Theme below)
 poll_fallback_secs = 30                  # seconds between polls while the socket is down; 5..=300
 dm_limit = 20                            # cap on subscribed DMs/MPIMs when dms=true; 0..=200
+dm_allow = ["alice", "Bob Smith"]        # DM/MPIM names always subscribed, ignoring dm_limit (default none)
+focus_keywords = ["incident", "p1"]      # Focus-view triggers, distinct from `keywords` (default none)
 ```
 
 `channels` is the only required key; every other key has a documented default. A missing config
@@ -155,12 +157,23 @@ invocation doesn't refetch the whole member list every time. Startup backfill re
 rate-limited conversation exactly once (sleeping the real `Retry-After` first) before giving up on
 the rest of the list for that session — the socket/poll paths fill in what backfill couldn't.
 
-`dm_limit` (default 20, valid `0..=200`) caps how many of your DMs/MPIMs are actively subscribed
-when `dms = true`, ranked by most-recently-active; `0` means no DMs are polled or backfilled at
-all, even with `dms = true`. A DM outside the cap is not completely invisible, though: if a message
-arrives on it over the live Socket Mode connection, it still shows up in the Feed/Mentions tabs —
-only the REST-driven backfill and polling paths respect the cap, since the socket subscribes to
-events for the whole workspace regardless of which conversations this pane chose to track.
+`dm_limit` (default 20, valid `0..=200`) caps how many of your DMs/MPIMs are *actively subscribed*
+— polled and backfilled on every regular tick — when `dms = true`, ranked by most-recently-active;
+`0` means none are polled or backfilled by default. `dm_allow` (below) always-subscribes named DMs
+regardless of this cap, on top of whichever ones rank inside it.
+
+**`dm_limit` never blocks a new message from arriving in any DM, capped or not, in either delivery
+mode.** Over the live Socket Mode connection this is automatic: the socket subscribes to events for
+the whole workspace regardless of which conversations the pane chose to actively track, so a
+message on an out-of-cap DM shows up in the Feed/Mentions tabs immediately, same as any subscribed
+one. In polling mode there is a dedicated detection path for it: every 5 minutes, a scan re-fetches
+the full conversation list and checks every out-of-cap DM/MPIM's Slack-reported activity stamp
+against what was last seen. If none moved, the scan costs nothing beyond that one list call. If one
+or more did move, exactly one of them — the single most-recently-active, if several changed at once
+— gets fetched with one extra `conversations.history` call that tick; the rest simply wait for the
+next 5-minute scan to pick them up. This scan is skipped entirely (no list call, no history call)
+during an active rate-limit cooldown from a prior 429, so it never adds pressure to a workspace
+that Slack has already asked the pane to back off from.
 
 ### Theme
 
@@ -254,6 +267,39 @@ were looking elsewhere," not as a precise per-tab row count.
   replies, within the same total per-tick budget described in [Rate limits](#rate-limits) — not
   in addition to it. With no active threads, the full budget goes to conversations as before.
 
+## Focus mode
+
+`f` toggles the Feed tab (only) into and out of a third projection, **Focus** — a narrower view
+than either the Timeline or Threads: only messages that (a) arrived live during this run of the
+pane, and (b) either came from an allow-listed DM/MPIM (`dm_allow`) or hit a `focus_keywords`
+trigger. Anything backfilled at startup is excluded, even if it would otherwise qualify — Focus is
+"what needs my attention right now", not a filtered history search. Restarting the pane resets what
+counts as "since app start"; there is no persistence across sessions.
+
+A message qualifies for Focus the same way regardless of which condition it hits:
+
+- **Allow-list match** — the message's conversation is one of the DM/MPIM names in `dm_allow`
+  (exact, case-insensitive — no substring matching, same rule `resolve_channels` uses).
+- **Keyword match** — the message text contains a `focus_keywords` entry, case-insensitively, as a
+  substring (the same matching rule `keywords` uses for Mentions, but a distinct list — setting one
+  never affects the other).
+
+Either condition alone is enough (an OR, not an AND); the message just needs to have arrived live.
+
+`t` (Threads) and `f` (Focus) are mutually exclusive Feed-tab views, each toggled by its own key
+rather than one shared three-way cycle — pressing one while the other is active switches straight
+to it instead of first returning to the Timeline:
+
+| before → key | `t`        | `f`        |
+| ------------- | ---------- | ---------- |
+| `Timeline`    | `Threads`  | `Focus`    |
+| `Threads`     | `Timeline` | `Focus`    |
+| `Focus`       | `Threads`  | `Timeline` |
+
+For example: from the Timeline, `t` lands on Threads; pressing `f` from there jumps straight to
+Focus (not back through Timeline first); pressing `t` again from Focus lands back on Threads, not
+Timeline.
+
 ## Controls
 
 | Key           | Action                                                          |
@@ -267,6 +313,7 @@ were looking elsewhere," not as a precise per-tab row count.
 | `Ctrl-d` · `Ctrl-u` | Move a half page                                            |
 | `Enter`       | Feed timeline: expand/collapse the selected thread (root, marker, reply, or activity row — see [Threads view](#threads-view)). Feed threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
 | `t`           | Feed tab only: toggle the Feed between the Timeline and the Threads-only view |
+| `f`           | Feed tab only: toggle the Feed into/out of the Focus view (see [Focus mode](#focus-mode)) |
 | `o`           | Open the selected message's permalink in the browser             |
 | `r`           | Manual refresh (re-pull the last 50 messages of every conversation) |
 | `q`           | Quit the pane                                                     |
@@ -384,7 +431,9 @@ invariant as the pane. An agent that needs to reply does so through your Slack M
 This is a focused, young tool. Known constraints:
 
 - **UTC timestamps.** Message times render as `HH:MM` in UTC (no timezone crate in the dependency
-  list), not your local time.
+  list), not your local time. A message from a UTC calendar day earlier than today additionally
+  shows the date, as `Mon DD HH:MM` (e.g. `Jul 12 06:00`), so a prior day's message is never
+  mistaken for one from today.
 - **No persistence.** Every message, read marker, and expanded thread lives in memory only — a
   pane restart re-backfills the last 50 messages per conversation from Slack and starts fresh.
 - **Read-only, always.** No composing, replying, reacting, or marking read in Slack itself — this

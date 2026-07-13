@@ -19,6 +19,8 @@ keywords = ["deploy", "oncall"]          # default []
 theme = "tokyo-night"                    # default "catppuccin"
 poll_fallback_secs = 45                  # default 30
 dm_limit = 15                            # default 20
+dm_allow = ["alice", "Bob Smith"]        # default []
+focus_keywords = ["incident", "p1"]      # default []
 ```
 
 | key                   | value                                                              |
@@ -29,6 +31,8 @@ dm_limit = 15                            # default 20
 | `theme`               | a palette name (see below); an unrecognized name is a runtime warning, not a config error |
 | `poll_fallback_secs`  | integer in `5..=300`; seconds between polls while the socket is down |
 | `dm_limit`            | integer in `0..=200`; caps how many `Im`/`Mpim` conversations are subscribed when `dms = true`, ranked by most-recently-active (`conversations.list`'s `updated`); `0` subscribes none even when `dms = true` |
+| `dm_allow`            | array of non-empty strings (no other format restriction — free-form Slack display names, not `#`-prefixed); `Im`/`Mpim` counterpart names always subscribed regardless of `dm_limit`, matched exactly and case-insensitively against the conversation's resolved name; `dms = false` still suppresses them |
+| `focus_keywords`      | array of strings; Focus-view triggers (see `pane.md`), matched case-insensitively as a substring — the same rule `keywords` uses, but a distinct list kept deliberately separate from it |
 
 Tokens live in a separate file, `tokens.toml` in the same directory, or the environment:
 
@@ -52,7 +56,9 @@ Tokens live in a separate file, `tokens.toml` in the same directory, or the envi
 | C9 | On Unix, a `tokens.toml` readable by group or world is refused with a `chmod 600 <path>` remedy, before its contents are ever parsed. |
 | C10 | No error message constructed by config or token resolution ever contains a candidate token value. |
 | C11 | A configured channel name that resolves to no real conversation is an error naming that channel. |
-| C12 | When the subscribed DM/MPIM set exceeds `dm_limit`, the cap keeps the most-recently-active ones (`updated` descending); if any candidate is missing `updated`, ranking falls back to Slack's own list order instead of guessing, logged once. `dm_limit = 0` excludes DMs entirely, independent of `dms`. A DM outside the cap is not backfilled or polled, but a message on it can still arrive live over the socket (`slack-host.md`). |
+| C12 | When the subscribed DM/MPIM set exceeds `dm_limit`, the cap keeps the most-recently-active ones (`updated` descending); if any candidate is missing `updated`, ranking falls back to Slack's own list order instead of guessing, logged once. `dm_limit = 0` excludes DMs entirely, independent of `dms`. A DM outside the cap is not backfilled or polled by the regular per-tick round-robin, but a message on it can still arrive live over the socket, and polling mode has its own out-of-cap activity scan (`slack-host.md` F12) — `dm_limit` bounds active-subscription *count*, never new-arrival *delivery*. |
+| C13 | A DM/MPIM whose resolved name exactly matches (case-insensitively, no substring matching) a `dm_allow` entry is always included in the subscribed set, never subject to the `dm_limit` cut — the cap applies only to the remaining non-allow-listed pool. `dms = false` suppresses allow-listed DMs too; an explicit "no DMs" wins over the allow-list. |
+| C14 | `focus_keywords` is validated and matched exactly like `keywords` (array of strings, case-insensitive substring), but is a wholly separate list consulted only by the Focus view (`pane.md`) — setting one never changes what the other matches. |
 
 An error names the config path and the read, syntax, key, or value failure, and states the expected form when a value is invalid.
 
