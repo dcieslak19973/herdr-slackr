@@ -191,10 +191,12 @@ fn cell_style(fg: Color, bg: Option<Color>) -> Style {
 
 /// `app.status`, with a `polling` marker appended when in fallback mode and not already named
 /// in the status text, a `t: toggle view` key hint on the Feed tab (spec §3: "`t` appears in
-/// the footer"), and a `g/G: top/bottom` nav-key hint on every tab (spec §2 — jumping applies
-/// uniformly now that ordering is unified newest-at-bottom everywhere) — this pane has no
-/// separate footer row, so every hint rides along on the status line, the bottommost row a
-/// user's eye lands on regardless.
+/// the footer"), a context-aware `enter expand/collapse thread` hint (spec §5) whenever
+/// `App::selected_is_thread_related` says Enter would actually do something thread-related, and
+/// a `g/G: top/bottom` nav-key hint on every tab (spec §2 — jumping applies uniformly now that
+/// ordering is unified newest-at-bottom everywhere) — this pane has no separate footer row, so
+/// every hint rides along on the status line, the bottommost row a user's eye lands on
+/// regardless.
 fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let mut text = app.status.clone();
     if app.polling && !text.contains("polling") {
@@ -208,6 +210,12 @@ fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
             text.push_str(" · ");
         }
         text.push_str("t: toggle view");
+    }
+    if app.selected_is_thread_related() {
+        if !text.is_empty() {
+            text.push_str(" · ");
+        }
+        text.push_str("enter expand/collapse thread");
     }
     if !text.is_empty() {
         text.push_str(" · ");

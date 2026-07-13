@@ -761,18 +761,27 @@ impl App {
         for stored in self.messages.values() {
             if let Some(root_ts) = stored.msg.thread_ts.clone() {
                 if self.messages.contains_key(&key_for(&stored.msg.conv, &root_ts)) {
-                    continue; // a reply to a known root; rendered below, attached to its root.
+                    if self.expanded.contains(&(stored.msg.conv.clone(), root_ts.clone())) {
+                        continue; // nested under its root below (today's behavior).
+                    }
+                    // Spec §6: a reply to a *collapsed* thread must not simply vanish — it gets
+                    // a discoverable activity row at its own chronological position (in addition
+                    // to the root's `ThreadMarker`, pushed when the root itself was processed).
+                    rows.push((
+                        stored.arrival,
+                        Some((stored.msg.conv.clone(), stored.msg.ts.clone())),
+                        self.activity_row(&stored.msg),
+                    ));
+                    continue;
                 }
                 // Orphaned reply: its root predates our backfill horizon (or was otherwise
                 // never seen), so without this branch it would never render at all. Render it
                 // as a normal inline row instead, marked with a "↳ " prefix so it still reads
                 // as thread context rather than a plain top-level message.
-                let mut row = self.message_row(&stored.msg);
-                row.text = format!("\u{21b3} {}", row.text);
                 rows.push((
                     stored.arrival,
                     Some((stored.msg.conv.clone(), stored.msg.ts.clone())),
-                    row,
+                    self.nested_reply_row(&stored.msg),
                 ));
                 continue;
             }
@@ -1076,25 +1085,87 @@ impl App {
     // ---- Feed tab: thread expand (thin REST edge over the pure `toggle_thread`) ----------
 
     fn toggle_expand(&mut self, rest: &Rest) {
-        let Some(((conv, root_ts), row)) = self.feed_target() else {
+        let Some(((conv, sel_ts), row)) = self.feed_target() else {
             return;
         };
-        if !matches!(row.kind, RowKind::ThreadMarker { .. }) {
+        let Some(root_ts) = self.expand_target_root(&conv, &sel_ts, &row) else {
             return;
-        }
+        };
         let will_expand = !self.expanded.contains(&(conv.clone(), root_ts.clone()));
+        let mut fetch_failed = false;
         let fetched = if will_expand {
             match crate::rest::replies(rest, &conv, &root_ts, None) {
                 Ok(msgs) => msgs,
                 Err(err) => {
                     self.status = format!("replies failed: {err:?}");
+                    fetch_failed = true;
                     Vec::new()
                 }
             }
         } else {
             Vec::new()
         };
-        self.toggle_thread(&conv, &root_ts, fetched);
+        let now_expanded = self.toggle_thread(&conv, &root_ts, fetched);
+        if !fetch_failed {
+            self.status = expand_status(now_expanded, self.local_reply_count(&conv, &root_ts));
+        }
+    }
+
+    /// Resolve the thread root `(conv, root_ts)` that Enter on the selected Feed-tab Timeline row
+    /// (`row`, identified by `(conv, sel_ts)`) should expand/collapse (spec §5-§6):
+    /// - a `ThreadMarker` row names its root directly (`sel_ts` already is the root's `ts`);
+    /// - a `Message` row names its root directly when the message itself is a thread root with
+    ///   at least one reply (`is_thread_root_with_replies`) — the new "Enter on the root row"
+    ///   route (spec §5);
+    /// - a `Message` row that is itself a reply to a *locally-known* root resolves via its
+    ///   stored `thread_ts` — covering both a still-nested expanded-reply row and a collapsed
+    ///   activity row (spec §6), whichever is currently selected.
+    ///
+    /// Any other row — a plain non-thread message, or a reply whose root isn't locally known
+    /// (an orphan — there is nothing to expand) — has nothing to toggle, so returns `None`.
+    fn expand_target_root(&self, conv: &str, sel_ts: &str, row: &Row) -> Option<String> {
+        match row.kind {
+            RowKind::ThreadMarker { .. } => Some(sel_ts.to_string()),
+            RowKind::Message => {
+                if self.is_thread_root_with_replies(conv, sel_ts) {
+                    return Some(sel_ts.to_string());
+                }
+                let root_ts = self.messages.get(&key_for(conv, sel_ts))?.msg.thread_ts.clone()?;
+                self.messages.contains_key(&key_for(conv, &root_ts)).then_some(root_ts)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `(conv, ts)` is a thread root (not itself a reply) with at least one reply, by
+    /// `marker_count`'s usual max-of-metadata-and-local rule — i.e. exactly the condition under
+    /// which `feed_rows_with_ids` would render a `ThreadMarker` for it were it collapsed. Used by
+    /// `expand_target_root` so Enter on the root's own `Message` row (spec §5) is only ever
+    /// treated as thread-related when it actually has a thread to expand.
+    fn is_thread_root_with_replies(&self, conv: &str, ts: &str) -> bool {
+        let Some(stored) = self.messages.get(&key_for(conv, ts)) else {
+            return false;
+        };
+        if stored.msg.thread_ts.is_some() {
+            return false; // it's a reply, not a root
+        }
+        marker_count(stored.msg.reply_count, self.local_reply_count(conv, ts)) > 0
+    }
+
+    /// Whether the Feed tab's Timeline currently has a thread-related row selected — anything
+    /// `expand_target_root` can resolve (spec §5-§6: root-with-thread, marker, nested reply, or
+    /// activity row). `ui.rs`'s footer uses this to show the `enter expand/collapse thread` hint
+    /// only when Enter would actually do something thread-related; `false` off the Feed tab or
+    /// off the Timeline projection, since the Threads view's Enter is an unconditional refresh
+    /// (`refresh_thread`), not a collapse/expand toggle this hint describes.
+    pub fn selected_is_thread_related(&self) -> bool {
+        if self.tab != Tab::Feed || self.view != FeedView::Timeline {
+            return false;
+        }
+        let Some((id, row)) = self.feed_target() else {
+            return false;
+        };
+        self.expand_target_root(&id.0, &id.1, &row).is_some()
     }
 
     /// `Enter` in the Threads view (spec §3: "Enter on a root (re)fetches its replies"): fetch
@@ -1245,6 +1316,28 @@ impl App {
         }
     }
 
+    /// A reply row nested under an expanded root (today's behavior), or an orphaned reply whose
+    /// root isn't locally known at all (spec §6: "keep their existing inline treatment"): the
+    /// plain message row with a "↳ " nesting prefix, sharing `SelKind::Message` identity with
+    /// whatever other rendering of the same `(conv, ts)` the caller is choosing between.
+    fn nested_reply_row(&self, msg: &Message) -> Row {
+        let mut row = self.message_row(msg);
+        row.text = format!("\u{21b3} {}", row.text);
+        row
+    }
+
+    /// A reply to a *collapsed* thread, rendered as a discoverable activity row at its own
+    /// chronological position (spec §6) instead of vanishing entirely: the same row shape as any
+    /// other message (conv label/author/time styled normally), with the text replaced by
+    /// `↳ @author replied: <text>` so it still reads as thread context. `RowKind::Message` and
+    /// the reply's own `(conv, ts)` identity are kept (see `feed_rows_with_ids`'s caller), so
+    /// Enter on it resolves here and expands the root via `expand_target_root`.
+    fn activity_row(&self, msg: &Message) -> Row {
+        let mut row = self.message_row(msg);
+        row.text = format!("\u{21b3} @{} replied: {}", row.author, row.text);
+        row
+    }
+
     fn conv_label(&self, conv_id: &str) -> String {
         let kind = self.conv_kinds.get(conv_id).copied().unwrap_or(ConvKind::Channel);
         let name = self.conv_names.get(conv_id).cloned().unwrap_or_else(|| conv_id.to_string());
@@ -1291,6 +1384,21 @@ fn apply_backfill(
 /// stale/never-set `reply_count`.
 fn marker_count(root_reply_count: Option<u32>, local_replies: usize) -> usize {
     (root_reply_count.unwrap_or(0) as usize).max(local_replies)
+}
+
+/// The status line `toggle_expand` sets after a successful expand/collapse (spec §5):
+/// `"thread expanded — n replies"` (`reply_count` is the thread's locally-known reply count
+/// right after the toggle, including anything just fetched) when expanding, or a plain
+/// `"thread collapsed"` note when collapsing. Pure so the wording is unit-tested without a REST
+/// call — `toggle_expand` is the only caller, threading in `local_reply_count` after
+/// `toggle_thread` runs; a failed fetch bypasses this entirely so the existing `"replies
+/// failed: ..."` wording is never overwritten (spec: "error wording unchanged").
+fn expand_status(now_expanded: bool, reply_count: usize) -> String {
+    if now_expanded {
+        format!("thread expanded — {reply_count} replies")
+    } else {
+        "thread collapsed".to_string()
+    }
 }
 
 /// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
@@ -1458,8 +1566,9 @@ fn resolve_im_names(
 mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, FeedView, RowKind, SelKind, Tab, apply_backfill,
-        backfill_retry_decision, capped_sleep_secs, cooldown_active, marker_count, next_batch,
-        poll_error_status, resolve_im_names, thread_slot_count, track_newest, ts_to_hhmm,
+        backfill_retry_decision, capped_sleep_secs, cooldown_active, expand_status, marker_count,
+        next_batch, poll_error_status, resolve_im_names, thread_slot_count, track_newest,
+        ts_to_hhmm,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -1616,10 +1725,171 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
         app.touch();
 
+        // Spec §6: a collapsed thread still shows its `ThreadMarker` right after the root, but
+        // each known reply also gets its own discoverable activity row at its chronological
+        // position, rather than vanishing entirely.
         let rows = app.feed_rows();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].kind, RowKind::Message);
         assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 2, expanded: false });
+        assert_eq!(rows[2].text, "\u{21b3} @dan replied: reply one");
+        assert_eq!(rows[2].kind, RowKind::Message);
+        assert_eq!(rows[3].text, "\u{21b3} @dan replied: reply two");
+    }
+
+    // ---- reply activity rows (Task 2, spec §6): a collapsed thread's replies get a discoverable
+    // activity row at their own chronological position instead of vanishing entirely; an
+    // expanded thread still nests them under the root with no activity rows at all. --------------
+
+    #[test]
+    fn a_collapsed_threads_reply_activity_row_carries_the_replys_own_identity() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+
+        let rows = app.feed_rows_with_ids();
+        let (id, row) = rows
+            .into_iter()
+            .find(|(_, r)| r.text.contains("replied:"))
+            .expect("an activity row must be present for the collapsed reply");
+        assert_eq!(id, Some(("C1".to_string(), "1.000002".to_string())));
+        assert_eq!(row.kind, RowKind::Message);
+    }
+
+    #[test]
+    fn an_expanded_thread_emits_no_activity_rows_for_its_replies() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+        app.toggle_thread("C1", "1.000001", Vec::new());
+
+        let rows = app.feed_rows();
+        assert!(
+            !rows.iter().any(|r| r.text.contains("replied:")),
+            "an expanded thread's replies must nest under the root, not also appear as activity rows:\n{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.text == "reply one"));
+    }
+
+    #[test]
+    fn an_orphaned_reply_keeps_its_existing_inline_treatment_unaffected_by_activity_rows() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "reply to a root we never saw",
+        )));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "\u{21b3} reply to a root we never saw");
+    }
+
+    // ---- Enter routing on thread-related rows (Task 2, spec §5-§6) ---------------------------
+
+    #[test]
+    fn entering_on_a_thread_roots_message_row_toggles_expansion_like_its_marker() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+
+        app.move_cursor(0); // the root's own Message row, not its ThreadMarker
+        let rows = app.feed_rows();
+        assert_eq!(rows[app.cursor].kind, RowKind::Message);
+        assert_eq!(rows[app.cursor].text, "root");
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.toggle_expand_or_read(&rest);
+
+        let rows = app.feed_rows();
+        assert!(
+            !rows.iter().any(|r| matches!(r.kind, RowKind::ThreadMarker { .. })),
+            "Enter on the root row must expand the thread just like Enter on its marker"
+        );
+        assert!(rows.iter().any(|r| r.text == "reply one"));
+    }
+
+    #[test]
+    fn entering_on_an_activity_row_expands_the_root_thread() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+
+        let rows = app.feed_rows_with_ids();
+        let pos = rows.iter().position(|(_, r)| r.text.contains("replied:")).unwrap();
+        app.cursor = pos;
+        app.selected = None;
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.toggle_expand_or_read(&rest);
+
+        let rows = app.feed_rows();
+        assert!(
+            !rows.iter().any(|r| r.text.contains("replied:")),
+            "the activity row must disappear once the thread is expanded:\n{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.text == "reply one"));
+    }
+
+    #[test]
+    fn entering_on_a_nested_reply_row_collapses_an_expanded_thread() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+        app.toggle_thread("C1", "1.000001", Vec::new()); // now expanded
+
+        app.move_cursor(1); // the nested reply row
+        let rows = app.feed_rows();
+        assert_eq!(rows[app.cursor].text, "reply one");
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.toggle_expand_or_read(&rest);
+
+        let rows = app.feed_rows();
+        assert!(
+            rows.iter().any(|r| matches!(r.kind, RowKind::ThreadMarker { .. })),
+            "Enter on a nested reply row must collapse the thread back to a marker:\n{rows:?}"
+        );
+    }
+
+    // ---- completion feedback (Task 2, spec §5) -------------------------------------------------
+
+    #[test]
+    fn expand_status_names_the_reply_count_when_expanding() {
+        assert_eq!(expand_status(true, 3), "thread expanded — 3 replies");
+    }
+
+    #[test]
+    fn expand_status_is_a_plain_collapsed_note() {
+        assert_eq!(expand_status(false, 0), "thread collapsed");
+    }
+
+    #[test]
+    fn collapsing_a_thread_via_the_root_row_sets_a_collapsed_status() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+        app.toggle_thread("C1", "1.000001", Vec::new()); // now expanded
+        app.cursor = 0;
+        app.selected = None;
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.toggle_expand_or_read(&rest);
+
+        assert_eq!(app.status, "thread collapsed");
     }
 
     #[test]
@@ -1640,9 +1910,12 @@ mod tests {
 
         let collapsed = app.toggle_thread("C1", "1.000001", Vec::new());
         assert!(!collapsed);
+        // Recollapsing brings back the `ThreadMarker` *and* now also the reply's own activity
+        // row (spec §6) — the reply is no longer nested, but it doesn't vanish either.
         let rows = app.feed_rows();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 1, expanded: false });
+        assert_eq!(rows[2].text, "\u{21b3} @dan replied: reply one");
     }
 
     #[test]
