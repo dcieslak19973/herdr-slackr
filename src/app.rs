@@ -999,7 +999,7 @@ impl App {
         let root_ts = self.thread_root_ts(&id.0, &id.1);
         match crate::rest::replies(rest, &id.0, &root_ts, None) {
             Ok(msgs) => self.apply_fetched_replies(msgs),
-            Err(err) => self.status = format!("replies failed: {err:?}"),
+            Err(err) => self.status = format!("thread refresh failed: {err:?}"),
         }
         self.resync_cursor();
     }
@@ -2657,7 +2657,7 @@ mod tests {
         // silently no-op) and must never touch `App::expanded` — the Threads view has nothing
         // for that Timeline-only flag to mean.
         app.toggle_expand_or_read(&rest);
-        assert!(app.status.contains("replies failed"), "{}", app.status);
+        assert!(app.status.contains("thread refresh failed"), "{}", app.status);
         assert!(
             app.expanded.is_empty(),
             "refresh_thread must not flip the Timeline's expanded set"
