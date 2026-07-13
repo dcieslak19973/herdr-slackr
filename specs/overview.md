@@ -23,7 +23,7 @@ Two tabs:
 | tab        | shows                                                                          |
 | ---------- | -------------------------------------------------------------------------------|
 | `Feed`     | one chronological stream across every subscribed conversation                  |
-| `Mentions` | only what triggers attention — `@you`, any DM/MPIM, keyword hits — newest first |
+| `Mentions` | only what triggers attention — `@you`, any DM/MPIM, keyword hits — chronological, newest at the bottom (`pane.md` P5) |
 
 ## Scope
 
