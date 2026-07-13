@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::app::{App, Tab};
 use crate::rest::Rest;
@@ -164,7 +164,14 @@ fn event_loop(
             last_unread = unread;
         }
 
-        terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(app)))?;
+        terminal.draw(|f| {
+            // Threaded into `App` once per draw (rather than measured only on a page-move key)
+            // so `page_move`'s caller below always has the pane's current on-screen height,
+            // including right after a terminal resize — see `App::set_viewport_rows`'s doc and
+            // `ui::body_rows` for the same chrome-row math `render_ready`'s layout uses.
+            app.set_viewport_rows(ui::body_rows(f.area().height));
+            ui::render(f, &palette, &PaneState::Ready(app));
+        })?;
 
         if event::poll(TICK)?
             && let Event::Key(k) = event::read()?
@@ -181,6 +188,16 @@ fn event_loop(
                 }
                 KeyCode::Char('j') | KeyCode::Down => app.move_cursor(1),
                 KeyCode::Char('k') | KeyCode::Up => app.move_cursor(-1),
+                KeyCode::Char('G') | KeyCode::End => app.jump_newest(),
+                KeyCode::Char('g') | KeyCode::Home => app.jump_first(),
+                KeyCode::PageDown => app.page_move(app.viewport_rows() as isize),
+                KeyCode::PageUp => app.page_move(-(app.viewport_rows() as isize)),
+                KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.page_move((app.viewport_rows() / 2) as isize);
+                }
+                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.page_move(-((app.viewport_rows() / 2) as isize));
+                }
                 KeyCode::Enter => app.toggle_expand_or_read(rest),
                 KeyCode::Char('t') => app.toggle_view(),
                 KeyCode::Char('o') => {

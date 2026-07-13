@@ -180,6 +180,19 @@ pub struct App {
     /// adjustments; the `now` it's compared against is injected as a parameter to
     /// `poll_tick_at` so the gating logic is unit-tested without a real sleep.
     cooldown_until: Option<Instant>,
+    /// Count of arrivals since the cursor last left the active tab's bottom row (spec §3): an
+    /// `apply`/`poll_tick` arrival while the cursor was already at the bottom follows it
+    /// (`snap_cursor_to_last_row`) and never touches this; one while scrolled up increments it
+    /// instead. Cleared by `maybe_clear_pending_new` the moment the cursor reaches the bottom
+    /// again, by any means (`j`/`move_cursor`, `g`/`jump_first`, `G`/`jump_newest`, or a follow
+    /// snap). Exposed read-only via `pending_new`.
+    pending_new: usize,
+    /// Rows available to the active tab's body viewport, set by Task 7's event loop once per
+    /// draw (`set_viewport_rows`) from the terminal's known frame height, and read back by
+    /// `page_move`'s caller to size a full/half page. Defaults to a small nonzero value so a
+    /// page-move issued before the first draw (or in a headless test) still moves rather than
+    /// no-oping on `0`.
+    viewport_rows: usize,
 }
 
 /// Ticks poll at most this many conversations, round-robin, per call — request count is what
@@ -246,6 +259,8 @@ impl App {
             poll_cursor: 0,
             poll_thread_cursor: 0,
             cooldown_until: None,
+            pending_new: 0,
+            viewport_rows: 20,
         };
 
         for conv in app.conversations.clone() {
@@ -293,6 +308,8 @@ impl App {
             poll_cursor: 0,
             poll_thread_cursor: 0,
             cooldown_until: None,
+            pending_new: 0,
+            viewport_rows: 20,
         }
     }
 
@@ -312,11 +329,15 @@ impl App {
     /// — it is recomputed on demand by `mention_rows`/`unread_mentions` from the raw message,
     /// so a later config change (e.g. a new keyword) would not require replaying history.
     pub fn apply(&mut self, ev: SocketEvent) {
-        // Captured before the event lands: if the Feed tab's cursor is already sitting on the
+        // Captured before the event lands: if the active tab's cursor is already sitting on the
         // last row (the common at-the-bottom chat-pane state — see `build`/`snap_cursor_to_last_row`),
         // a new arrival below it should not leave the cursor stranded above the new bottom; it
-        // should keep following, exactly like a chat client scrolled to "now".
-        let follow_bottom = self.tab == Tab::Feed && self.is_cursor_at_last_row();
+        // should keep following, exactly like a chat client scrolled to "now". Ordering is now
+        // unified newest-at-bottom everywhere (spec §1), so this applies to every tab/view, not
+        // just the Feed tab.
+        let follow_bottom = self.is_cursor_at_last_row();
+        let had_rows_before = !self.current_ids().is_empty();
+        let arrival_before = self.arrival_seq;
         match ev {
             SocketEvent::Connected => {
                 self.polling = false;
@@ -335,9 +356,31 @@ impl App {
             SocketEvent::Changed(msg) => self.upsert_edit(msg),
             SocketEvent::Deleted { conv, ts } => self.remove(&conv, &ts),
         }
+        self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
+    }
+
+    /// Shared tail of `apply`/`poll_tick_at` (spec §3-§4): resync the cursor's identity, then
+    /// either keep following the bottom (cursor was already there when the arrival landed — the
+    /// new-arrivals counter stays untouched, since `snap_cursor_to_last_row` clears it via
+    /// `maybe_clear_pending_new`) or, if the cursor was scrolled up in a tab that already had
+    /// rows and `arrival_before` shows the message store actually grew, count the arrival.
+    /// `had_rows_before` is what keeps the very first-ever arrival into an empty tab (where
+    /// `follow_bottom` is trivially `false` — there is no "last row" yet to be sitting on) from
+    /// being miscounted as "arrived while scrolled up": there is no bottom to have scrolled away
+    /// from yet either. `arrival_before` (rather than "did this event insert a row") is what lets
+    /// one call cover every event kind — `Connected`/`Down`/`Deleted` never bump `arrival_seq`,
+    /// so they never falsely increment.
+    fn finish_after_arrivals(
+        &mut self,
+        follow_bottom: bool,
+        had_rows_before: bool,
+        arrival_before: u64,
+    ) {
         self.resync_cursor();
         if follow_bottom {
             self.snap_cursor_to_last_row();
+        } else if had_rows_before && self.arrival_seq > arrival_before {
+            self.pending_new += 1;
         }
     }
 
@@ -357,6 +400,64 @@ impl App {
             self.cursor = last;
             self.selected.clone_from(&ids[last]);
         }
+        self.maybe_clear_pending_new();
+    }
+
+    /// Clear the new-arrivals counter once the cursor has reached the active tab's last row, by
+    /// any means (spec §3: "reaching the bottom, any means, clears it") — called from every
+    /// cursor-moving method that can land there: `move_cursor` (so `j`/`Down`/`PageDown`/
+    /// `ctrl-d` all count), `jump_first` (the degenerate single-row case), and
+    /// `snap_cursor_to_last_row` (so both `jump_newest`/`G`/`End` and the follow-bottom snap in
+    /// `finish_after_arrivals` count).
+    fn maybe_clear_pending_new(&mut self) {
+        if self.is_cursor_at_last_row() {
+            self.pending_new = 0;
+        }
+    }
+
+    /// Count of arrivals since the cursor last left the active tab's bottom row (spec §3); `0`
+    /// when the cursor is following the bottom or nothing has arrived since it last was there.
+    /// The bottom-edge `↓ n new` overlay (Task 7's `ui.rs`) shows only while this is nonzero.
+    pub fn pending_new(&self) -> usize {
+        self.pending_new
+    }
+
+    /// Set the row count Task 7's event loop measured for the active tab's body viewport this
+    /// draw (the body area's height — see `ui::render_body`), so `page_move`'s caller can size a
+    /// full/half page off the pane's actual on-screen height rather than a hardcoded guess.
+    /// Called once per frame; harmless to call with the same value repeatedly.
+    pub fn set_viewport_rows(&mut self, rows: usize) {
+        self.viewport_rows = rows;
+    }
+
+    /// The last-measured viewport row count (see `set_viewport_rows`), for a caller that needs
+    /// to compute `page_move`'s `rows` argument (e.g. `±viewport_rows` for PageDown/PageUp,
+    /// `±viewport_rows / 2` for ctrl-d/ctrl-u).
+    pub fn viewport_rows(&self) -> usize {
+        self.viewport_rows
+    }
+
+    /// Move the cursor+selection to the active tab's last row (spec §2: `G`/`End`).
+    pub fn jump_newest(&mut self) {
+        self.snap_cursor_to_last_row();
+    }
+
+    /// Move the cursor+selection to the active tab's first row (spec §2: `g`/`Home`).
+    pub fn jump_first(&mut self) {
+        let ids = self.current_ids();
+        if !ids.is_empty() {
+            self.cursor = 0;
+            self.selected.clone_from(&ids[0]);
+        }
+        self.maybe_clear_pending_new();
+    }
+
+    /// Move the cursor by a page-sized `rows` delta (spec §2: PageDown/PageUp `±viewport_rows`,
+    /// ctrl-d/ctrl-u `±viewport_rows / 2`, both computed by the caller from `viewport_rows()`),
+    /// reusing `move_cursor`'s clamping and identity tracking — a page move is just a bigger
+    /// `move_cursor`, not a different kind of motion.
+    pub fn page_move(&mut self, rows: isize) {
+        self.move_cursor(rows);
     }
 
     /// Fallback mode: incrementally re-pull each polled conversation's messages newer than the
@@ -400,6 +501,10 @@ impl App {
         }
         self.cooldown_until = None;
 
+        let follow_bottom = self.is_cursor_at_last_row();
+        let had_rows_before = !self.current_ids().is_empty();
+        let arrival_before = self.arrival_seq;
+
         let active = self.active_threads();
         let thread_slots = thread_slot_count(active.len());
         let conv_slots = POLL_BATCH - thread_slots;
@@ -408,7 +513,7 @@ impl App {
         if !rate_limited {
             self.poll_conversations(rest, conv_slots, now);
         }
-        self.resync_cursor();
+        self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
     }
 
     /// The active-thread half of `poll_tick_at`'s split budget: round-robin `thread_slots` of
@@ -552,6 +657,7 @@ impl App {
         let new_pos = new_pos as usize;
         self.cursor = new_pos;
         self.selected.clone_from(&ids[new_pos]);
+        self.maybe_clear_pending_new();
     }
 
     /// The active tab's current row identities (each paired with its `SelKind`), in row order
@@ -746,8 +852,9 @@ impl App {
     /// order, always shown here regardless of the Timeline's per-thread `expanded` flag (spec:
     /// "always expanded in this view" — see `refresh_thread`'s doc for why that flag plays no
     /// role here at all). Threads are ordered by latest activity — the newest locally-known
-    /// reply's `ts`, or the root's own `ts` when no reply is known yet — descending, so a thread
-    /// that just got a new reply jumps back to the top even if its root is old. Non-threaded
+    /// reply's `ts`, or the root's own `ts` when no reply is known yet — ascending (spec §1: most
+    /// recently active thread last, unified with every view's newest-at-the-bottom direction), so
+    /// a thread that just got a new reply jumps back to the bottom even if its root is old. Non-threaded
     /// messages are excluded entirely, unlike the Timeline (which shows every message). Root and
     /// reply rows both render as plain `RowKind::Message` — a reply's text gets the same "↳ "
     /// nesting prefix the Timeline's orphaned-reply/expanded-thread rows use — so they share
@@ -824,7 +931,7 @@ impl App {
             threads.push(Thread { activity, conv, root_ts, root_msg: None, replies });
         }
 
-        threads.sort_by(|a, b| b.activity.cmp(&a.activity)); // newest activity first
+        threads.sort_by(|a, b| a.activity.cmp(&b.activity)); // oldest activity first, newest last
 
         let mut rows: Vec<IdRow> = Vec::new();
         for thread in threads {
@@ -855,8 +962,9 @@ impl App {
         rows
     }
 
-    /// The Mentions tab: every message that triggers attention, newest first, each carrying
-    /// its read/unread state.
+    /// The Mentions tab: every message that triggers attention, oldest first / newest at the
+    /// bottom (spec §1, unified with the Feed tab's direction), each carrying its read/unread
+    /// state.
     pub fn mention_rows(&self) -> Vec<Row> {
         self.mention_rows_with_ids().into_iter().map(|(_, row)| row).collect()
     }
@@ -866,7 +974,7 @@ impl App {
     fn mention_rows_with_ids(&self) -> Vec<((String, String), Row)> {
         let mut items: Vec<&Stored> =
             self.messages.values().filter(|s| self.is_mention_stored(s)).collect();
-        items.sort_by(|a, b| ts_cmp(&b.msg.ts, &a.msg.ts)); // newest first
+        items.sort_by(|a, b| ts_cmp(&a.msg.ts, &b.msg.ts)); // oldest first, newest at the bottom (spec §1)
         items
             .into_iter()
             .map(|s| {
@@ -1402,6 +1510,8 @@ mod tests {
             poll_cursor: 0,
             poll_thread_cursor: 0,
             cooldown_until: None,
+            pending_new: 0,
+            viewport_rows: 20,
         }
     }
 
@@ -1616,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn mention_rows_are_newest_first() {
+    fn mention_rows_are_oldest_first_newest_at_the_bottom() {
         let mut app = empty_app();
         app.conv_kinds.insert("D1".to_string(), ConvKind::Im);
         app.apply(SocketEvent::Message(msg("D1", "1.0", None, "U1", "older dm")));
@@ -1624,8 +1734,8 @@ mod tests {
 
         let rows = app.mention_rows();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].text, "newer dm");
-        assert_eq!(rows[1].text, "older dm");
+        assert_eq!(rows[0].text, "older dm");
+        assert_eq!(rows[1].text, "newer dm");
     }
 
     #[test]
@@ -1773,18 +1883,18 @@ mod tests {
         app.tab = Tab::Mentions;
         app.touch();
 
-        app.move_cursor(1); // newest-first: [X(10), Y(5)] -> index 1 selects Y
-        assert_eq!(app.mention_rows()[app.cursor].text, "row Y");
+        app.move_cursor(1); // oldest-first: [Y(5), X(10)] -> index 1 selects X
+        assert_eq!(app.mention_rows()[app.cursor].text, "row X");
 
-        // A message between X and Y arrives, shifting Y from index 1 to index 2.
+        // A message between Y and X arrives, shifting X from index 1 to index 2.
         app.apply(SocketEvent::Message(msg("D1", "7.0", None, "U1", "row Z")));
         assert_eq!(app.cursor, 2);
-        assert_eq!(app.mention_rows()[app.cursor].text, "row Y");
+        assert_eq!(app.mention_rows()[app.cursor].text, "row X");
 
         app.toggle_read();
         assert!(
-            app.read_mentions.contains(&("D1".to_string(), "5.0".to_string())),
-            "the read toggle must land on row Y (the selected identity)"
+            app.read_mentions.contains(&("D1".to_string(), "10.0".to_string())),
+            "the read toggle must land on row X (the selected identity)"
         );
         assert!(
             !app.read_mentions.contains(&("D1".to_string(), "7.0".to_string())),
@@ -2517,20 +2627,20 @@ mod tests {
     }
 
     #[test]
-    fn thread_rows_orders_threads_by_latest_activity_descending() {
+    fn thread_rows_orders_threads_by_latest_activity_ascending_newest_last() {
         let mut app = empty_app();
         // Thread A's root is newer than thread B's, but B's latest reply is newer still — B
-        // must sort first.
+        // must sort last (spec §1: newest activity at the bottom).
         app.apply(SocketEvent::Message(msg("C1", "10.0", None, "U1", "root A")));
         app.apply(SocketEvent::Message(msg("C1", "10.1", Some("10.0"), "U1", "reply A1")));
         app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "root B")));
         app.apply(SocketEvent::Message(msg("C1", "50.0", Some("5.0"), "U1", "reply B1")));
 
         let rows = app.thread_rows();
-        assert_eq!(rows[0].text, "root B", "B's latest reply (50.0) beats A's (10.1)");
-        assert_eq!(rows[1].text, "\u{21b3} reply B1");
-        assert_eq!(rows[2].text, "root A");
-        assert_eq!(rows[3].text, "\u{21b3} reply A1");
+        assert_eq!(rows[0].text, "root A", "A's latest reply (10.1) beats B's (50.0) for last");
+        assert_eq!(rows[1].text, "\u{21b3} reply A1");
+        assert_eq!(rows[2].text, "root B");
+        assert_eq!(rows[3].text, "\u{21b3} reply B1");
     }
 
     #[test]
@@ -2544,8 +2654,8 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "2.1", Some("2.0"), "U1", "reply")));
 
         let rows = app.thread_rows();
-        assert_eq!(rows[0].text, "newer root");
-        assert_eq!(rows[2].text, "old root, no replies fetched yet");
+        assert_eq!(rows[0].text, "old root, no replies fetched yet");
+        assert_eq!(rows[1].text, "newer root");
     }
 
     // ---- thread_rows: orphaned replies (root not locally known) get a synthetic thread --------
@@ -2577,13 +2687,14 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "root A")));
         app.apply(SocketEvent::Message(msg("C1", "5.1", Some("5.0"), "U1", "reply A1")));
         // The orphaned reply's ts (50.0) is newer than thread A's activity (5.1) — its synthetic
-        // thread must sort first.
+        // thread must sort last (spec §1: newest activity at the bottom).
         app.apply(SocketEvent::Message(msg("C1", "50.0", Some("40.0"), "U1", "orphaned reply")));
 
         let rows = app.thread_rows();
-        assert_eq!(rows[0].text, "(thread — root not loaded)");
-        assert_eq!(rows[1].text, "\u{21b3} orphaned reply");
-        assert_eq!(rows[2].text, "root A");
+        assert_eq!(rows[0].text, "root A");
+        assert_eq!(rows[1].text, "\u{21b3} reply A1");
+        assert_eq!(rows[2].text, "(thread — root not loaded)");
+        assert_eq!(rows[3].text, "\u{21b3} orphaned reply");
     }
 
     #[test]
@@ -2685,5 +2796,155 @@ mod tests {
 
         let rows = app.thread_rows();
         assert!(rows.iter().any(|r| r.text == "\u{21b3} fetched reply"));
+    }
+
+    // ---- jump_newest / jump_first (Task 1, spec §2) --------------------------------------------
+
+    #[test]
+    fn jump_newest_moves_the_cursor_to_the_last_row() {
+        let mut app = empty_app();
+        for ts in ["1.0", "2.0", "3.0"] {
+            app.apply(SocketEvent::Message(msg("C1", ts, None, "U1", "row")));
+        }
+        app.touch(); // keep the unread divider out of the row count for this test's arithmetic
+        app.jump_first();
+        assert_eq!(app.cursor, 0);
+
+        app.jump_newest();
+        assert_eq!(app.cursor, 2, "must land on the last row");
+        assert_eq!(app.selected, Some((("C1".to_string(), "3.0".to_string()), SelKind::Message)));
+    }
+
+    #[test]
+    fn jump_first_moves_the_cursor_to_the_first_row() {
+        let mut app = empty_app();
+        for ts in ["1.0", "2.0", "3.0"] {
+            app.apply(SocketEvent::Message(msg("C1", ts, None, "U1", "row")));
+        }
+        app.touch();
+        app.jump_newest();
+        app.jump_first();
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.selected, Some((("C1".to_string(), "1.0".to_string()), SelKind::Message)));
+    }
+
+    #[test]
+    fn jump_newest_and_jump_first_no_op_on_an_empty_row_list() {
+        let mut app = empty_app();
+        app.jump_newest();
+        assert_eq!(app.cursor, 0);
+        app.jump_first();
+        assert_eq!(app.cursor, 0);
+    }
+
+    // ---- page_move: reuses move_cursor's clamping (Task 1, spec §2) ----------------------------
+
+    #[test]
+    fn page_move_clamps_at_the_bounds_like_move_cursor() {
+        let mut app = empty_app();
+        for ts in ["1.0", "2.0", "3.0"] {
+            app.apply(SocketEvent::Message(msg("C1", ts, None, "U1", "row")));
+        }
+        app.touch();
+        app.page_move(-10); // clamps to 0 rather than panicking/underflowing
+        assert_eq!(app.cursor, 0);
+        app.page_move(2);
+        assert_eq!(app.cursor, 2);
+        app.page_move(10); // clamps to the last row
+        assert_eq!(app.cursor, 2);
+    }
+
+    // ---- viewport_rows: set/get round-trip (Task 1, spec §2) ------------------------------------
+
+    #[test]
+    fn set_viewport_rows_round_trips() {
+        let mut app = empty_app();
+        app.set_viewport_rows(15);
+        assert_eq!(app.viewport_rows(), 15);
+    }
+
+    // ---- new-arrivals indicator: pure transitions (Task 1, spec §3-§4) -------------------------
+
+    #[test]
+    fn pending_new_is_zero_before_anything_arrives() {
+        let app = empty_app();
+        assert_eq!(app.pending_new(), 0);
+    }
+
+    #[test]
+    fn an_arrival_while_the_cursor_is_at_the_bottom_follows_and_does_not_increment() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "first")));
+        app.touch(); // keep the unread divider out of the way before the arrival under test
+        assert!(app.is_cursor_at_last_row(), "the only row is trivially the last row");
+
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "second")));
+
+        assert_eq!(app.pending_new(), 0, "following the bottom must not count the arrival");
+        // Looked up by content (not a raw index) since this arrival is itself unread and so
+        // shifts the divider back in; `feed_rows()[app.cursor]` stays correct regardless.
+        assert_eq!(app.feed_rows()[app.cursor].text, "second", "cursor must follow to the bottom");
+    }
+
+    #[test]
+    fn an_arrival_while_scrolled_up_increments_pending_new_without_moving_the_cursor() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "first")));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "second")));
+        app.touch(); // keep the divider out of the way before scrolling up
+        // Establish the at-the-bottom baseline explicitly (as `build` does after backfill):
+        // without it, the cursor's untouched default position isn't necessarily "the bottom",
+        // so `jump_first` below wouldn't actually be leaving a followed bottom behind.
+        app.jump_newest();
+        app.jump_first(); // scroll away from the bottom
+        assert_eq!(app.feed_rows()[app.cursor].text, "first");
+
+        app.apply(SocketEvent::Message(msg("C1", "3.0", None, "U1", "third")));
+
+        assert_eq!(app.pending_new(), 1, "an arrival while scrolled up must count");
+        assert_eq!(app.feed_rows()[app.cursor].text, "first", "the cursor must not move");
+
+        app.apply(SocketEvent::Message(msg("C1", "4.0", None, "U1", "fourth")));
+        assert_eq!(app.pending_new(), 2, "a second arrival while still scrolled up accumulates");
+        assert_eq!(app.feed_rows()[app.cursor].text, "first");
+    }
+
+    #[test]
+    fn reaching_the_bottom_by_any_means_clears_pending_new() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "first")));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "second")));
+        app.touch();
+        app.jump_newest(); // establish the at-the-bottom baseline explicitly, as `build` does
+        app.jump_first();
+        app.apply(SocketEvent::Message(msg("C1", "3.0", None, "U1", "third")));
+        app.touch();
+        assert_eq!(app.pending_new(), 1);
+
+        app.jump_newest(); // any means: G/End
+        assert_eq!(app.pending_new(), 0, "jump_newest must clear the counter");
+
+        app.jump_first();
+        app.apply(SocketEvent::Message(msg("C1", "4.0", None, "U1", "fourth")));
+        app.touch();
+        assert_eq!(app.pending_new(), 1);
+        app.move_cursor(100); // any means: j/Down walked all the way to the bottom
+        assert_eq!(app.pending_new(), 0, "move_cursor landing on the last row must clear it");
+    }
+
+    #[test]
+    fn a_poll_arrival_while_scrolled_up_also_increments_pending_new() {
+        let mut app = app_with_conversations(1);
+        app.apply(SocketEvent::Message(msg("C0", "1.0", None, "U1", "first")));
+        app.touch();
+        app.jump_first();
+        assert_eq!(app.cursor, 0);
+
+        // precancelled_rest fails every call, so no message actually arrives via this poll —
+        // this only proves the tick doesn't spuriously increment when nothing lands.
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now());
+        assert_eq!(app.pending_new(), 0, "a failed poll must not fabricate an arrival");
     }
 }

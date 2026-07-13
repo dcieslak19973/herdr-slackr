@@ -322,3 +322,61 @@ fn mentions_tab_status_has_no_t_hint() {
     let out = render_ready(&app);
     assert!(!out.to_lowercase().contains("toggle view"), "{out}");
 }
+
+// ---- nav keys + new-arrivals indicator (Task 1, spec §2-§4) --------------------------------
+
+#[test]
+fn status_hints_the_top_bottom_jump_keys_on_every_tab() {
+    let mut app = App::empty("SELF");
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("g/g: top/bottom"), "{out}");
+
+    app.set_tab(Tab::Mentions);
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("g/g: top/bottom"), "{out}");
+}
+
+#[test]
+fn jump_newest_keeps_the_last_row_visible_in_a_short_viewport() {
+    let mut app = tall_feed(30);
+    app.jump_first(); // start scrolled away from the bottom
+    app.jump_newest();
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("row 29"), "G/End must land on the last row:\n{out}");
+    assert!(!out.contains("row 0"), "the first row scrolls out of view:\n{out}");
+}
+
+#[test]
+fn jump_first_keeps_the_first_row_visible_in_a_short_viewport() {
+    let mut app = tall_feed(30);
+    app.jump_newest(); // start at the bottom
+    app.jump_first();
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("row 0"), "g/Home must land on the first row:\n{out}");
+    assert!(!out.contains("row 29"), "the last row scrolls out of view:\n{out}");
+}
+
+#[test]
+fn the_new_arrivals_indicator_is_hidden_with_nothing_pending() {
+    let mut app = tall_feed(30);
+    // `tall_feed` builds via plain `apply` calls, whose cursor defaults to row 0 (see the
+    // top-viewport test above) rather than `build`'s explicit at-the-bottom snap — establish
+    // that baseline explicitly here so this test starts from the common "caught up" state.
+    app.jump_newest();
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(!out.contains("new"), "no overlay expected when pending_new is 0:\n{out}");
+}
+
+#[test]
+fn the_new_arrivals_indicator_shows_the_pending_count_once_scrolled_up() {
+    let mut app = tall_feed(30);
+    app.jump_newest(); // establish the at-the-bottom baseline (see the test above)
+    app.jump_first(); // scroll away from the bottom
+
+    app.apply(SocketEvent::Message(msg("C1", "5000.0", None, "U1", "an arrival off-screen")));
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("\u{2193} 1 new"), "expected the indicator with count 1:\n{out}");
+}
