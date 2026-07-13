@@ -11,6 +11,7 @@ use herdr_slackr::ui::{self, PaneState};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 
 fn dump(buffer: &Buffer) -> String {
     let area = buffer.area;
@@ -48,12 +49,40 @@ fn msg(conv: &str, ts: &str, thread_ts: Option<&str>, author: &str, text: &str) 
         author: author.into(),
         text: text.into(),
         edited: false,
+        reply_count: None,
     }
 }
 
 fn rest(cancelled: &AtomicBool) -> Rest<'_> {
     cancelled.store(true, std::sync::atomic::Ordering::Release);
     Rest { user_token: "xoxp-test", cancelled }
+}
+
+/// The `(x, y)` of `text`'s first character in `buffer`, scanning row by row — used so a style
+/// assertion targets the actual on-screen position of a rendered segment rather than a
+/// hand-computed offset that would silently drift out of sync with `row_line`'s layout.
+fn find_text_position(buffer: &Buffer, text: &str) -> Option<(u16, u16)> {
+    let area = buffer.area;
+    let wanted: Vec<char> = text.chars().collect();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            if x + wanted.len() as u16 > area.width {
+                continue;
+            }
+            let matches = wanted.iter().enumerate().all(|(i, c)| {
+                buffer.cell((x + i as u16, y)).is_some_and(|cell| cell.symbol() == c.to_string())
+            });
+            if matches {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn fg_at(buffer: &Buffer, text: &str) -> Color {
+    let (x, y) = find_text_position(buffer, text).unwrap_or_else(|| panic!("{text:?} not found"));
+    buffer.cell((x, y)).unwrap().fg
 }
 
 #[test]
@@ -180,4 +209,116 @@ fn degraded_screen_names_the_tokens_and_the_tokens_toml_path() {
     let out = render_blocked(&err.to_string());
     assert!(out.contains("SLACK_APP_TOKEN"), "{out}");
     assert!(out.contains("tokens.toml"), "{out}");
+}
+
+// ---- row colors (spec §4): conv label blue-family, author green, time/markers muted -------
+
+#[test]
+fn feed_row_segments_render_in_their_spec_colors() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1752300000.000100", None, "U1", "deploy done")));
+    app.touch();
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(&app))).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    assert_eq!(fg_at(buffer, "#eng"), palette.lavender, "conv label is the blue-family accent");
+    assert_eq!(fg_at(buffer, "@dan"), palette.green, "author is green");
+    assert_eq!(fg_at(buffer, "06:00"), palette.overlay1, "time is the muted overlay tone");
+    assert_eq!(fg_at(buffer, "deploy done"), palette.text, "message text is the default fg");
+}
+
+#[test]
+fn thread_marker_text_renders_in_the_muted_overlay_tone() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
+    app.touch();
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(&app))).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    assert_eq!(fg_at(buffer, "\u{21b3} 2 replies"), palette.overlay1);
+}
+
+// ---- Threads view (spec §3) -----------------------------------------------------------------
+
+#[test]
+fn threads_view_shows_only_threads_with_replies_nested_beneath_their_root() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "not a thread")));
+    app.apply(SocketEvent::Message(Message {
+        reply_count: Some(1),
+        ..msg("C1", "2.0", None, "U1", "thread root")
+    }));
+    app.apply(SocketEvent::Message(msg("C1", "2.1", Some("2.0"), "U1", "a reply")));
+    app.touch();
+    app.toggle_view();
+
+    let out = render_ready(&app);
+    assert!(out.contains("thread root"), "{out}");
+    assert!(out.contains("a reply"), "{out}");
+    assert!(!out.contains("not a thread"), "non-threaded messages must be excluded:\n{out}");
+}
+
+#[test]
+fn tab_bar_names_the_active_feed_view_mode() {
+    let mut app = App::empty("SELF");
+    let out = render_ready(&app);
+    assert!(out.contains("1 Feed"), "{out}");
+
+    app.toggle_view();
+    let out = render_ready(&app);
+    assert!(out.contains("1 Threads"), "{out}");
+}
+
+#[test]
+fn t_key_toggle_flips_the_feed_view_and_the_timeline_survives_a_flip_back() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "a plain message")));
+    app.touch();
+
+    app.toggle_view();
+    let out = render_ready(&app);
+    assert!(
+        !out.contains("a plain message"),
+        "the Threads view excludes non-threaded messages:\n{out}"
+    );
+
+    app.toggle_view();
+    let out = render_ready(&app);
+    assert!(
+        out.contains("a plain message"),
+        "the Timeline is unchanged after flipping back:\n{out}"
+    );
+}
+
+// ---- status-line `t` hint on the Feed tab ----------------------------------------------------
+
+#[test]
+fn feed_tab_status_hints_the_t_toggle_key() {
+    let app = App::empty("SELF");
+    let out = render_ready(&app);
+    assert!(out.contains('t'), "{out}"); // loose smoke check before the exact-text assertion below
+    assert!(out.to_lowercase().contains("toggle view"), "{out}");
+}
+
+#[test]
+fn mentions_tab_status_has_no_t_hint() {
+    let mut app = App::empty("SELF");
+    app.set_tab(Tab::Mentions);
+    let out = render_ready(&app);
+    assert!(!out.to_lowercase().contains("toggle view"), "{out}");
 }

@@ -176,6 +176,37 @@ pane starts with the default palette and a one-line status notice naming the bad
 that matches your terminal's light or dark background; the pane keeps the terminal's own
 background.
 
+Every row is color-segmented by field, not one flat color, under whichever palette is active: the
+conversation label in the accent color, the author name in green, the time/thread markers in a
+muted tone, and the message text in the default foreground.
+
+## Threads view
+
+`t` toggles the Feed tab (only) between two projections of the same message store:
+
+- **Timeline** (default) — the chronological stream described above, threads collapsed under
+  their root with `↳ n replies`.
+- **Threads** — a digest of threads only. Every thread with at least one reply (Slack's own
+  `reply_count` metadata, or a locally-known reply, whichever is greater) gets one entry, ordered
+  by latest activity — the newest reply's time, or the root's own time if it has none yet —
+  newest first, so a thread that just got a reply jumps back to the top. The root and every
+  locally-known reply render nested beneath it, always expanded here — there is no
+  collapsed/expanded state in this view the way the Timeline has. Non-threaded messages (anything
+  that never got a reply) are excluded entirely.
+- **`Enter` in the Threads view** always (re)fetches the selected thread's replies over REST,
+  rather than the Timeline's expand/collapse toggle — there is no "collapsed" state here for a
+  toggle to mean.
+- **Orphaned threads self-heal.** A reply whose root was never backfilled or seen still shows up
+  here, as a synthetic entry headed `(thread — root not loaded)` instead of being dropped.
+  Selecting it and hitting `Enter` fetches the real root over REST like any other refresh; once
+  it arrives, the next redraw quietly replaces the placeholder with the real root row — no
+  separate action needed.
+- **Polling reply-refresh.** While the pane is in fallback polling mode, up to 2 of each tick's
+  8-request budget rotate round-robin over "active" threads (currently expanded in the Timeline,
+  or whose Slack-reported `reply_count` outpaces what's stored locally) to fetch just the newer
+  replies, within the same total per-tick budget described in [Rate limits](#rate-limits) — not
+  in addition to it. With no active threads, the full budget goes to conversations as before.
+
 ## Controls
 
 | Key           | Action                                                          |
@@ -183,7 +214,8 @@ background.
 | `1` `2`       | Switch tab — Feed / Mentions                                     |
 | `Tab`         | Switch tab (Feed ↔ Mentions)                                      |
 | `j` `k` · `↑` `↓` | Move the cursor                                              |
-| `Enter`       | Feed: expand/collapse the selected thread. Mentions: toggle read  |
+| `Enter`       | Feed timeline: expand/collapse the selected thread. Feed threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
+| `t`           | Feed tab only: toggle the Feed between the Timeline and the Threads-only view |
 | `o`           | Open the selected message's permalink in the browser             |
 | `r`           | Manual refresh (re-pull the last 50 messages of every conversation) |
 | `q`           | Quit the pane                                                     |

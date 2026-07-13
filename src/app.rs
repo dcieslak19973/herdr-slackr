@@ -33,6 +33,16 @@ pub enum Tab {
     Mentions,
 }
 
+/// Which projection of the Feed tab's rows is shown (spec §3): the plain chronological
+/// `feed_rows` timeline, or the threads-only digest (`thread_rows`). Only meaningful on
+/// `Tab::Feed` — `toggle_view` no-ops on `Tab::Mentions`, and the Mentions tab's own row list
+/// ignores this field entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedView {
+    Timeline,
+    Threads,
+}
+
 /// One renderable row, identical for both tabs so Task 7 has a single render path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -108,6 +118,8 @@ type IdRow = (Option<(String, String)>, Row);
 #[derive(Debug)]
 pub struct App {
     pub tab: Tab,
+    /// Which projection of the Feed tab is shown (see [`FeedView`]); irrelevant to `Tab::Mentions`.
+    pub view: FeedView,
     /// Index into `visible_rows()` of the active tab (`feed_rows()` for `Tab::Feed`,
     /// `mention_rows()` for `Tab::Mentions`). Positional, but kept in sync with `selected` by
     /// `resync_cursor` after every row-set change, so it stays pointed at the same identity
@@ -157,6 +169,11 @@ pub struct App {
     /// batch (see `next_batch`); persists across ticks so every conversation is eventually
     /// polled rather than only ever the first `POLL_BATCH`.
     poll_cursor: usize,
+    /// Round-robin position into `active_threads()`'s list for `poll_tick_at`'s thread-refresh
+    /// slots (see `thread_slot_count`); persists across ticks for the same reason `poll_cursor`
+    /// does, independently of it — the active-thread list's length has nothing to do with
+    /// `conversations`'s, so the two cursors would otherwise race each other's wraparound.
+    poll_thread_cursor: usize,
     /// Set from a `RateLimited(secs)` hit during `poll_tick`; while `Some` and unexpired, ticks
     /// are skipped entirely (not merely shortened) rather than hammering Slack again on
     /// schedule. `Instant`-based (not wall-clock) so it is monotonic and immune to clock
@@ -209,6 +226,7 @@ impl App {
 
         let mut app = App {
             tab: Tab::Feed,
+            view: FeedView::Timeline,
             cursor: 0,
             status: String::new(),
             polling: false,
@@ -226,6 +244,7 @@ impl App {
             divider_mark: 0,
             newest_ts: HashMap::new(),
             poll_cursor: 0,
+            poll_thread_cursor: 0,
             cooldown_until: None,
         };
 
@@ -254,6 +273,7 @@ impl App {
     pub fn empty(self_id: impl Into<String>) -> App {
         App {
             tab: Tab::Feed,
+            view: FeedView::Timeline,
             cursor: 0,
             status: String::new(),
             polling: false,
@@ -271,6 +291,7 @@ impl App {
             divider_mark: 0,
             newest_ts: HashMap::new(),
             poll_cursor: 0,
+            poll_thread_cursor: 0,
             cooldown_until: None,
         }
     }
@@ -347,16 +368,24 @@ impl App {
     /// (`cooldown_until`) hasn't yet passed — the status line keeps showing the notice from when
     /// the cooldown was set.
     ///
+    /// Up to [`thread_slot_count`] of the `POLL_BATCH` budget is spent first on a second
+    /// round-robin over [`App::active_threads`] — threads currently expanded, or whose root's
+    /// `reply_count` outpaces what's locally known — fetching each one's replies newer than the
+    /// thread's newest-known reply ts (spec §2). The remainder goes to conversations exactly as
+    /// before; when there are no active threads, the full `POLL_BATCH` goes to conversations, so
+    /// the reservation never wastes budget on an empty thread list.
+    ///
     /// Messages already known (same `(conv, ts)`) are deduplicated by `upsert_new` regardless
     /// (belt-and-suspenders against a re-widened `oldest` window), so a message that arrives via
     /// both a poll and the socket still appears exactly once.
     ///
     /// A `RestError::RateLimited` sets a rate-limit status, starts the cooldown, and stops the
-    /// rest of this tick's batch (Slack's own signal to back off now, not to keep hammering the
-    /// remaining conversations); any other error sets a one-line status naming the conversation
-    /// and moves on to the next one in the batch rather than crashing (spec: a per-conversation
-    /// poll failure must never take down the pane). See `poll_error_status` for the pure wording
-    /// decision.
+    /// rest of this tick — including skipping the conversation batch entirely if the limit hit
+    /// during the thread slots (Slack's own signal to back off now, not to keep hammering
+    /// anything else this tick); any other error sets a one-line status naming what failed and
+    /// moves on to the next item in its batch rather than crashing (spec: a per-conversation or
+    /// per-thread poll failure must never take down the pane). See `poll_error_status` for the
+    /// pure wording decision.
     pub fn poll_tick(&mut self, rest: &Rest) {
         self.poll_tick_at(rest, Instant::now());
     }
@@ -371,8 +400,60 @@ impl App {
         }
         self.cooldown_until = None;
 
+        let active = self.active_threads();
+        let thread_slots = thread_slot_count(active.len());
+        let conv_slots = POLL_BATCH - thread_slots;
+
+        let rate_limited = self.poll_active_threads(rest, &active, thread_slots, now);
+        if !rate_limited {
+            self.poll_conversations(rest, conv_slots, now);
+        }
+        self.resync_cursor();
+    }
+
+    /// The active-thread half of `poll_tick_at`'s split budget: round-robin `thread_slots` of
+    /// `active` via the dedicated `poll_thread_cursor`, fetching each thread's replies newer than
+    /// its newest-known reply ts (`newest_reply_ts`) and folding them in via `apply_fetched_replies`.
+    /// Returns whether a `RateLimited` hit occurred (and so the conversation batch this tick
+    /// should be skipped entirely, matching the single-batch behavior `poll_conversations` itself
+    /// applies) — the cooldown itself is set on `self` before returning, same as the
+    /// conversation path.
+    fn poll_active_threads(
+        &mut self,
+        rest: &Rest,
+        active: &[(String, String)],
+        thread_slots: usize,
+        now: Instant,
+    ) -> bool {
+        let (indices, next_cursor) =
+            next_batch(self.poll_thread_cursor, active.len(), thread_slots);
+        self.poll_thread_cursor = next_cursor;
+
+        for i in indices {
+            let (conv_id, root_ts) = active[i].clone();
+            let oldest = self.newest_reply_ts(&conv_id, &root_ts);
+            let label = format!("{conv_id} thread {root_ts}");
+            match crate::rest::replies(rest, &conv_id, &root_ts, oldest.as_deref()) {
+                Ok(msgs) => self.apply_fetched_replies(msgs),
+                Err(err @ RestError::RateLimited(secs)) => {
+                    self.status = poll_error_status(&label, &err);
+                    self.cooldown_until = Some(now + Duration::from_secs(secs));
+                    return true;
+                }
+                Err(err) => {
+                    self.status = poll_error_status(&label, &err);
+                }
+            }
+        }
+        false
+    }
+
+    /// The conversation half of `poll_tick_at`'s split budget: unchanged from before the split
+    /// except that its slot count is now `conv_slots` (`POLL_BATCH` minus whatever the thread
+    /// round-robin took) rather than the full `POLL_BATCH`.
+    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) {
         let n = self.conversations.len();
-        let (indices, next_cursor) = next_batch(self.poll_cursor, n, POLL_BATCH);
+        let (indices, next_cursor) = next_batch(self.poll_cursor, n, conv_slots);
         self.poll_cursor = next_cursor;
 
         for i in indices {
@@ -395,7 +476,63 @@ impl App {
                 }
             }
         }
-        self.resync_cursor();
+    }
+
+    /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
+    /// every root currently expanded inline (`expanded`), plus every root whose Slack-reported
+    /// `reply_count` exceeds the number of replies stored locally for it — i.e. backfill/polling
+    /// hasn't caught up to what Slack says the thread actually has. A root already covered by
+    /// `expanded` is not duplicated. Order is stable within one call (`expanded`'s arbitrary but
+    /// fixed hash order, then remaining count-gap roots in message-store order) — good enough for
+    /// `poll_thread_cursor`'s round-robin, which only needs a consistent order across ticks, not
+    /// any particular one.
+    fn active_threads(&self) -> Vec<(String, String)> {
+        let mut ids: Vec<(String, String)> = self.expanded.iter().cloned().collect();
+        for stored in self.messages.values() {
+            if stored.msg.thread_ts.is_some() {
+                continue; // only roots are candidates
+            }
+            let id = (stored.msg.conv.clone(), stored.msg.ts.clone());
+            if ids.contains(&id) {
+                continue;
+            }
+            let local = self.local_reply_count(&stored.msg.conv, &stored.msg.ts);
+            if stored.msg.reply_count.unwrap_or(0) as usize > local {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// How many replies to `root_ts` in `conv` are already stored locally.
+    fn local_reply_count(&self, conv: &str, root_ts: &str) -> usize {
+        self.messages
+            .values()
+            .filter(|s| s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts))
+            .count()
+    }
+
+    /// The newest `ts` among `root_ts`'s locally-known replies in `conv`, threaded into
+    /// `poll_active_threads`'s `replies(..., oldest)` call — `None` when no reply is known yet
+    /// locally, which fetches the whole thread (Slack's `oldest` is optional; omitting it is
+    /// exactly what a first-ever fetch of a backfilled-but-never-expanded thread wants).
+    fn newest_reply_ts(&self, conv: &str, root_ts: &str) -> Option<String> {
+        self.messages
+            .values()
+            .filter(|s| s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts))
+            .map(|s| s.msg.ts.clone())
+            .max_by(|a, b| ts_cmp(a, b))
+    }
+
+    /// Fold thread replies fetched by the polling refresh into the store via the normal
+    /// `upsert_new` path, so mention detection/dedup/arrival-ordering all follow exactly as they
+    /// do for any other newly-seen message (spec §2: "fetched replies run through the normal
+    /// upsert path, so thread mentions land in the Mentions tab"). Split out from
+    /// `poll_active_threads` so it is unit-tested without a real REST call.
+    fn apply_fetched_replies(&mut self, msgs: Vec<Message>) {
+        for msg in msgs {
+            self.upsert_new(msg);
+        }
     }
 
     /// Move the cursor by `delta` rows within the active tab's current row list, clamping to
@@ -418,11 +555,12 @@ impl App {
     }
 
     /// The active tab's current row identities (each paired with its `SelKind`), in row order
-    /// (`None` only ever appears for the Feed tab's synthetic `Divider` row).
+    /// (`None` only ever appears for the Feed tab's synthetic `Divider` row, which only the
+    /// Timeline projection ever produces).
     fn current_ids(&self) -> Vec<Option<((String, String), SelKind)>> {
         match self.tab {
             Tab::Feed => self
-                .feed_rows_with_ids()
+                .active_feed_rows_with_ids()
                 .into_iter()
                 .map(|(id, row)| id.map(|i| (i, sel_kind_of(&row))))
                 .collect(),
@@ -431,6 +569,19 @@ impl App {
                 .into_iter()
                 .map(|(id, _)| Some((id, SelKind::Mention)))
                 .collect(),
+        }
+    }
+
+    /// The Feed tab's current row list, dispatched by `view` (see [`FeedView`]): `feed_rows_with_ids`
+    /// for the Timeline, `thread_rows_with_ids` for the Threads digest. The single dispatch point
+    /// `current_ids`, `feed_target`, and `render_body` (via the public `feed_rows`/`thread_rows`
+    /// pair) all funnel through, so an action taken in the Threads view (Enter, permalink) always
+    /// resolves against the rows actually on screen rather than the Timeline's — see the module
+    /// doc's `SelKind` and `toggle_view`'s doc for why the two projections must never be conflated.
+    fn active_feed_rows_with_ids(&self) -> Vec<IdRow> {
+        match self.view {
+            FeedView::Timeline => self.feed_rows_with_ids(),
+            FeedView::Threads => self.thread_rows_with_ids(),
         }
     }
 
@@ -460,7 +611,7 @@ impl App {
     /// (covers direct `cursor` assignment without going through `move_cursor`, as the existing
     /// tests do).
     fn feed_target(&self) -> Option<((String, String), Row)> {
-        let rows = self.feed_rows_with_ids();
+        let rows = self.active_feed_rows_with_ids();
         if let Some((sel_id, sel_kind)) = &self.selected
             && let Some((_, row)) = rows
                 .iter()
@@ -528,7 +679,8 @@ impl App {
                     s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts.as_str())
                 })
                 .collect();
-            if replies.is_empty() {
+            let count = marker_count(stored.msg.reply_count, replies.len());
+            if count == 0 {
                 continue;
             }
             replies.sort_by(|a, b| ts_cmp(&a.msg.ts, &b.msg.ts));
@@ -555,8 +707,8 @@ impl App {
                         conv_label: self.conv_label(&conv),
                         author: String::new(),
                         time_hhmm: String::new(),
-                        text: format!("\u{21b3} {} replies", replies.len()),
-                        kind: RowKind::ThreadMarker { replies: replies.len(), expanded: false },
+                        text: format!("\u{21b3} {count} replies"),
+                        kind: RowKind::ThreadMarker { replies: count, expanded: false },
                     },
                 ));
             }
@@ -586,6 +738,121 @@ impl App {
             out.push((id, row));
         }
         out
+    }
+
+    /// The Threads view (spec §3): a digest of only threads. Each qualifying root — one whose
+    /// `marker_count` (metadata or locally-known replies, `max`'d as everywhere else) is nonzero
+    /// — is followed immediately by every locally-known reply nested beneath it in chronological
+    /// order, always shown here regardless of the Timeline's per-thread `expanded` flag (spec:
+    /// "always expanded in this view" — see `refresh_thread`'s doc for why that flag plays no
+    /// role here at all). Threads are ordered by latest activity — the newest locally-known
+    /// reply's `ts`, or the root's own `ts` when no reply is known yet — descending, so a thread
+    /// that just got a new reply jumps back to the top even if its root is old. Non-threaded
+    /// messages are excluded entirely, unlike the Timeline (which shows every message). Root and
+    /// reply rows both render as plain `RowKind::Message` — a reply's text gets the same "↳ "
+    /// nesting prefix the Timeline's orphaned-reply/expanded-thread rows use — so they share
+    /// `SelKind::Message` identity with their Timeline counterparts (see the module doc's
+    /// `SelKind`), letting a selection made in one view still resolve correctly if the row also
+    /// exists in the other.
+    ///
+    /// A reply whose root predates the backfill horizon (or was otherwise never seen) gets a
+    /// *synthetic* thread entry instead of being dropped — see the doc on the `Thread::root_msg`
+    /// field this method builds internally, and on the "(thread — root not loaded)" header text
+    /// below, for how that's rendered and how it self-heals once the real root is known.
+    pub fn thread_rows(&self) -> Vec<Row> {
+        self.thread_rows_with_ids().into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// As `thread_rows`, but each row is paired with the `(conv, ts)` a Threads-view action
+    /// (Enter/refresh, permalink) should act on.
+    fn thread_rows_with_ids(&self) -> Vec<IdRow> {
+        /// Either a real, locally-known root (`Some`) or a synthetic placeholder for a thread
+        /// whose root has never been seen (`None` — see `thread_rows`'s doc). The `(conv,
+        /// root_ts)` pair is carried alongside so the synthetic case has something to render and
+        /// key an id from even without a `Stored` root to borrow it from.
+        struct Thread<'a> {
+            activity: (u64, u32),
+            conv: String,
+            root_ts: String,
+            root_msg: Option<&'a Stored>,
+            replies: Vec<&'a Stored>,
+        }
+
+        let mut threads: Vec<Thread<'_>> = Vec::new();
+        // Every reply attached to a root this loop already knows about (whether or not that root
+        // clears `marker_count`) — used below to find orphaned replies, i.e. those whose
+        // `thread_ts` names a root outside this set entirely.
+        let mut seen_roots: HashSet<(&str, &str)> = HashSet::new();
+        for stored in self.messages.values() {
+            if stored.msg.thread_ts.is_some() {
+                continue; // only roots start a thread entry; replies are attached below.
+            }
+            seen_roots.insert((stored.msg.conv.as_str(), stored.msg.ts.as_str()));
+            let conv = stored.msg.conv.clone();
+            let root_ts = stored.msg.ts.clone();
+            let mut replies: Vec<&Stored> = self
+                .messages
+                .values()
+                .filter(|s| {
+                    s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts.as_str())
+                })
+                .collect();
+            let count = marker_count(stored.msg.reply_count, replies.len());
+            if count == 0 {
+                continue; // not a thread — excluded from this view entirely.
+            }
+            replies.sort_by_key(|r| ts_key(&r.msg.ts));
+            let activity = replies.last().map_or_else(|| ts_key(&root_ts), |r| ts_key(&r.msg.ts));
+            threads.push(Thread { activity, conv, root_ts, root_msg: Some(stored), replies });
+        }
+
+        // Orphaned replies: their root isn't locally known at all (unlike the roots skipped
+        // above via `count == 0`, which *are* known — just not thread-qualifying). Group them by
+        // `(conv, thread_ts)` into one synthetic thread entry each rather than dropping them, the
+        // way the Timeline's `feed_rows_with_ids` inlines them individually instead.
+        let mut orphans: BTreeMap<(String, String), Vec<&Stored>> = BTreeMap::new();
+        for stored in self.messages.values() {
+            if let Some(root_ts) = &stored.msg.thread_ts
+                && !seen_roots.contains(&(stored.msg.conv.as_str(), root_ts.as_str()))
+            {
+                orphans.entry((stored.msg.conv.clone(), root_ts.clone())).or_default().push(stored);
+            }
+        }
+        for ((conv, root_ts), mut replies) in orphans {
+            replies.sort_by_key(|r| ts_key(&r.msg.ts));
+            let activity = replies.last().map_or_else(|| ts_key(&root_ts), |r| ts_key(&r.msg.ts));
+            threads.push(Thread { activity, conv, root_ts, root_msg: None, replies });
+        }
+
+        threads.sort_by(|a, b| b.activity.cmp(&a.activity)); // newest activity first
+
+        let mut rows: Vec<IdRow> = Vec::new();
+        for thread in threads {
+            let id = Some((thread.conv.clone(), thread.root_ts.clone()));
+            let root_row = match thread.root_msg {
+                Some(root) => self.message_row(&root.msg),
+                // Synthetic header: same shape/`SelKind` as a real root row (`RowKind::Message`,
+                // via `message_row`'s own default), so selecting it and hitting Enter still
+                // routes through `refresh_thread` → `conversations.replies`, which returns the
+                // real root as the first message; the next `upsert_new` inserts it under this
+                // same key, and the very next projection naturally replaces this synthetic row
+                // with the real one — no explicit cleanup needed anywhere.
+                None => Row {
+                    conv_label: self.conv_label(&thread.conv),
+                    author: String::new(),
+                    time_hhmm: ts_to_hhmm(&thread.root_ts),
+                    text: "(thread — root not loaded)".to_string(),
+                    kind: RowKind::Message,
+                },
+            };
+            rows.push((id, root_row));
+            for reply in thread.replies {
+                let mut row = self.message_row(&reply.msg);
+                row.text = format!("\u{21b3} {}", row.text);
+                rows.push((Some((thread.conv.clone(), reply.msg.ts.clone())), row));
+            }
+        }
+        rows
     }
 
     /// The Mentions tab: every message that triggers attention, newest first, each carrying
@@ -638,12 +905,37 @@ impl App {
         self.resync_cursor();
     }
 
-    /// `Enter` semantics per tab: on the Feed tab, expand/collapse the selected thread
-    /// (fetching replies via REST on first expand); on the Mentions tab, toggle the selected
-    /// row's read state.
+    /// Flip the Feed tab between the Timeline and Threads projections (spec §3, the `t` key), a
+    /// no-op on any other tab — the toggle key is Feed-only. Resyncs selection into the new
+    /// projection exactly like `set_tab` does across tabs: `selected` is dropped rather than
+    /// trusted across the flip, because the two projections' row sets only partially overlap (a
+    /// Timeline-only collapsed `ThreadMarker` selection has no counterpart here, and a reply row
+    /// hidden by that same collapse has no source row in a still-collapsed Timeline), so
+    /// `resync_cursor`'s "keep the old identity if it still exists, else clamp" fallback is the
+    /// only sound behavior either way.
+    pub fn toggle_view(&mut self) {
+        if self.tab != Tab::Feed {
+            return;
+        }
+        self.view = match self.view {
+            FeedView::Timeline => FeedView::Threads,
+            FeedView::Threads => FeedView::Timeline,
+        };
+        self.selected = None;
+        self.resync_cursor();
+    }
+
+    /// `Enter` semantics per tab (and, on the Feed tab, per view): the Timeline expands/collapses
+    /// the selected thread (fetching replies via REST on first expand); the Threads view instead
+    /// always (re)fetches the selected thread's replies (see `refresh_thread`'s doc for why a
+    /// collapse-toggle semantics doesn't apply there); the Mentions tab toggles the selected row's
+    /// read state.
     pub fn toggle_expand_or_read(&mut self, rest: &Rest) {
         match self.tab {
-            Tab::Feed => self.toggle_expand(rest),
+            Tab::Feed => match self.view {
+                FeedView::Timeline => self.toggle_expand(rest),
+                FeedView::Threads => self.refresh_thread(rest),
+            },
             Tab::Mentions => self.toggle_read(),
         }
     }
@@ -678,7 +970,7 @@ impl App {
         }
         let will_expand = !self.expanded.contains(&(conv.clone(), root_ts.clone()));
         let fetched = if will_expand {
-            match crate::rest::replies(rest, &conv, &root_ts) {
+            match crate::rest::replies(rest, &conv, &root_ts, None) {
                 Ok(msgs) => msgs,
                 Err(err) => {
                     self.status = format!("replies failed: {err:?}");
@@ -689,6 +981,39 @@ impl App {
             Vec::new()
         };
         self.toggle_thread(&conv, &root_ts, fetched);
+    }
+
+    /// `Enter` in the Threads view (spec §3: "Enter on a root (re)fetches its replies"): fetch
+    /// the selected row's thread via REST and merge the result in via the normal upsert path,
+    /// same as `toggle_expand`'s fetch — but, unlike `toggle_expand`, this never consults or
+    /// flips `App::expanded`. The Threads view always shows every thread's locally-known replies
+    /// nested beneath its root regardless of that flag (see `thread_rows_with_ids`'s doc), so
+    /// there is no collapsed/expanded state here for a toggle to mean — a plain unconditional
+    /// refresh is the simplest semantics that stays consistent whether the selected row is
+    /// still-collapsed-in-the-Timeline, already expanded there, or a nested reply row (in which
+    /// case `thread_root_ts` walks up to the thread it belongs to).
+    fn refresh_thread(&mut self, rest: &Rest) {
+        let Some((id, _)) = self.feed_target() else {
+            return;
+        };
+        let root_ts = self.thread_root_ts(&id.0, &id.1);
+        match crate::rest::replies(rest, &id.0, &root_ts, None) {
+            Ok(msgs) => self.apply_fetched_replies(msgs),
+            Err(err) => self.status = format!("thread refresh failed: {err:?}"),
+        }
+        self.resync_cursor();
+    }
+
+    /// The root `ts` of the thread `(conv, ts)` belongs to: `ts` itself when it names a root (or
+    /// an id not locally known at all — nothing better to fall back to), or its stored
+    /// `thread_ts` when it names a known reply. Used by `refresh_thread` so Enter on either a
+    /// thread's root row or one of its nested reply rows in the Threads view refreshes the same
+    /// thread.
+    fn thread_root_ts(&self, conv: &str, ts: &str) -> String {
+        self.messages
+            .get(&key_for(conv, ts))
+            .and_then(|s| s.msg.thread_ts.clone())
+            .unwrap_or_else(|| ts.to_string())
     }
 
     /// Pure core of thread expand/collapse: flips the expanded flag for `(conv, root_ts)`,
@@ -760,9 +1085,13 @@ impl App {
     /// original arrival predates this session), insert it fresh instead of dropping the edit.
     /// That insert-fresh path deliberately assigns a brand-new `arrival_seq` (rather than, say,
     /// backdating it) so the edit surfaces under the unread divider like any other new arrival.
-    fn upsert_edit(&mut self, msg: Message) {
+    fn upsert_edit(&mut self, mut msg: Message) {
         let key = key_for(&msg.conv, &msg.ts);
         if let Some(stored) = self.messages.get_mut(&key) {
+            // A live `message_changed` event's payload never carries `reply_count` (see
+            // `socket::message_from`), so an incoming `None` here means "field not reported",
+            // not "no replies" — inherit whatever was already known rather than clobbering it.
+            msg.reply_count = msg.reply_count.or(stored.msg.reply_count);
             stored.msg = msg;
         } else {
             self.arrival_seq += 1;
@@ -835,6 +1164,30 @@ fn apply_backfill(
         app.upsert_new(msg);
     }
     Ok(())
+}
+
+/// The reply count a `ThreadMarker` row should display: the greater of Slack's own
+/// `reply_count` metadata (from a history/backfill/poll root, or a live `message_changed`
+/// update — see `Message::reply_count`'s doc) and the number of replies actually stored
+/// locally. Taking the max (rather than always preferring one or the other) is what lets a
+/// freshly-backfilled thread show its true count immediately — before any reply has been
+/// fetched, `reply_count` alone carries it — while a thread whose replies arrived live (via
+/// the socket, where roots don't carry updated metadata on every reply — see `socket.rs`'s
+/// module doc) still counts correctly from what's locally known, even if that exceeds a
+/// stale/never-set `reply_count`.
+fn marker_count(root_reply_count: Option<u32>, local_replies: usize) -> usize {
+    (root_reply_count.unwrap_or(0) as usize).max(local_replies)
+}
+
+/// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
+/// round-robin this tick: the number of active threads, capped at `2` — so `0` active threads
+/// reserves nothing (the full budget goes to conversations instead — see `App::active_threads`),
+/// exactly `1` active thread reserves exactly `1` slot (reserving a flat 2 here would waste a
+/// slot no thread exists to fill; `poll_conversations` picks up the difference), and `2` or more
+/// active threads reserves the full `2`. Spec §2: "up to 2 of the 8 slots rotate round-robin
+/// over active threads."
+fn thread_slot_count(active_threads: usize) -> usize {
+    active_threads.min(2)
 }
 
 /// Update `newest` in place with `ts` for `conv`, iff `ts` is chronologically at or after
@@ -990,9 +1343,9 @@ fn resolve_im_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BackfillOutcome, BackfillRetry, RowKind, SelKind, Tab, apply_backfill,
-        backfill_retry_decision, capped_sleep_secs, cooldown_active, next_batch, poll_error_status,
-        resolve_im_names, track_newest, ts_to_hhmm,
+        App, BackfillOutcome, BackfillRetry, FeedView, RowKind, SelKind, Tab, apply_backfill,
+        backfill_retry_decision, capped_sleep_secs, cooldown_active, marker_count, next_batch,
+        poll_error_status, resolve_im_names, thread_slot_count, track_newest, ts_to_hhmm,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -1013,12 +1366,14 @@ mod tests {
             author: author.into(),
             text: text.into(),
             edited: false,
+            reply_count: None,
         }
     }
 
     fn empty_app() -> App {
         App {
             tab: Tab::Feed,
+            view: FeedView::Timeline,
             cursor: 0,
             status: String::new(),
             polling: false,
@@ -1045,6 +1400,7 @@ mod tests {
             divider_mark: 0,
             newest_ts: HashMap::new(),
             poll_cursor: 0,
+            poll_thread_cursor: 0,
             cooldown_until: None,
         }
     }
@@ -1094,6 +1450,34 @@ mod tests {
         let rows = app.feed_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "edited text");
+    }
+
+    #[test]
+    fn changed_event_without_reply_count_preserves_the_stored_reply_count() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(5),
+            ..msg("C1", "1.0", None, "U1", "root")
+        }));
+        // A live `message_changed` event carries no `reply_count` field at all (see
+        // `socket::message_from`), so the parsed `Message` has `reply_count: None` — that must
+        // not clobber the `Some(5)` already known for this root.
+        app.apply(SocketEvent::Changed(Message {
+            edited: true,
+            ..msg("C1", "1.0", None, "U1", "edited text")
+        }));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows[0].text, "edited text");
+        // Proxy assertion: reply_count isn't otherwise exposed, but active_threads() only
+        // treats a root as active when its (possibly-stale) reply_count exceeds locally-known
+        // replies — that stays true here (0 local < 5) only if reply_count survived the edit.
+        assert_eq!(
+            app.active_threads(),
+            vec![("C1".to_string(), "1.0".to_string())],
+            "reply_count must still be Some(5) after the edit, so the count-gap keeps it active"
+        );
     }
 
     // ---- delete removes ---------------------------------------------------------------------
@@ -1747,6 +2131,252 @@ mod tests {
         assert_eq!(app.newest_ts.get("C1").map(String::as_str), Some("10.0"));
     }
 
+    // ---- marker_count: max(metadata, local) (Task 1, spec §1) ----------------------------------
+
+    #[test]
+    fn marker_count_uses_metadata_when_local_is_zero() {
+        assert_eq!(marker_count(Some(5), 0), 5);
+    }
+
+    #[test]
+    fn marker_count_uses_local_when_metadata_is_absent() {
+        assert_eq!(marker_count(None, 3), 3);
+    }
+
+    #[test]
+    fn marker_count_takes_the_greater_of_the_two_when_both_are_present() {
+        assert_eq!(marker_count(Some(2), 5), 5, "local ahead of stale/smaller metadata");
+        assert_eq!(marker_count(Some(9), 4), 9, "metadata ahead of what's locally known yet");
+    }
+
+    #[test]
+    fn marker_count_is_zero_when_neither_is_present() {
+        assert_eq!(marker_count(None, 0), 0);
+    }
+
+    #[test]
+    fn a_backfilled_thread_shows_its_marker_before_any_reply_is_locally_known() {
+        // Spec §1: a root's reply_count alone must render "n replies" immediately, with zero
+        // replies actually fetched yet.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(4),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 4, expanded: false });
+    }
+
+    #[test]
+    fn a_thread_with_more_local_replies_than_stale_metadata_shows_the_local_count() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 2, expanded: false });
+    }
+
+    // ---- thread_slot_count: budget split, zero-active never wastes (Task 1, spec §2) ----------
+
+    #[test]
+    fn thread_slot_count_is_zero_with_no_active_threads() {
+        assert_eq!(thread_slot_count(0), 0);
+    }
+
+    #[test]
+    fn thread_slot_count_matches_active_count_below_the_cap() {
+        // Exactly 1 active thread only ever issues 1 replies() call, so reserving a flat 2
+        // wastes a slot the conversation round-robin could have used instead.
+        assert_eq!(thread_slot_count(1), 1);
+        assert_eq!(thread_slot_count(2), 2);
+    }
+
+    #[test]
+    fn thread_slot_count_is_capped_at_two_with_more_active_threads() {
+        assert_eq!(thread_slot_count(5), 2);
+    }
+
+    // ---- active_threads: expanded ∪ count-gap roots (Task 1, spec §2) --------------------------
+
+    #[test]
+    fn active_threads_includes_an_expanded_root_even_with_no_reply_count_gap() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.toggle_thread("C1", "1.000001", Vec::new()); // expand with no replies at all
+
+        assert_eq!(app.active_threads(), vec![("C1".to_string(), "1.000001".to_string())]);
+    }
+
+    #[test]
+    fn active_threads_includes_a_collapsed_root_whose_reply_count_outpaces_local_replies() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(3),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        // Only 1 of the 3 reported replies is locally known.
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+
+        assert_eq!(app.active_threads(), vec![("C1".to_string(), "1.000001".to_string())]);
+    }
+
+    #[test]
+    fn active_threads_excludes_a_root_whose_local_replies_already_match_its_reply_count() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+
+        assert!(app.active_threads().is_empty(), "no gap and not expanded — not active");
+    }
+
+    #[test]
+    fn active_threads_is_empty_for_a_plain_thread_root_with_no_metadata_or_expansion() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        assert!(app.active_threads().is_empty());
+    }
+
+    #[test]
+    fn active_threads_does_not_duplicate_a_root_that_is_both_expanded_and_count_gapped() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(5),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.toggle_thread("C1", "1.000001", Vec::new());
+
+        assert_eq!(app.active_threads(), vec![("C1".to_string(), "1.000001".to_string())]);
+    }
+
+    // ---- newest_reply_ts / apply_fetched_replies (Task 1, spec §2) -----------------------------
+
+    #[test]
+    fn newest_reply_ts_is_none_when_no_reply_is_known_locally() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        assert_eq!(app.newest_reply_ts("C1", "1.000001"), None);
+    }
+
+    #[test]
+    fn newest_reply_ts_picks_the_chronologically_latest_known_reply() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "later")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "earlier")));
+        assert_eq!(app.newest_reply_ts("C1", "1.000001"), Some("1.000003".to_string()));
+    }
+
+    #[test]
+    fn apply_fetched_replies_upserts_each_message_through_the_normal_path() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.toggle_thread("C1", "1.000001", Vec::new()); // expanded, so the reply renders inline
+        app.apply_fetched_replies(vec![msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "fetched reply",
+        )]);
+        app.touch();
+
+        let rows = app.feed_rows();
+        assert!(rows.iter().any(|r| r.text == "fetched reply"));
+    }
+
+    // ---- poll_tick_at: split-budget rotation over active threads (Task 1, spec §2) -------------
+
+    /// A fixture with `n` conversations (`C0`..`Cn-1`), for exercising the slot-split math at a
+    /// batch size the default 2-conversation `empty_app` can't: `POLL_BATCH` is 8, so the
+    /// conv-slot reservation (6 when threads are active) only bites with more than 6 conversations.
+    fn app_with_conversations(n: usize) -> App {
+        let mut app = App::empty("SELF");
+        for i in 0..n {
+            let id = format!("C{i}");
+            app.add_conversation(&id, &format!("conv{i}"), ConvKind::Channel);
+        }
+        app.conversations = (0..n)
+            .map(|i| Conversation {
+                id: format!("C{i}"),
+                name: format!("conv{i}"),
+                kind: ConvKind::Channel,
+                updated: None,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn poll_tick_reserves_only_one_conv_slot_for_a_single_active_thread() {
+        // Exactly 1 active thread means only 1 replies() call actually issues; the conversation
+        // budget must pick up the slack rather than leaving the 2nd reserved slot unused — a
+        // full tick still visits all 8 of the budget's slots (1 thread + 7 conversations).
+        let mut app = app_with_conversations(8);
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(3),
+            ..msg("C0", "1.000001", None, "U1", "root")
+        }));
+        assert_eq!(app.active_threads().len(), 1, "one count-gapped root makes threads active");
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now());
+
+        assert_eq!(
+            app.poll_cursor, 7,
+            "all 7 remaining conversations were visited — only 1 slot went to the active thread"
+        );
+    }
+
+    #[test]
+    fn poll_tick_spends_all_eight_slots_on_conversations_when_no_threads_are_active() {
+        let mut app = app_with_conversations(8);
+        assert!(app.active_threads().is_empty());
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now());
+
+        assert_eq!(
+            app.poll_cursor, 0,
+            "all 8 conversations were visited and the cursor wrapped — nothing reserved"
+        );
+    }
+
+    #[test]
+    fn poll_tick_thread_cursor_round_robins_across_ticks() {
+        let mut app = app_with_conversations(1);
+        // Three distinct active threads (all expanded, so no reply_count juggling needed).
+        for ts in ["1.0", "2.0", "3.0"] {
+            app.apply(SocketEvent::Message(msg("C0", ts, None, "U1", "root")));
+            app.toggle_thread("C0", ts, Vec::new());
+        }
+        assert_eq!(app.active_threads().len(), 3);
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.poll_tick_at(&rest, Instant::now()); // visits 2 of the 3 active threads
+        assert_eq!(app.poll_thread_cursor, 2, "thread cursor advances by the 2-slot budget");
+
+        app.poll_tick_at(&rest, Instant::now()); // wraps: visits the 3rd, then back to the 1st
+        assert_eq!(
+            app.poll_thread_cursor, 1,
+            "thread cursor wraps round-robin across ticks, independent of the conv cursor"
+        );
+    }
+
     // ---- backfill retry decision (Task 2, spec §5) --------------------------------------------
 
     #[test]
@@ -1847,5 +2477,213 @@ mod tests {
 
         let rows = app.feed_rows();
         assert_eq!(rows[app.cursor].text, "row A", "cursor away from the bottom must not move");
+    }
+
+    // ---- thread_rows: the Threads view projection (Task 2, spec §3) ---------------------------
+
+    #[test]
+    fn thread_rows_excludes_non_threaded_messages() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "just chatting")));
+        assert!(app.thread_rows().is_empty());
+    }
+
+    #[test]
+    fn thread_rows_includes_a_backfilled_root_before_any_reply_is_known() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(3),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "root");
+        assert_eq!(rows[0].kind, RowKind::Message);
+    }
+
+    #[test]
+    fn thread_rows_nests_locally_known_replies_beneath_their_root_in_order() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "later")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "earlier")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].text, "root");
+        assert_eq!(rows[1].text, "\u{21b3} earlier");
+        assert_eq!(rows[2].text, "\u{21b3} later");
+    }
+
+    #[test]
+    fn thread_rows_orders_threads_by_latest_activity_descending() {
+        let mut app = empty_app();
+        // Thread A's root is newer than thread B's, but B's latest reply is newer still — B
+        // must sort first.
+        app.apply(SocketEvent::Message(msg("C1", "10.0", None, "U1", "root A")));
+        app.apply(SocketEvent::Message(msg("C1", "10.1", Some("10.0"), "U1", "reply A1")));
+        app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "root B")));
+        app.apply(SocketEvent::Message(msg("C1", "50.0", Some("5.0"), "U1", "reply B1")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows[0].text, "root B", "B's latest reply (50.0) beats A's (10.1)");
+        assert_eq!(rows[1].text, "\u{21b3} reply B1");
+        assert_eq!(rows[2].text, "root A");
+        assert_eq!(rows[3].text, "\u{21b3} reply A1");
+    }
+
+    #[test]
+    fn thread_rows_uses_the_root_ts_as_activity_when_no_reply_is_known_yet() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.0", None, "U1", "old root, no replies fetched yet")
+        }));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "newer root")));
+        app.apply(SocketEvent::Message(msg("C1", "2.1", Some("2.0"), "U1", "reply")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows[0].text, "newer root");
+        assert_eq!(rows[2].text, "old root, no replies fetched yet");
+    }
+
+    // ---- thread_rows: orphaned replies (root not locally known) get a synthetic thread --------
+
+    #[test]
+    fn thread_rows_surfaces_an_orphaned_reply_as_a_synthetic_thread() {
+        let mut app = empty_app();
+        // No root "1.000001" was ever stored (e.g. it's older than the backfill horizon), but a
+        // reply to it arrives. The Timeline (feed_rows) inlines this as a "↳ "-prefixed row; the
+        // Threads view must not simply drop it instead — it gets a synthetic thread entry.
+        app.apply(SocketEvent::Message(msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "reply to an unknown root",
+        )));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, RowKind::Message);
+        assert_eq!(rows[0].text, "(thread — root not loaded)");
+        assert_eq!(rows[1].text, "\u{21b3} reply to an unknown root");
+    }
+
+    #[test]
+    fn thread_rows_orders_a_synthetic_thread_by_its_replys_ts() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "5.0", None, "U1", "root A")));
+        app.apply(SocketEvent::Message(msg("C1", "5.1", Some("5.0"), "U1", "reply A1")));
+        // The orphaned reply's ts (50.0) is newer than thread A's activity (5.1) — its synthetic
+        // thread must sort first.
+        app.apply(SocketEvent::Message(msg("C1", "50.0", Some("40.0"), "U1", "orphaned reply")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows[0].text, "(thread — root not loaded)");
+        assert_eq!(rows[1].text, "\u{21b3} orphaned reply");
+        assert_eq!(rows[2].text, "root A");
+    }
+
+    #[test]
+    fn thread_rows_synthetic_thread_self_heals_when_the_root_arrives() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply")));
+        assert_eq!(app.thread_rows()[0].text, "(thread — root not loaded)");
+
+        // The root arrives — e.g. `refresh_thread`'s `conversations.replies` call returns the
+        // actual root as the first message, and it goes through the normal upsert path.
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "actual root")));
+
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 2, "the synthetic header must be replaced, not duplicated");
+        assert_eq!(rows[0].text, "actual root");
+        assert_eq!(rows[1].text, "\u{21b3} reply");
+    }
+
+    // ---- toggle_view: Feed-tab-only projection flip (Task 2, spec §3) --------------------------
+
+    #[test]
+    fn toggle_view_flips_between_timeline_and_threads_on_the_feed_tab() {
+        let mut app = empty_app();
+        assert_eq!(app.view, FeedView::Timeline);
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Timeline);
+    }
+
+    #[test]
+    fn toggle_view_is_a_no_op_off_the_feed_tab() {
+        let mut app = empty_app();
+        app.tab = Tab::Mentions;
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Timeline, "the toggle key is Feed-only");
+    }
+
+    #[test]
+    fn toggle_view_resyncs_the_cursor_into_the_new_projections_bounds() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "not a thread")));
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "2.0", None, "U1", "a thread root")
+        }));
+        app.touch();
+        app.move_cursor(1); // selects "a thread root" in the 2-row timeline
+
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+        assert_eq!(app.cursor, 0, "the 1-row threads projection clamps the stale cursor");
+        assert_eq!(app.thread_rows()[app.cursor].text, "a thread root");
+    }
+
+    // ---- refresh_thread: Enter in the Threads view (re)fetches replies (Task 2, spec §3) -------
+
+    #[test]
+    fn enter_on_a_thread_root_in_threads_view_fetches_its_replies() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.toggle_view();
+        assert_eq!(app.view, FeedView::Threads);
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // The REST call itself fails (precancelled), but this must reach the fetch path (not
+        // silently no-op) and must never touch `App::expanded` — the Threads view has nothing
+        // for that Timeline-only flag to mean.
+        app.toggle_expand_or_read(&rest);
+        assert!(app.status.contains("thread refresh failed"), "{}", app.status);
+        assert!(
+            app.expanded.is_empty(),
+            "refresh_thread must not flip the Timeline's expanded set"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_thread_root_in_threads_view_merges_a_successfully_fetched_reply() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reply_count: Some(1),
+            ..msg("C1", "1.000001", None, "U1", "root")
+        }));
+        app.toggle_view();
+
+        // Exercise the pure merge path directly (apply_fetched_replies), the same path
+        // refresh_thread's successful branch calls, since a real REST fetch needs the network.
+        app.apply_fetched_replies(vec![msg(
+            "C1",
+            "1.000002",
+            Some("1.000001"),
+            "U1",
+            "fetched reply",
+        )]);
+
+        let rows = app.thread_rows();
+        assert!(rows.iter().any(|r| r.text == "\u{21b3} fetched reply"));
     }
 }

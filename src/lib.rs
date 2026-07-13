@@ -182,6 +182,7 @@ fn event_loop(
                 KeyCode::Char('j') | KeyCode::Down => app.move_cursor(1),
                 KeyCode::Char('k') | KeyCode::Up => app.move_cursor(-1),
                 KeyCode::Enter => app.toggle_expand_or_read(rest),
+                KeyCode::Char('t') => app.toggle_view(),
                 KeyCode::Char('o') => {
                     if let Some(url) = app.permalink_of_selected(rest)
                         && let Err(error) = browser::open(&url)

@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-12
+
+### Added
+- **Threads view.** `t` toggles the Feed tab (Timeline-only) between the normal chronological
+  stream and a threads-only digest: every thread, newest activity first, root plus every
+  locally-known reply always shown nested beneath it — no collapsed marker in this view. Non-
+  threaded messages are excluded entirely. `Enter` on a row here always (re)fetches that thread's
+  replies, rather than the Timeline's expand/collapse toggle. A reply whose root was never
+  backfilled gets a synthetic `(thread — root not loaded)` header instead of vanishing; selecting
+  it and hitting `Enter` fetches the real root over REST, which quietly replaces the placeholder
+  on the next redraw — no separate "heal" action needed.
+- **Colored row segments.** Every row now renders as separately styled spans instead of one flat
+  color: the conversation label in the theme's accent (`lavender`), the author in `green`, the
+  time and thread/divider markers in the muted `overlay1` tone, and the message text in the
+  default foreground — consistent across every configured palette.
+- **Thread metadata everywhere.** Messages now carry Slack's own `reply_count`, so a thread's
+  displayed reply count is accurate immediately after backfill, before any reply has actually
+  been fetched — previously it only reflected replies already stored locally.
+- **Polling reply-refresh.** While in fallback polling mode, up to 2 of each tick's 8-request
+  budget now rotate over "active" threads (currently expanded, or whose Slack-reported reply
+  count outpaces what's stored locally), fetching just the replies newer than the newest one
+  already known. The remaining slots still cover conversations as before; with no active threads,
+  the full budget goes to conversations, so the reservation never goes to waste.
+
+### Changed
+- `refresh_thread`'s (Threads-view `Enter`) failure status now reads `thread refresh failed: …`,
+  distinct from the Timeline's `replies failed: …`, so the status line names which action failed.
+
 ## [0.1.2] — 2026-07-12
 
 ### Added

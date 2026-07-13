@@ -8,11 +8,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::app::{App, Row, RowKind, Tab};
+use crate::app::{App, FeedView, Row, RowKind, Tab};
 use crate::theme::Palette;
 
 /// What [`render`] draws this frame.
@@ -52,12 +52,19 @@ fn render_ready(frame: &mut Frame, palette: &Palette, app: &App) {
     render_status(frame, palette, app, rows[2]);
 }
 
-/// `1 Feed  2 Mentions (n)`, the active tab underlined and bright.
+/// `1 Feed  2 Mentions (n)`, the active tab underlined and bright. The Feed label itself names
+/// the active `FeedView` (`1 Feed` in the Timeline, `1 Threads` once toggled — spec §3's minimal
+/// mode marker) rather than adding a separate indicator, since the Feed tab is the only place
+/// the mode is ever relevant.
 fn render_tab_bar(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let n = app.unread_mentions();
+    let feed_label = match app.view {
+        FeedView::Timeline => "1 Feed",
+        FeedView::Threads => "1 Threads",
+    };
     let line = Line::from(vec![
         Span::raw(" "),
-        Span::styled("1 Feed", tab_style(palette, app.tab == Tab::Feed)),
+        Span::styled(feed_label, tab_style(palette, app.tab == Tab::Feed)),
         Span::raw("  "),
         Span::styled(format!("2 Mentions ({n})"), tab_style(palette, app.tab == Tab::Mentions)),
     ]);
@@ -78,7 +85,10 @@ fn tab_style(palette: &Palette, active: bool) -> Style {
 /// last visible line invisible below the viewport.
 fn render_body(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let rows = match app.tab {
-        Tab::Feed => app.feed_rows(),
+        Tab::Feed => match app.view {
+            FeedView::Timeline => app.feed_rows(),
+            FeedView::Threads => app.thread_rows(),
+        },
         Tab::Mentions => app.mention_rows(),
     };
     let width = area.width as usize;
@@ -109,32 +119,61 @@ fn scroll_offset(total: usize, cursor: usize, height: usize) -> usize {
     wants.min(total - height)
 }
 
-/// One row as `#chan  @author  HH:MM  text` (a thread marker keeps its own `↳ n replies`
-/// text; a divider is a bare horizontal rule; a mention row gets a leading read/unread
-/// marker ahead of the same header).
+/// One row as styled spans (spec §4): the conv label (`#chan`/`@dm`) in the palette's
+/// blue-family accent (`lavender`), the author in `green`, the `HH:MM` time and thread/divider
+/// markers in the muted `overlay1` tone, and the message text in the default `text` fg. A
+/// selected row's cursor-fill background (`cursor_bg`) is applied uniformly across every span
+/// so the whole row highlights, not just one segment. A thread marker's `↳ n replies` text
+/// counts as a marker (muted); a mention row's leading read/unread glyph keeps its own plain
+/// `text`-fg styling (unaffected by this change, per spec) ahead of the same colored header; a
+/// divider is a bare horizontal rule in the muted tone.
 fn row_line(palette: &Palette, row: &Row, width: usize, selected: bool) -> Line<'static> {
-    let mut style = Style::default().fg(palette.text);
-    if selected {
-        style = style.bg(palette.cursor_bg(true));
-    }
-    let text = match &row.kind {
-        RowKind::Divider => "─".repeat(width),
-        RowKind::ThreadMarker { .. } => format!("{}  {}", row.conv_label, row.text),
+    let bg = selected.then(|| palette.cursor_bg(true));
+    let spans = match &row.kind {
+        RowKind::Divider => vec![Span::styled("─".repeat(width), cell_style(palette.overlay1, bg))],
+        RowKind::ThreadMarker { .. } => vec![
+            Span::styled(row.conv_label.clone(), cell_style(palette.lavender, bg)),
+            Span::styled("  ", cell_style(palette.text, bg)),
+            Span::styled(row.text.clone(), cell_style(palette.overlay1, bg)),
+        ],
         RowKind::Mention { read } => {
             let marker = if *read { "○" } else { "●" };
-            format!("{marker} {}", header_and_text(row))
+            let mut spans = vec![Span::styled(format!("{marker} "), cell_style(palette.text, bg))];
+            spans.extend(header_spans(palette, row, bg));
+            spans
         }
-        RowKind::Message => header_and_text(row),
+        RowKind::Message => header_spans(palette, row, bg),
     };
-    Line::from(Span::styled(text, style))
+    Line::from(spans)
 }
 
-fn header_and_text(row: &Row) -> String {
-    format!("{}  @{}  {}  {}", row.conv_label, row.author, row.time_hhmm, row.text)
+/// The `#chan  @author  HH:MM  text` header, as separately colored spans (see `row_line`'s doc).
+fn header_spans(palette: &Palette, row: &Row, bg: Option<Color>) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(row.conv_label.clone(), cell_style(palette.lavender, bg)),
+        Span::styled("  ", cell_style(palette.text, bg)),
+        Span::styled(format!("@{}", row.author), cell_style(palette.green, bg)),
+        Span::styled("  ", cell_style(palette.text, bg)),
+        Span::styled(row.time_hhmm.clone(), cell_style(palette.overlay1, bg)),
+        Span::styled("  ", cell_style(palette.text, bg)),
+        Span::styled(row.text.clone(), cell_style(palette.text, bg)),
+    ]
 }
 
-/// `app.status`, with a `polling` marker appended when in fallback mode and not already
-/// named in the status text.
+/// `fg` plus the selected row's cursor-fill `bg`, if any — the one-liner every `row_line` span
+/// shares so a selected row's highlight always covers the whole line uniformly.
+fn cell_style(fg: Color, bg: Option<Color>) -> Style {
+    let style = Style::default().fg(fg);
+    match bg {
+        Some(bg) => style.bg(bg),
+        None => style,
+    }
+}
+
+/// `app.status`, with a `polling` marker appended when in fallback mode and not already named
+/// in the status text, plus a `t: toggle view` key hint on the Feed tab (spec §3: "`t` appears
+/// in the footer") — this pane has no separate footer row, so the hint rides along on the
+/// status line, the bottommost row a user's eye lands on regardless.
 fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let mut text = app.status.clone();
     if app.polling && !text.contains("polling") {
@@ -142,6 +181,12 @@ fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
             text.push_str(" · ");
         }
         text.push_str("polling");
+    }
+    if app.tab == Tab::Feed {
+        if !text.is_empty() {
+            text.push_str(" · ");
+        }
+        text.push_str("t: toggle view");
     }
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(palette.peach).bg(palette.surface0)),

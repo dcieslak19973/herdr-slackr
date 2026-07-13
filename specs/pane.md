@@ -35,6 +35,42 @@ Row shapes, identical structure across both tabs:
 | divider       | a bare horizontal rule                                            |
 | mention       | `●`/`○` read marker, then the same message header as above        |
 
+**Row colors:** each row renders as separately styled spans, not one flat color — consistent
+across every configured palette (see `config.md`'s theme list):
+
+| segment                        | palette field | applies to                                          |
+| -------------------------------- | --------------- | -------------------------------------------------------|
+| conversation label (`#chan`/`@dm`) | `lavender`    | message, thread marker, mention                        |
+| author (`@name`)                | `green`       | message, mention                                        |
+| time (`HH:MM`) / thread markers / divider | `overlay1` | message, thread marker (`↳ n replies`), divider |
+| message text                    | `text` (default fg) | message, mention                                 |
+
+A selected row's cursor highlight fills the whole line uniformly (all spans share the same
+background), so the color-segmentation never competes with the selection indicator. A mention
+row's leading `●`/`○` read marker keeps the plain `text` fg ahead of the same colored header.
+
+## Threads view
+
+`t` toggles the Feed tab (Feed only — a no-op on the Mentions tab) between two projections of the
+same message store, tracked as `FeedView`:
+
+| view       | shows                                                                                       |
+| ----------- | -----------------------------------------------------------------------------------------------|
+| Timeline   | the row shapes above: every message, threads collapsed under a `ThreadMarker` unless expanded |
+| Threads    | threads only — non-threaded messages are excluded entirely                                     |
+
+**Threads view behavior:**
+
+| #   | Always true                                                                                       |
+| --- | ---------------------------------------------------------------------------------------------------|
+| T1  | Only qualifying threads appear — a root whose reply count (Slack's `reply_count` metadata or the number of locally-known replies, whichever is greater) is nonzero. A root with zero replies either way is excluded, same as any other non-threaded message. |
+| T2  | Each qualifying thread renders as its root row immediately followed by every locally-known reply, in chronological order, nested with the same `↳ ` prefix the Timeline uses for an expanded thread or an orphaned reply — **always shown regardless of the Timeline's `expanded` flag** for that thread; there is no collapsed state in this view. |
+| T3  | Threads are ordered by latest activity descending: the newest locally-known reply's `ts`, or the root's own `ts` if it has no reply yet — a thread that just received a reply jumps back to the top even if its root is old. |
+| T4  | `Enter` on any row in this view (re)fetches that thread's replies via `conversations.replies` unconditionally — not the Timeline's expand/collapse toggle, and it never reads or flips `App`'s `expanded` set. A reply row's Enter resolves to the thread it belongs to, same as its root's. |
+| T5  | A reply whose root was never backfilled or otherwise seen still gets an entry — a *synthetic* one, headed `(thread — root not loaded)` in place of the normal `#chan @author HH:MM text` header, grouped with every other reply sharing that same unknown root. Selecting it and pressing `Enter` fetches the real root via the same `conversations.replies` call (Slack returns the root as the first message); once the fetch lands, the very next redraw naturally shows the real root row in place of the placeholder — no explicit cleanup step. |
+| T6  | Root and reply rows in this view share `SelKind::Message` identity with their Timeline counterparts (same `(conv, ts)`), so a selection made in one view still resolves in the other if the row exists there too. |
+| T7  | Switching views (`t`) resyncs cursor/selection into the new projection exactly like switching tabs (P8): the old selected identity is kept if it still names a row in the new view, otherwise cursor/selection are clamped/re-derived from scratch. |
+
 ## Behavior
 
 | #  | Always true                                                                                                     |
@@ -56,7 +92,8 @@ Row shapes, identical structure across both tabs:
 | `1` / `2`            | switch to Feed / Mentions                                        |
 | `Tab`                | switch tab (Feed ↔ Mentions)                                      |
 | `j`/`k`, `↓`/`↑`      | move the cursor                                                   |
-| `Enter`               | Feed: expand/collapse the selected thread. Mentions: toggle read  |
+| `Enter`               | Feed Timeline: expand/collapse the selected thread. Feed Threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
+| `t`                   | Feed tab only: toggle between the Timeline and the Threads-only view (see below) |
 | `o`                   | open the selected row's Slack permalink (`chat.getPermalink`) in the browser |
 | `r`                   | manual refresh: re-pull the last 50 messages of every subscribed conversation |
 | `q`                   | quit the pane                                                     |
