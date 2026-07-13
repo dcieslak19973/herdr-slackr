@@ -380,7 +380,13 @@ impl App {
         if follow_bottom {
             self.snap_cursor_to_last_row();
         } else if had_rows_before && self.arrival_seq > arrival_before {
-            self.pending_new += 1;
+            // Count every arrival landed this cycle, not just "an arrival happened": a poll
+            // tick (or any other caller) can upsert several messages before its one
+            // `finish_after_arrivals` call (`poll_conversations`/`apply_fetched_replies` each
+            // loop `upsert_new` over a batch), and each of those bumps `arrival_seq` by 1.
+            let delta = usize::try_from(self.arrival_seq - arrival_before)
+                .expect("arrival_seq delta always fits usize on any platform this runs on");
+            self.pending_new += delta;
         }
     }
 
@@ -2930,6 +2936,41 @@ mod tests {
         assert_eq!(app.pending_new(), 1);
         app.move_cursor(100); // any means: j/Down walked all the way to the bottom
         assert_eq!(app.pending_new(), 0, "move_cursor landing on the last row must clear it");
+    }
+
+    #[test]
+    fn a_single_cycle_landing_several_messages_counts_every_arrival() {
+        // Regression for the review finding: a poll tick (or any other caller of
+        // `finish_after_arrivals`) that upserts several messages before its one
+        // `finish_after_arrivals` call must count every one of them, not just 1 — a
+        // polling-fallback backlog or `apply_fetched_replies` batch each go through exactly
+        // one `finish_after_arrivals` call no matter how many messages landed inside it.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "first")));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "second")));
+        app.touch();
+        app.jump_newest(); // establish the at-the-bottom baseline explicitly, as `build` does
+        app.jump_first(); // scroll away from the bottom
+
+        let follow_bottom = app.is_cursor_at_last_row();
+        let had_rows_before = !app.current_ids().is_empty();
+        let arrival_before = app.arrival_seq;
+
+        // Simulate one poll cycle's several upserts landing before its single
+        // `finish_after_arrivals` call (mirrors `poll_conversations`/`apply_fetched_replies`,
+        // each of which loops `upsert_new` over a batch inside one `poll_tick_at` cycle).
+        app.apply_fetched_replies(vec![
+            msg("C1", "3.0", None, "U1", "third"),
+            msg("C1", "4.0", None, "U1", "fourth"),
+            msg("C1", "5.0", None, "U1", "fifth"),
+        ]);
+        app.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
+
+        assert_eq!(
+            app.pending_new(),
+            3,
+            "one cycle landing 3 messages must count all 3, not just 1"
+        );
     }
 
     #[test]
