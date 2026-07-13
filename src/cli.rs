@@ -214,11 +214,16 @@ fn scan(json: bool, limit: u32, channel_filter: Option<&str>, mention_only: bool
         Err(error) => return rest_fail(&error),
     };
 
-    let selected =
-        match resolve_channels(config.channels(), config.dms(), config.dm_limit(), &all_convs) {
-            Ok(v) => v,
-            Err(message) => return fail(&message),
-        };
+    let selected = match resolve_channels(
+        config.channels(),
+        config.dms(),
+        config.dm_limit(),
+        config.dm_allow(),
+        &all_convs,
+    ) {
+        Ok(v) => v,
+        Err(message) => return fail(&message),
+    };
     let selected = resolve_im_names(selected, &user_names);
 
     let selected = if let Some(wanted) = channel_filter {

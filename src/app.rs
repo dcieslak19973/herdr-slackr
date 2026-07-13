@@ -216,8 +216,13 @@ impl App {
     pub fn build(config: PluginConfig, _tokens: &Tokens, rest: &Rest) -> Result<App, String> {
         let all_convs = crate::rest::list_conversations(rest)
             .map_err(|e| format!("list_conversations failed: {e:?}"))?;
-        let selected =
-            resolve_channels(config.channels(), config.dms(), config.dm_limit(), &all_convs)?;
+        let selected = resolve_channels(
+            config.channels(),
+            config.dms(),
+            config.dm_limit(),
+            config.dm_allow(),
+            &all_convs,
+        )?;
 
         let self_id =
             crate::rest::auth_self(rest).map_err(|e| format!("auth_self failed: {e:?}"))?;

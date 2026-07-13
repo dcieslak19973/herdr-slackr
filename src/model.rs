@@ -80,16 +80,22 @@ pub fn ts_key(ts: &str) -> (u64, u32) {
 /// `all`, matching only `Channel`/`Group` kinds; an unresolved name is an error naming it (per
 /// the design doc: "A configured channel name that resolves to nothing is an error naming the
 /// channel"). When `dms` is true, every `Im`/`Mpim` conversation in `all` is appended — DMs are
-/// subscribed as a class, not named individually in config — capped to the `dm_limit` most
-/// recently active ones by [`Conversation::updated`] descending. `dm_limit == 0` excludes DMs
-/// entirely even when `dms` is true. When the DM set exceeds `dm_limit` and *any* candidate DM
-/// is missing `updated` (some workspace payloads omit it), ranking degrades to plain list order
-/// — never scanning history to rank — and logs the degradation once via `logln!`. The single
-/// shared home for this cap: it was previously duplicated verbatim in `app.rs` and `cli.rs`.
+/// subscribed as a class, not named individually in config. The DM pool is first partitioned by
+/// `dm_allow`: a DM whose resolved name exactly matches (case-insensitively, no substring
+/// matching) any `dm_allow` entry is always included, never subject to the cap. The remaining
+/// (non-allow-listed) DMs are capped to the `dm_limit` most recently active ones by
+/// [`Conversation::updated`] descending. `dm_limit == 0` excludes non-allow-listed DMs entirely
+/// even when `dms` is true — allow-listed DMs are still included. When the remaining DM set
+/// exceeds `dm_limit` and *any* candidate DM in it is missing `updated` (some workspace payloads
+/// omit it), ranking degrades to plain list order — never scanning history to rank — and logs
+/// the degradation once via `logln!`. `dms = false` suppresses all DMs, including allow-listed
+/// ones — an explicit "no DMs" wins over the allow-list. The single shared home for this cap: it
+/// was previously duplicated verbatim in `app.rs` and `cli.rs`.
 pub(crate) fn resolve_channels(
     config_channels: &[String],
     dms: bool,
     dm_limit: u32,
+    dm_allow: &[String],
     all: &[Conversation],
 ) -> Result<Vec<Conversation>, String> {
     let mut out = Vec::with_capacity(config_channels.len());
@@ -104,25 +110,29 @@ pub(crate) fn resolve_channels(
         }
     }
     if dms {
-        let mut dm_convs: Vec<Conversation> = all
+        let is_allowed = |c: &Conversation| {
+            dm_allow.iter().any(|allowed| allowed.to_lowercase() == c.name.to_lowercase())
+        };
+        let (allowed, mut rest): (Vec<Conversation>, Vec<Conversation>) = all
             .iter()
             .filter(|c| matches!(c.kind, ConvKind::Im | ConvKind::Mpim))
             .cloned()
-            .collect();
+            .partition(is_allowed);
         let limit = dm_limit as usize;
-        if dm_convs.len() > limit {
-            if dm_convs.iter().all(|c| c.updated.is_some()) {
-                dm_convs.sort_by(|a, b| b.updated.cmp(&a.updated));
+        if rest.len() > limit {
+            if rest.iter().all(|c| c.updated.is_some()) {
+                rest.sort_by(|a, b| b.updated.cmp(&a.updated));
             } else {
                 crate::logln!(
                     "resolve_channels: `updated` missing on one or more of {} DMs; falling back \
                      to list order for the dm_limit={dm_limit} cap",
-                    dm_convs.len()
+                    rest.len()
                 );
             }
-            dm_convs.truncate(limit);
+            rest.truncate(limit);
         }
-        out.extend(dm_convs);
+        out.extend(allowed);
+        out.extend(rest);
     }
     Ok(out)
 }
@@ -148,14 +158,14 @@ mod tests {
             conv("C1", "eng-infra", ConvKind::Channel),
             conv("C2", "releases", ConvKind::Channel),
         ];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, 20, &all).unwrap();
+        let resolved = resolve_channels(&["#eng-infra".to_string()], false, 20, &[], &all).unwrap();
         assert_eq!(resolved, vec![conv("C1", "eng-infra", ConvKind::Channel)]);
     }
 
     #[test]
     fn resolve_channels_errors_naming_an_unknown_channel() {
         let all = vec![conv("C1", "eng-infra", ConvKind::Channel)];
-        let error = resolve_channels(&["#nope".to_string()], false, 20, &all).unwrap_err();
+        let error = resolve_channels(&["#nope".to_string()], false, 20, &[], &all).unwrap_err();
         assert!(error.contains("#nope"), "{error}");
     }
 
@@ -166,21 +176,21 @@ mod tests {
             conv("D1", "U9", ConvKind::Im),
             conv("M1", "mpdm-a-b", ConvKind::Mpim),
         ];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], true, 20, &all).unwrap();
+        let resolved = resolve_channels(&["#eng-infra".to_string()], true, 20, &[], &all).unwrap();
         assert_eq!(resolved.len(), 3);
     }
 
     #[test]
     fn resolve_channels_excludes_dms_when_disabled() {
         let all = vec![conv("C1", "eng-infra", ConvKind::Channel), conv("D1", "U9", ConvKind::Im)];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], false, 20, &all).unwrap();
+        let resolved = resolve_channels(&["#eng-infra".to_string()], false, 20, &[], &all).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
     #[test]
     fn resolve_channels_dm_limit_zero_excludes_dms_even_when_enabled() {
         let all = vec![conv("C1", "eng-infra", ConvKind::Channel), conv("D1", "U9", ConvKind::Im)];
-        let resolved = resolve_channels(&["#eng-infra".to_string()], true, 0, &all).unwrap();
+        let resolved = resolve_channels(&["#eng-infra".to_string()], true, 0, &[], &all).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
@@ -191,7 +201,7 @@ mod tests {
             conv_updated("D2", "U2", ConvKind::Im, 300),
             conv_updated("D3", "U3", ConvKind::Im, 200),
         ];
-        let resolved = resolve_channels(&[], true, 2, &all).unwrap();
+        let resolved = resolve_channels(&[], true, 2, &[], &all).unwrap();
         assert_eq!(resolved.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["D2", "D3"]);
     }
 
@@ -202,9 +212,59 @@ mod tests {
             conv("D2", "U2", ConvKind::Im), // no `updated`
             conv_updated("D3", "U3", ConvKind::Im, 999),
         ];
-        let resolved = resolve_channels(&[], true, 2, &all).unwrap();
+        let resolved = resolve_channels(&[], true, 2, &[], &all).unwrap();
         // List order preserved (D1, D2), not ranked by `updated` (which would pick D3, D1).
         assert_eq!(resolved.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["D1", "D2"]);
+    }
+
+    #[test]
+    fn resolve_channels_dm_allow_included_even_when_outside_the_dm_limit_by_recency() {
+        let all = vec![
+            conv_updated("D1", "alice", ConvKind::Im, 100),
+            conv_updated("D2", "bob", ConvKind::Im, 300),
+            conv_updated("D3", "carol", ConvKind::Im, 200),
+        ];
+        // dm_limit=1 would normally keep only D2 (most recent); "alice" is allow-listed so
+        // it must survive even though it ranks last by `updated`.
+        let resolved = resolve_channels(&[], true, 1, &["alice".to_string()], &all).unwrap();
+        let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"D1"), "{ids:?}");
+        assert!(ids.contains(&"D2"), "{ids:?}");
+    }
+
+    #[test]
+    fn resolve_channels_dm_allow_does_not_double_count_toward_the_cap() {
+        let all = vec![
+            conv_updated("D1", "alice", ConvKind::Im, 400),
+            conv_updated("D2", "bob", ConvKind::Im, 300),
+            conv_updated("D3", "carol", ConvKind::Im, 200),
+        ];
+        // dm_limit=1 applies only to the non-allow-listed remainder {bob, carol}: bob wins
+        // that cut. alice is allow-listed and additionally included, for 2 total, not capped
+        // to 1 overall.
+        let resolved = resolve_channels(&[], true, 1, &["alice".to_string()], &all).unwrap();
+        let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["D1", "D2"]);
+    }
+
+    #[test]
+    fn resolve_channels_dms_false_suppresses_allow_listed_dms_too() {
+        let all = vec![conv_updated("D1", "alice", ConvKind::Im, 100)];
+        let resolved = resolve_channels(&[], false, 20, &["alice".to_string()], &all).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_channels_dm_allow_matches_case_insensitively_but_not_by_substring() {
+        let all = vec![
+            conv_updated("D1", "Alice", ConvKind::Im, 100),
+            conv_updated("D2", "alicent", ConvKind::Im, 200),
+        ];
+        // "alice" (lowercase) must exact-match "Alice" (case-insensitive) but must NOT
+        // substring-match "alicent".
+        let resolved = resolve_channels(&[], true, 0, &["alice".to_string()], &all).unwrap();
+        assert_eq!(resolved.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["D1"]);
     }
 
     #[test]
