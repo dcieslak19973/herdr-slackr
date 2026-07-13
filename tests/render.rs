@@ -101,6 +101,38 @@ fn feed_row_shows_channel_author_time_and_text() {
 }
 
 #[test]
+fn a_collapsed_threads_reply_renders_as_an_activity_row_at_its_own_position() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.touch();
+
+    let out = render_ready(&app);
+    assert!(out.contains("\u{21b3} @dan replied: reply one"), "{out}");
+    // The marker must still show too — the activity row is additional, not a replacement.
+    assert!(out.contains("\u{21b3} 1 replies"), "{out}");
+}
+
+#[test]
+fn an_expanded_threads_reply_shows_no_activity_row() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.touch();
+    // cursor defaults to the root's own Message row; Enter on it expands the thread (spec §5).
+    let cancelled = AtomicBool::new(false);
+    app.toggle_expand_or_read(&rest(&cancelled));
+
+    let out = render_ready(&app);
+    assert!(!out.contains("replied:"), "{out}");
+    assert!(out.contains("reply one"), "{out}");
+}
+
+#[test]
 fn thread_marker_renders_the_reply_count() {
     let mut app = App::empty("SELF");
     app.add_conversation("C1", "eng", ConvKind::Channel);
@@ -321,4 +353,131 @@ fn mentions_tab_status_has_no_t_hint() {
     app.set_tab(Tab::Mentions);
     let out = render_ready(&app);
     assert!(!out.to_lowercase().contains("toggle view"), "{out}");
+}
+
+// ---- thread expand/collapse completion feedback (Task 2, spec §5) ---------------------------
+
+#[test]
+fn collapsing_a_thread_shows_a_collapsed_status_line() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.touch();
+    let cancelled = AtomicBool::new(false);
+    app.toggle_expand_or_read(&rest(&cancelled)); // expand (cursor defaults to the root row)
+    app.cursor = 0;
+    app.toggle_expand_or_read(&rest(&cancelled)); // collapse back
+
+    let out = render_ready(&app);
+    assert!(out.contains("thread collapsed"), "{out}");
+}
+
+// ---- nav keys + new-arrivals indicator (Task 1, spec §2-§4) --------------------------------
+
+// ---- context-aware "enter expand/collapse thread" footer hint (Task 2, spec §5) -------------
+
+#[test]
+fn footer_hints_enter_to_expand_when_the_cursor_is_on_a_thread_roots_message_row() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.touch(); // cursor defaults to row 0: the root's own Message row.
+
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("enter expand/collapse thread"), "{out}");
+}
+
+#[test]
+fn footer_hints_enter_to_expand_when_the_cursor_is_on_the_marker_row() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.touch();
+    app.move_cursor(1); // the ThreadMarker row
+
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("enter expand/collapse thread"), "{out}");
+}
+
+#[test]
+fn footer_hints_enter_to_expand_when_the_cursor_is_on_an_activity_row() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.touch();
+    app.move_cursor(2); // the reply's activity row
+
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("enter expand/collapse thread"), "{out}");
+}
+
+#[test]
+fn footer_has_no_thread_hint_when_the_cursor_is_on_a_plain_message() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "just chatting")));
+    app.touch();
+
+    let out = render_ready(&app);
+    assert!(!out.to_lowercase().contains("enter expand/collapse thread"), "{out}");
+}
+
+#[test]
+fn status_hints_the_top_bottom_jump_keys_on_every_tab() {
+    let mut app = App::empty("SELF");
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("g/g: top/bottom"), "{out}");
+
+    app.set_tab(Tab::Mentions);
+    let out = render_ready(&app);
+    assert!(out.to_lowercase().contains("g/g: top/bottom"), "{out}");
+}
+
+#[test]
+fn jump_newest_keeps_the_last_row_visible_in_a_short_viewport() {
+    let mut app = tall_feed(30);
+    app.jump_first(); // start scrolled away from the bottom
+    app.jump_newest();
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("row 29"), "G/End must land on the last row:\n{out}");
+    assert!(!out.contains("row 0"), "the first row scrolls out of view:\n{out}");
+}
+
+#[test]
+fn jump_first_keeps_the_first_row_visible_in_a_short_viewport() {
+    let mut app = tall_feed(30);
+    app.jump_newest(); // start at the bottom
+    app.jump_first();
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("row 0"), "g/Home must land on the first row:\n{out}");
+    assert!(!out.contains("row 29"), "the last row scrolls out of view:\n{out}");
+}
+
+#[test]
+fn the_new_arrivals_indicator_is_hidden_with_nothing_pending() {
+    let mut app = tall_feed(30);
+    // `tall_feed` builds via plain `apply` calls, whose cursor defaults to row 0 (see the
+    // top-viewport test above) rather than `build`'s explicit at-the-bottom snap — establish
+    // that baseline explicitly here so this test starts from the common "caught up" state.
+    app.jump_newest();
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(!out.contains("new"), "no overlay expected when pending_new is 0:\n{out}");
+}
+
+#[test]
+fn the_new_arrivals_indicator_shows_the_pending_count_once_scrolled_up() {
+    let mut app = tall_feed(30);
+    app.jump_newest(); // establish the at-the-bottom baseline (see the test above)
+    app.jump_first(); // scroll away from the bottom
+
+    app.apply(SocketEvent::Message(msg("C1", "5000.0", None, "U1", "an arrival off-screen")));
+
+    let out = render_ready_sized(&app, 60, 10);
+    assert!(out.contains("\u{2193} 1 new"), "expected the indicator with count 1:\n{out}");
 }

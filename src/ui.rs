@@ -101,6 +101,25 @@ fn render_body(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     #[allow(clippy::cast_possible_truncation)]
     let offset = offset as u16;
     frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), area);
+    render_new_arrivals_indicator(frame, palette, area, app.pending_new());
+}
+
+/// The bottom-edge `↓ n new` overlay (spec §3), drawn over the body's last on-screen row,
+/// right-aligned, in the same muted `overlay1` accent `row_line` uses for markers/dividers, with
+/// the same `surface0` fill the tab bar/status line use so it stays legible over whatever row
+/// happens to sit last. Drawn after the row `Paragraph` so it paints on top; a no-op when
+/// nothing is pending or the body has no rows to overlay onto.
+fn render_new_arrivals_indicator(frame: &mut Frame, palette: &Palette, area: Rect, pending: usize) {
+    if pending == 0 || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = format!("\u{2193} {pending} new");
+    #[allow(clippy::cast_possible_truncation)]
+    let width = (text.chars().count() as u16).min(area.width);
+    let overlay =
+        Rect { x: area.x + area.width - width, y: area.y + area.height - 1, width, height: 1 };
+    let p = Paragraph::new(text).style(Style::default().fg(palette.overlay1).bg(palette.surface0));
+    frame.render_widget(p, overlay);
 }
 
 /// The first visible row for a `height`-row-tall viewport that keeps `cursor` on-screen among
@@ -171,9 +190,13 @@ fn cell_style(fg: Color, bg: Option<Color>) -> Style {
 }
 
 /// `app.status`, with a `polling` marker appended when in fallback mode and not already named
-/// in the status text, plus a `t: toggle view` key hint on the Feed tab (spec §3: "`t` appears
-/// in the footer") — this pane has no separate footer row, so the hint rides along on the
-/// status line, the bottommost row a user's eye lands on regardless.
+/// in the status text, a `t: toggle view` key hint on the Feed tab (spec §3: "`t` appears in
+/// the footer"), a context-aware `enter expand/collapse thread` hint (spec §5) whenever
+/// `App::selected_is_thread_related` says Enter would actually do something thread-related, and
+/// a `g/G: top/bottom` nav-key hint on every tab (spec §2 — jumping applies uniformly now that
+/// ordering is unified newest-at-bottom everywhere) — this pane has no separate footer row, so
+/// every hint rides along on the status line, the bottommost row a user's eye lands on
+/// regardless.
 fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let mut text = app.status.clone();
     if app.polling && !text.contains("polling") {
@@ -188,10 +211,31 @@ fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
         }
         text.push_str("t: toggle view");
     }
+    if app.selected_is_thread_related() {
+        if !text.is_empty() {
+            text.push_str(" · ");
+        }
+        text.push_str("enter expand/collapse thread");
+    }
+    if !text.is_empty() {
+        text.push_str(" · ");
+    }
+    text.push_str("g/G: top/bottom");
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(palette.peach).bg(palette.surface0)),
         area,
     );
+}
+
+/// The active tab's body viewport height for a `total_rows`-tall terminal frame: the tab bar and
+/// status line each claim one fixed row (see `render_ready`'s `Layout::vertical`), so the body
+/// gets whatever's left, floored at `0` for a frame too short to fit both chrome rows. Exposed so
+/// Task 7's event loop can compute the same height *before* calling `terminal.draw` (from a raw
+/// `crossterm::terminal::size()`, with no `Frame` yet available) and feed it to
+/// `App::set_viewport_rows` ahead of a `page_move` needing it.
+#[must_use]
+pub fn body_rows(total_rows: u16) -> usize {
+    total_rows.saturating_sub(2) as usize
 }
 
 /// The OSC 0 terminal-title escape naming the unread mention count — the nav-presence spike

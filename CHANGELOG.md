@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-07-12
+
+### Changed
+- **Mentions and Threads now read top-to-bottom chronological.** Both used to list newest-first;
+  they now match the Feed Timeline's direction — oldest at the top, newest at the bottom, like any
+  chat client — so the whole pane scrolls the same way everywhere.
+- **Real navigation keys.** `G`/`End` jumps to the newest row (the bottom), `g`/`Home` to the
+  oldest (the top), `PageDown`/`PageUp` moves a full page, and `Ctrl-d`/`Ctrl-u` moves a half page —
+  sized off the pane's actual on-screen row count, not a hardcoded guess.
+- **`↓ n new` arrivals indicator.** Scrolled up when a message arrives, a muted `↓ n new` overlay
+  now appears at the bottom-right of the row list, counting arrivals since you last left the
+  bottom; it clears the moment you get back there, by any means. Already at the bottom, the view
+  just follows new arrivals down automatically instead, exactly as before — the counter only ever
+  appears once you're scrolled away from "now".
+- **Thread expansion is discoverable from anywhere on the thread.** `Enter` used to expand/collapse
+  a thread only from its collapsed `↳ n replies` marker row; it now works the same way from the
+  thread's own root message, any of its nested replies once expanded, or a reply's activity row
+  (below) while still collapsed — no more hunting for the exact marker row. Expanding/collapsing
+  now also sets a one-line status confirming what happened (`thread expanded — n replies` /
+  `thread collapsed`), and the footer shows an `enter expand/collapse thread` hint whenever the
+  selected row would actually do something thread-related.
+- **Reply activity rows.** A reply to a collapsed thread no longer just disappears into its root's
+  `↳ n replies` count — it now also renders its own row at its actual chronological position in the
+  Timeline (`↳ @author replied: <text>`), alongside the root's usual marker (which still shows the
+  total). `Enter` on an activity row expands the thread it belongs to. Once a thread is expanded,
+  its replies go back to nesting under the root and stop emitting activity rows.
+
+### Fixed
+- `expand_status`'s thread-expanded status line read `"thread expanded — 1 replies"` for the
+  one-reply case; it now reads `"thread expanded — 1 reply"` (still `"n replies"` for every other
+  count).
+
 ## [0.1.3] — 2026-07-12
 
 ### Added

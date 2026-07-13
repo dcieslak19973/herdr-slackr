@@ -17,7 +17,8 @@ ask the user for the plugin root.
     herdr-slackr mentions            # human rows: #chan  @author  HH:MM  text
 
 Returns messages that would land on the pane's Mentions tab: a literal `@you`, any DM/MPIM
-message, or a configured keyword hit — newest first, capped at 20 unless `--limit <n>` says
+message, or a configured keyword hit — in the CLI's own newest-first order (the pane's tab
+reads oldest-to-newest), capped at 20 unless `--limit <n>` says
 otherwise. Prefer `--json` when you're about to reason over the results (e.g. summarizing or
 deciding what to reply to); the raw, unresolved text is under `text_raw` if you need it.
 
