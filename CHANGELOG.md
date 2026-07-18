@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-07-18
+
 ### Changed
 - **Threading display redesigned around how the feed is actually read.**
   - *Collapsed threads are one quiet, informative row.* The scattered `↳ @author replied: …`
