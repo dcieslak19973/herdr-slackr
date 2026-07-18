@@ -130,6 +130,7 @@ poll_fallback_secs = 30                  # seconds between polls while the socke
 dm_limit = 20                            # cap on subscribed DMs/MPIMs when dms=true; 0..=200
 dm_allow = ["alice", "Bob Smith"]        # DM/MPIM names always subscribed, ignoring dm_limit (default none)
 focus_keywords = ["incident", "p1"]      # Focus-view triggers, distinct from `keywords` (default none)
+lookback_days = 7                        # how far back any history fetch reaches; 0..=365, 0 = unlimited
 ```
 
 `channels` is the only required key; every other key has a documented default. A missing config
@@ -161,9 +162,25 @@ the rate limit or the budget) rather than skipping past it; a socket reconnect a
 pending cooldown immediately, since a healthy socket means Slack has already accepted the
 connection. Because Socket Mode never redelivers events that fired while the connection was down,
 every reconnect also arms a one-time catch-up sweep: each subscribed conversation gets one
-watermarked history fetch, paced out in 8-request batches every 10 seconds — a conversation that
+watermarked history fetch, paced out in 8-request batches every 15 seconds — a conversation that
 missed nothing answers with an empty body, so a sweep after a brief blip is close to free, while a
-sweep over real gaps spreads itself out under the same budget. The workspace's `users.list`
+sweep over real gaps spreads itself out under the same budget.
+
+`lookback_days` (default 7, valid `0..=365`, `0` = unlimited) is the *depth* companion to that
+request-budget *rate* cap: startup backfill drops messages older than the horizon, and every
+incremental fetch (polling, catch-up, the DM scan) clamps its "fetch since" bound to it. Without a
+horizon, a watermark left over from a two-week gap would send pagination chasing history the
+300-message retention cap would mostly discard anyway — pure request waste. With it, the deepest
+any conversation's catch-up can reach is bounded no matter how long the pane was away.
+
+**Shared app credentials.** Slack rate limits pool per app + workspace — not per pane, not per
+person. If the Slack app behind your tokens is shared (several teammates running herdr-slackr, or
+other tooling on the same bot), every consumer draws from the same budget. herdr-slackr's own
+worst sustained rate is deliberately kept well under half of Tier 3 (~8 requests/30s polling,
+~8/15s during a catch-up sweep, ≤2 per 5-minute DM scan) precisely so it behaves as a good tenant
+on a shared key; if you still see `slack rate limit` notices while the pane is idle-ish, the
+budget is being spent elsewhere on the same app, and raising `poll_fallback_secs` and/or lowering
+`lookback_days` are the two knobs that cut this pane's share further. The workspace's `users.list`
 directory (used for display names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so
 a pane restart or a CLI invocation doesn't refetch the whole member list every time. Startup
 backfill retries a rate-limited conversation exactly once (sleeping the real `Retry-After` first)

@@ -249,6 +249,10 @@ pub struct App {
     /// substring via `entities::keyword_hit` — deliberately not reusing `keywords` (the Mentions
     /// trigger list); see `PluginConfig::focus_keywords`'s doc for why the two must stay distinct.
     focus_keywords: Vec<String>,
+    /// The look-back horizon in days (`PluginConfig::lookback_days`, 0 = unlimited): backfill
+    /// drops messages older than this, and every incremental fetch clamps its `oldest` to it
+    /// (see [`lookback_cutoff_ts`]/[`clamp_oldest`]).
+    lookback_days: u64,
     /// Per-conversation message counts, maintained incrementally by `upsert_new`/`upsert_edit`
     /// (insert paths), `remove`, and `prune_conv` itself — so the "is this conversation over
     /// its retention cap" check is O(1) per insert instead of a full store scan (`messages` is
@@ -383,13 +387,15 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: config.focus_keywords().to_vec(),
+            lookback_days: config.lookback_days(),
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs,
         };
 
+        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), app.lookback_days);
         for conv in app.conversations.clone() {
-            match backfill_one(&mut app, rest, &conv) {
+            match backfill_one(&mut app, rest, &conv, cutoff.as_deref()) {
                 BackfillOutcome::Ok => {}
                 BackfillOutcome::SkipRemaining => break,
                 BackfillOutcome::Fail(msg) => return Err(msg),
@@ -445,6 +451,10 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            // Unlimited by default in fixtures: `empty` exists for network-free tests, whose
+            // fixture timestamps are tiny epoch-era values a real 7-day horizon (computed from
+            // the actual clock) would silently exclude.
+            lookback_days: 0,
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
@@ -788,7 +798,9 @@ impl App {
         let Some(updated) = conv.updated else {
             return;
         };
-        let oldest = self.dm_last_seen.get(&conv.id).copied().map(updated_ms_to_ts);
+        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), self.lookback_days);
+        let oldest =
+            clamp_oldest(self.dm_last_seen.get(&conv.id).copied().map(updated_ms_to_ts), cutoff);
         match crate::rest::history(rest, &conv.id, 50, oldest.as_deref()) {
             Ok(msgs) => {
                 for msg in msgs {
@@ -873,6 +885,7 @@ impl App {
         // Each conversation costs at least one request, so the budget also bounds how many
         // conversations this batch could possibly visit — plan exactly that many.
         let (indices, planned_next) = next_batch(self.poll_cursor, n, request_budget);
+        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), self.lookback_days);
 
         let mut spent = 0;
         let mut rate_limited = false;
@@ -884,7 +897,7 @@ impl App {
             }
             let conv_id = self.conversations[i].id.clone();
             let conv_name = self.conversations[i].name.clone();
-            let oldest = self.newest_ts.get(&conv_id).cloned();
+            let oldest = clamp_oldest(self.newest_ts.get(&conv_id).cloned(), cutoff.clone());
             match crate::rest::history_counted(rest, &conv_id, 50, oldest.as_deref()) {
                 Ok((msgs, requests)) => {
                     spent += requests;
@@ -1842,18 +1855,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// Fold one conversation's backfill result into `app`, or produce an error naming which
-/// conversation's history fetch failed (spec: "a per-channel history error fails build with an
-/// error naming the channel"). Split out of `build`'s loop so the error-naming path is
-/// unit-tested without a real REST call.
+/// Fold one conversation's backfill result into `app` — dropping messages older than the
+/// look-back `cutoff` ([`within_lookback`]; backfill's plain last-50 fetch is not bounded
+/// server-side the way the incremental paths' `oldest` is, so the horizon is applied here
+/// instead) — or produce an error naming which conversation's history fetch failed (spec: "a
+/// per-channel history error fails build with an error naming the channel"). Split out of
+/// `build`'s loop so the error-naming and horizon paths are unit-tested without a real REST
+/// call.
 fn apply_backfill(
     app: &mut App,
     conv_name: &str,
     msgs: Result<Vec<Message>, RestError>,
+    cutoff: Option<&str>,
 ) -> Result<(), String> {
     let msgs = msgs.map_err(|e| format!("history failed for {conv_name}: {e:?}"))?;
     for msg in msgs {
-        app.upsert_new(msg);
+        if within_lookback(&msg.ts, cutoff) {
+            app.upsert_new(msg);
+        }
     }
     Ok(())
 }
@@ -1919,6 +1938,37 @@ fn resume_cursor(indices: &[usize], planned_next: usize, stopped_at: Option<usiz
 /// conversation's guaranteed minimum of one request.
 fn budget_exhausted(spent: usize, budget: usize) -> bool {
     spent >= budget
+}
+
+/// The look-back horizon as a synthetic Slack `ts` (`<secs>.000000`, same shape trick as
+/// [`updated_ms_to_ts`] — `oldest` only needs a chronological cutoff, not a real message
+/// identity), or `None` when `lookback_days` is `0` (unlimited). This is the *depth* companion
+/// to the request budget's *rate* cap: without it, a watermark from a weeks-long gap sends
+/// every fetch paginating toward history the retention prune would mostly discard — wasted
+/// requests that matter double when the Slack app's rate-limit pool is shared with other
+/// consumers (limits are per app + workspace, not per pane).
+fn lookback_cutoff_ts(now_epoch_secs: u64, lookback_days: u64) -> Option<String> {
+    (lookback_days > 0).then(|| {
+        let cutoff = now_epoch_secs.saturating_sub(lookback_days.saturating_mul(86_400));
+        format!("{cutoff}.000000")
+    })
+}
+
+/// The `oldest` an incremental history fetch should send: the newer of the conversation's
+/// newest-seen watermark and the look-back cutoff ([`lookback_cutoff_ts`]) — the watermark
+/// already bounds a short gap tighter than the horizon does, while a long-gap (or first-ever)
+/// fetch is bounded by the horizon instead of reaching arbitrarily far back.
+fn clamp_oldest(watermark: Option<String>, cutoff: Option<String>) -> Option<String> {
+    match (watermark, cutoff) {
+        (Some(w), Some(c)) => Some(if ts_cmp(&w, &c) == std::cmp::Ordering::Less { c } else { w }),
+        (w, c) => w.or(c),
+    }
+}
+
+/// Whether `ts` is at or inside the look-back horizon (`None` cutoff = unlimited, everything
+/// qualifies). Inclusive at the boundary, matching `clamp_oldest`'s "newer of" rule.
+fn within_lookback(ts: &str, cutoff: Option<&str>) -> bool {
+    cutoff.is_none_or(|c| ts_cmp(ts, c) != std::cmp::Ordering::Less)
 }
 
 /// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
@@ -2087,7 +2137,12 @@ enum BackfillOutcome {
 /// retries the same conversation exactly once via `backfill_retry_decision`. Any error other
 /// than the initial `RateLimited` keeps the unchanged contract: a misconfigured channel fails
 /// `build` loud, naming it.
-fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutcome {
+fn backfill_one(
+    app: &mut App,
+    rest: &Rest,
+    conv: &Conversation,
+    cutoff: Option<&str>,
+) -> BackfillOutcome {
     match crate::rest::history(rest, &conv.id, 50, None) {
         Err(RestError::RateLimited(secs)) => {
             std::thread::sleep(Duration::from_secs(capped_sleep_secs(secs)));
@@ -2095,7 +2150,9 @@ fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutc
             match backfill_retry_decision(&conv.name, retry) {
                 BackfillRetry::Continue(msgs) => {
                     for msg in msgs {
-                        app.upsert_new(msg);
+                        if within_lookback(&msg.ts, cutoff) {
+                            app.upsert_new(msg);
+                        }
                     }
                     BackfillOutcome::Ok
                 }
@@ -2106,7 +2163,7 @@ fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutc
                 BackfillRetry::HardFail(msg) => BackfillOutcome::Fail(msg),
             }
         }
-        other => match apply_backfill(app, &conv.name, other) {
+        other => match apply_backfill(app, &conv.name, other, cutoff) {
             Ok(()) => BackfillOutcome::Ok,
             Err(msg) => BackfillOutcome::Fail(msg),
         },
@@ -2152,9 +2209,10 @@ mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
         RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, budget_exhausted,
-        capped_sleep_secs, catchup_after_reconnect, cooldown_active, dm_scan_due, expand_status,
-        format_ts, key_for, marker_count, next_batch, pick_changed_dm, poll_error_status,
-        resolve_im_names, resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
+        capped_sleep_secs, catchup_after_reconnect, clamp_oldest, cooldown_active, dm_scan_due,
+        expand_status, format_ts, key_for, lookback_cutoff_ts, marker_count, next_batch,
+        pick_changed_dm, poll_error_status, resolve_im_names, resume_cursor, thread_slot_count,
+        track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -2218,6 +2276,10 @@ mod tests {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            // Unlimited by default in fixtures: `empty` exists for network-free tests, whose
+            // fixture timestamps are tiny epoch-era values a real 7-day horizon (computed from
+            // the actual clock) would silently exclude.
+            lookback_days: 0,
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
@@ -2847,6 +2909,60 @@ mod tests {
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
     }
 
+    // ---- look-back horizon (`lookback_days`): bounds how deep any history fetch reaches, the
+    // *depth* companion to the request budget's *rate* cap — a watermark from a two-week gap
+    // must not send pagination chasing history the retention prune would mostly discard,
+    // especially on a Slack app whose rate-limit pool is shared with other consumers. --------
+
+    #[test]
+    fn lookback_cutoff_ts_is_none_when_unlimited() {
+        assert_eq!(lookback_cutoff_ts(1_752_300_000, 0), None);
+    }
+
+    #[test]
+    fn lookback_cutoff_ts_subtracts_whole_days_as_a_synthetic_ts() {
+        // 7 days = 604_800 seconds; 1_752_300_000 - 604_800 = 1_751_695_200.
+        assert_eq!(lookback_cutoff_ts(1_752_300_000, 7), Some("1751695200.000000".to_string()));
+    }
+
+    #[test]
+    fn lookback_cutoff_ts_saturates_rather_than_underflowing() {
+        assert_eq!(lookback_cutoff_ts(100, 7), Some("0.000000".to_string()));
+    }
+
+    #[test]
+    fn clamp_oldest_takes_the_newer_of_watermark_and_cutoff() {
+        let clamp = |w: Option<&str>, c: Option<&str>| {
+            clamp_oldest(w.map(str::to_string), c.map(str::to_string))
+        };
+        // Watermark newer than cutoff: the watermark already bounds the fetch tighter.
+        assert_eq!(clamp(Some("100.000001"), Some("50.000000")), Some("100.000001".to_string()));
+        // Watermark older than cutoff (a long gap): the horizon wins.
+        assert_eq!(clamp(Some("100.000001"), Some("200.000000")), Some("200.000000".to_string()));
+        // No watermark yet (first fetch): the horizon alone bounds it.
+        assert_eq!(clamp(None, Some("200.000000")), Some("200.000000".to_string()));
+        // Unlimited look-back: watermark behavior unchanged.
+        assert_eq!(clamp(Some("100.000001"), None), Some("100.000001".to_string()));
+        assert_eq!(clamp(None, None), None);
+    }
+
+    #[test]
+    fn apply_backfill_drops_messages_older_than_the_lookback_cutoff() {
+        let mut app = empty_app();
+        let msgs = vec![
+            msg("C1", "50.000000", None, "U1", "beyond the horizon"),
+            msg("C1", "100.000000", None, "U1", "exactly at the horizon"),
+            msg("C1", "150.000000", None, "U1", "inside the horizon"),
+        ];
+        apply_backfill(&mut app, "eng", Ok(msgs), Some("100.000000")).unwrap();
+        assert!(!app.messages.contains_key(&key_for("C1", "50.000000")));
+        assert!(
+            app.messages.contains_key(&key_for("C1", "100.000000")),
+            "the horizon is inclusive"
+        );
+        assert!(app.messages.contains_key(&key_for("C1", "150.000000")));
+    }
+
     // ---- request-budget batching: POLL_BATCH meters what Slack meters — requests, not
     // conversations. A paginated catch-up fetch can cost up to HISTORY_PAGE_CAP requests for
     // one conversation, so a conversation-counted batch could issue ~10× its intended request
@@ -3145,9 +3261,13 @@ mod tests {
     #[test]
     fn a_backfill_history_error_fails_build_naming_the_channel() {
         let mut app = empty_app();
-        let error =
-            apply_backfill(&mut app, "eng", Err(RestError::SlackError("channel_not_found".into())))
-                .unwrap_err();
+        let error = apply_backfill(
+            &mut app,
+            "eng",
+            Err(RestError::SlackError("channel_not_found".into())),
+            None,
+        )
+        .unwrap_err();
         assert!(error.contains("eng"), "{error}");
         assert!(error.contains("channel_not_found"), "{error}");
     }
@@ -3155,7 +3275,8 @@ mod tests {
     #[test]
     fn a_successful_backfill_upserts_every_message() {
         let mut app = empty_app();
-        apply_backfill(&mut app, "eng", Ok(vec![msg("C1", "1.0", None, "U1", "hi")])).unwrap();
+        apply_backfill(&mut app, "eng", Ok(vec![msg("C1", "1.0", None, "U1", "hi")]), None)
+            .unwrap();
         app.touch();
         assert_eq!(app.feed_rows().len(), 1);
     }
@@ -3835,7 +3956,7 @@ mod tests {
             kind: ConvKind::Channel,
             updated: None,
         };
-        match super::backfill_one(&mut app, &rest, &conv) {
+        match super::backfill_one(&mut app, &rest, &conv, None) {
             BackfillOutcome::Fail(message) => assert!(message.contains("eng"), "{message}"),
             _ => panic!("expected Fail for a non-rate-limit history error"),
         }

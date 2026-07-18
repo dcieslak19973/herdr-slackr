@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`lookback_days` config key (default 7, `0..=365`, `0` = unlimited).** Bounds how far back any
+  history fetch reaches — the *depth* companion to the request budget's *rate* cap. Startup
+  backfill drops messages older than the horizon, and every incremental fetch (polling, the
+  post-reconnect catch-up sweep, the DM scan) clamps its `oldest` to it, so a watermark left over
+  from a weeks-long gap no longer sends pagination chasing history the 300-message retention cap
+  would mostly discard anyway. Deliberately conservative for shared Slack apps, where the
+  rate-limit pool is per app + workspace and this pane is not the only consumer.
+
+### Changed
+- **Catch-up sweep pacing relaxed from 10s to 15s between batches.** Worst sustained sweep rate
+  drops from ~48 to ~32 requests/min, leaving real Tier-3 headroom for other consumers of a
+  shared app key.
+
 ### Fixed
 - **Poll batches now meter requests, not conversations.** History pagination made one
   conversation cost anywhere from one request (caught up) to ten (a large gap), so an

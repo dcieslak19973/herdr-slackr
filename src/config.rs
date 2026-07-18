@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-const PLUGIN_CONFIG_KEYS: [&str; 8] = [
+const PLUGIN_CONFIG_KEYS: [&str; 9] = [
     "channels",
     "dms",
     "keywords",
@@ -19,6 +19,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 8] = [
     "dm_limit",
     "dm_allow",
     "focus_keywords",
+    "lookback_days",
 ];
 
 /// The default theme name when `config.toml` omits `theme`.
@@ -36,6 +37,12 @@ pub const DEFAULT_DM_LIMIT: u32 = 20;
 /// Valid range for `dm_limit`; `0` means "no DMs even when `dms = true`".
 const DM_LIMIT_RANGE: std::ops::RangeInclusive<u32> = 0..=200;
 
+/// The default look-back horizon, in days, when `config.toml` omits `lookback_days`.
+pub const DEFAULT_LOOKBACK_DAYS: u64 = 7;
+
+/// Valid range for `lookback_days`; `0` means unlimited (no look-back horizon at all).
+const LOOKBACK_DAYS_RANGE: std::ops::RangeInclusive<u64> = 0..=365;
+
 /// One validated snapshot of `$HERDR_PLUGIN_CONFIG_DIR/config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginConfig {
@@ -47,6 +54,7 @@ pub struct PluginConfig {
     dm_limit: u32,
     dm_allow: Vec<String>,
     focus_keywords: Vec<String>,
+    lookback_days: u64,
 }
 
 impl PluginConfig {
@@ -99,6 +107,16 @@ impl PluginConfig {
     /// them would mean turning one on always affects the other. Defaults to empty.
     pub fn focus_keywords(&self) -> &[String] {
         &self.focus_keywords
+    }
+
+    /// How many days back any history fetch may reach: startup backfill drops messages older
+    /// than this horizon, and the incremental poll/catch-up/DM-scan paths clamp their `oldest`
+    /// to it — bounding both how much history the pane retains attention on and how many
+    /// paginated requests a large gap can cost (the *depth* companion to the request-budget
+    /// *rate* cap; especially important when the Slack app's rate-limit pool is shared with
+    /// other consumers). Defaults to 7; valid range is `0..=365`, where `0` means unlimited.
+    pub fn lookback_days(&self) -> u64 {
+        self.lookback_days
     }
 }
 
@@ -231,6 +249,17 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             .ok_or_else(|| value_error(path, "focus_keywords", expected))?;
     }
 
+    let mut lookback_days = DEFAULT_LOOKBACK_DAYS;
+    if let Some(value) = table.get("lookback_days") {
+        let expected = "an integer in 0..=365 (0 means unlimited)";
+        let raw = value.as_integer().ok_or_else(|| value_error(path, "lookback_days", expected))?;
+        let days = u64::try_from(raw).map_err(|_| value_error(path, "lookback_days", expected))?;
+        if !LOOKBACK_DAYS_RANGE.contains(&days) {
+            return Err(value_error(path, "lookback_days", expected));
+        }
+        lookback_days = days;
+    }
+
     Ok(PluginConfig {
         channels,
         dms,
@@ -240,6 +269,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         dm_limit,
         dm_allow,
         focus_keywords,
+        lookback_days,
     })
 }
 
@@ -311,6 +341,7 @@ mod tests {
         assert_eq!(config.dm_limit(), 20);
         assert!(config.dm_allow().is_empty());
         assert!(config.focus_keywords().is_empty());
+        assert_eq!(config.lookback_days(), 7);
     }
 
     #[test]
@@ -327,6 +358,7 @@ mod tests {
                 "dm_limit = 15\n",
                 "dm_allow = [\"alice\", \"Bob Smith\"]\n",
                 "focus_keywords = [\"incident\", \"p1\"]\n",
+                "lookback_days = 14\n",
             ),
         );
         let config = super::plugin_config_in(dir.path()).unwrap();
@@ -338,6 +370,7 @@ mod tests {
         assert_eq!(config.dm_limit(), 15);
         assert_eq!(config.dm_allow(), ["alice", "Bob Smith"]);
         assert_eq!(config.focus_keywords(), ["incident", "p1"]);
+        assert_eq!(config.lookback_days(), 14);
     }
 
     #[test]
@@ -419,6 +452,9 @@ mod tests {
             ("channels = [\"#a\"]\ndm_allow = [\"\"]\n", "dm_allow"),
             ("channels = [\"#a\"]\nfocus_keywords = \"incident\"\n", "focus_keywords"),
             ("channels = [\"#a\"]\nfocus_keywords = [1]\n", "focus_keywords"),
+            ("channels = [\"#a\"]\nlookback_days = \"7\"\n", "lookback_days"),
+            ("channels = [\"#a\"]\nlookback_days = -1\n", "lookback_days"),
+            ("channels = [\"#a\"]\nlookback_days = 366\n", "lookback_days"),
         ];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -446,6 +482,15 @@ mod tests {
         assert_eq!(super::plugin_config_in(dir.path()).unwrap().dm_limit(), 0);
         write(dir.path(), "channels = [\"#a\"]\ndm_limit = 200\n");
         assert_eq!(super::plugin_config_in(dir.path()).unwrap().dm_limit(), 200);
+    }
+
+    #[test]
+    fn lookback_days_boundary_values_are_valid_and_zero_means_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "channels = [\"#a\"]\nlookback_days = 0\n");
+        assert_eq!(super::plugin_config_in(dir.path()).unwrap().lookback_days(), 0);
+        write(dir.path(), "channels = [\"#a\"]\nlookback_days = 365\n");
+        assert_eq!(super::plugin_config_in(dir.path()).unwrap().lookback_days(), 365);
     }
 
     #[test]

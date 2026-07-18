@@ -42,11 +42,13 @@ use crate::ui::PaneState;
 /// channel and re-check the polling-fallback clock even with no keypress pending.
 const TICK: Duration = Duration::from_millis(250);
 
-/// Pacing between post-reconnect catch-up batches (`App::catchup_tick`, `POLL_BATCH`
-/// conversations each): fast enough that a typical subscription list is swept within a
-/// minute of reconnecting, slow enough that a large one (whose sweep is one `history` call
-/// per conversation) stays comfortably under Slack's per-minute request budget.
-const CATCHUP_INTERVAL: Duration = Duration::from_secs(10);
+/// Pacing between post-reconnect catch-up batches (`App::catchup_tick`, a `POLL_BATCH`-request
+/// budget each): fast enough that a typical subscription list is swept within a minute or two
+/// of reconnecting, slow enough that the sweep's worst sustained rate (~8 requests / 15s ≈
+/// 32/min) leaves real headroom under Slack's Tier-3 budget (~50/min) — deliberately
+/// conservative because Slack rate limits pool per app + workspace, so a shared bot key means
+/// this pane is never the only thing spending from it.
+const CATCHUP_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Entry point: resolve config/tokens, build the pane, run the loop, restore the terminal.
 /// A config or token failure (or `App::build`'s own REST failure) never crashes — it renders
