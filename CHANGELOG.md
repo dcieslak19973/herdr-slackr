@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Threading display redesigned around how the feed is actually read.**
+  - *Collapsed threads are one quiet, informative row.* The scattered `↳ @author replied: …`
+    rows a busy thread sprayed through the Timeline are gone; the root's marker now carries the
+    freshness itself — `↳ 3 replies · @alice: sounds good` — count first so it survives any pane
+    width. The marker's arrival is the newest reply's, so the unread divider and the `↓ n new`
+    counter still surface new thread activity exactly once, at the thread.
+  - *Expanded replies sit on an aligned connector rail.* Replies swap the repeated channel label
+    for muted `├─`/`└─` connectors padded to the root label's width, so author/time/text columns
+    stay aligned and the thread reads as one visual block with an unmistakable end. The leftmost
+    character now tells the row type at a glance (`#`/`@` message, `├`/`└` in-thread, `↳`
+    collapsed summary).
+  - *The Threads view is a real triage digest.* Each thread gets a bold header — reply count
+    first, time column showing the thread's latest activity (the view's sort key) rather than
+    the root's age — then its newest three replies on the rail, with one muted `… n earlier
+    replies` line standing in for the rest (Enter on it, or anywhere in the thread, refetches
+    the full thread).
+
 ### Added
 - **`lookback_days` config key (default 7, `0..=365`, `0` = unlimited).** Bounds how far back any
   history fetch reaches — the *depth* companion to the request budget's *rate* cap. Startup

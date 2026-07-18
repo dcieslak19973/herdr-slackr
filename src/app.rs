@@ -71,9 +71,27 @@ pub struct Row {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     Message,
-    ThreadMarker { replies: usize, expanded: bool },
+    /// A thread reply rendered beneath its root (Timeline expanded, or the Threads digest):
+    /// `conv_label` carries the tree-connector rail (`├─`/`└─`, padded to the root label's
+    /// width so author/time/text columns stay aligned — see [`reply_rail`]) instead of
+    /// repeating the channel name; `last` picks the closing `└─` glyph and lets the renderer
+    /// know where the thread block ends. Selection-wise a reply is still a message
+    /// (`SelKind::Message`), so identity resolution across views is unchanged.
+    Reply {
+        last: bool,
+    },
+    /// The Threads digest's per-thread header row: the root message styled bold, its text led
+    /// by the reply count ([`digest_header_text`]) and its time column showing the thread's
+    /// *latest activity* (the digest's sort key), not the root's own age.
+    ThreadHeader,
+    ThreadMarker {
+        replies: usize,
+        expanded: bool,
+    },
     Divider,
-    Mention { read: bool },
+    Mention {
+        read: bool,
+    },
 }
 
 /// Which row-kind a selected `(conv, ts)` identity refers to. Needed because a thread root's
@@ -92,7 +110,12 @@ fn sel_kind_of(row: &Row) -> SelKind {
     match row.kind {
         RowKind::ThreadMarker { .. } => SelKind::ThreadMarker,
         RowKind::Mention { .. } => SelKind::Mention,
-        RowKind::Message | RowKind::Divider => SelKind::Message,
+        // A reply rail row and a digest header are both, identity-wise, the message they
+        // render (the reply / the thread root) — sharing `SelKind::Message` is what lets a
+        // selection survive a view flip (see the module doc's `SelKind` story).
+        RowKind::Message | RowKind::Reply { .. } | RowKind::ThreadHeader | RowKind::Divider => {
+            SelKind::Message
+        }
     }
 }
 
@@ -305,6 +328,13 @@ const MAX_PER_CONV: usize = 300;
 /// messages, so the prune's oldest-first sweep runs once per `PRUNE_SLACK` inserts (amortized)
 /// rather than on every single arrival at the cap boundary.
 const PRUNE_SLACK: usize = 50;
+
+/// How many of a thread's newest replies the Threads digest shows beneath its header; anything
+/// older collapses into one muted `… n earlier replies` row. The digest is a triage surface —
+/// which threads are active, what was just said — not an archive: a 40-reply thread rendered in
+/// full would push every other thread off screen, and the full thread is one Enter away
+/// (`refresh_thread`) in either view.
+const DIGEST_REPLY_CAP: usize = 3;
 
 impl App {
     /// Build the initial state: resolve configured channel names to ids (erroring on an
@@ -1151,17 +1181,12 @@ impl App {
         for stored in self.messages.values() {
             if let Some(root_ts) = stored.msg.thread_ts.clone() {
                 if self.messages.contains_key(&key_for(&stored.msg.conv, &root_ts)) {
-                    if self.expanded.contains(&(stored.msg.conv.clone(), root_ts.clone())) {
-                        continue; // nested under its root below (today's behavior).
-                    }
-                    // Spec §6: a reply to a *collapsed* thread must not simply vanish — it gets
-                    // a discoverable activity row at its own chronological position (in addition
-                    // to the root's `ThreadMarker`, pushed when the root itself was processed).
-                    rows.push((
-                        stored.arrival,
-                        Some((stored.msg.conv.clone(), stored.msg.ts.clone())),
-                        self.activity_row(&stored.msg),
-                    ));
+                    // A reply whose root is locally known renders only through its root:
+                    // nested beneath it when the thread is expanded, or summarized into the
+                    // root's enriched `ThreadMarker` (count + latest-reply snippet) when
+                    // collapsed — never as its own chronological row. The marker's arrival
+                    // (the newest reply's) still places the unread divider, so the catch-up
+                    // scan surfaces new thread activity exactly once, at the thread.
                     continue;
                 }
                 // Orphaned reply: its root predates our backfill horizon (or was otherwise
@@ -1192,11 +1217,13 @@ impl App {
             replies.sort_by(|a, b| ts_cmp(&a.msg.ts, &b.msg.ts));
 
             if self.expanded.contains(&(conv.clone(), root_ts.clone())) {
-                for reply in &replies {
+                let label_width = self.conv_label(&conv).chars().count();
+                let n = replies.len();
+                for (i, reply) in replies.iter().enumerate() {
                     rows.push((
                         reply.arrival,
                         Some((conv.clone(), reply.msg.ts.clone())),
-                        self.message_row(&reply.msg),
+                        self.reply_row(&reply.msg, i + 1 == n, label_width),
                     ));
                 }
             } else {
@@ -1213,7 +1240,13 @@ impl App {
                         conv_label: self.conv_label(&conv),
                         author: String::new(),
                         time_hhmm: String::new(),
-                        text: format!("\u{21b3} {count} replies"),
+                        text: {
+                            let latest = self.latest_reply_summary(&replies);
+                            marker_text(
+                                count,
+                                latest.as_ref().map(|(a, t)| (a.as_str(), t.as_str())),
+                            )
+                        },
                         kind: RowKind::ThreadMarker { replies: count, expanded: false },
                     },
                 ));
@@ -1332,27 +1365,61 @@ impl App {
         let mut rows: Vec<IdRow> = Vec::new();
         for thread in threads {
             let id = Some((thread.conv.clone(), thread.root_ts.clone()));
-            let root_row = match thread.root_msg {
-                Some(root) => self.message_row(&root.msg),
-                // Synthetic header: same shape/`SelKind` as a real root row (`RowKind::Message`,
-                // via `message_row`'s own default), so selecting it and hitting Enter still
-                // routes through `refresh_thread` → `conversations.replies`, which returns the
-                // real root as the first message; the next `upsert_new` inserts it under this
-                // same key, and the very next projection naturally replaces this synthetic row
+            // The digest's sort key is latest activity, so that's what the header's time
+            // column shows — a days-old root time next to an activity ordering would mislead
+            // the triage scan (`format_ts` dates it automatically when older than today).
+            let activity_ts =
+                thread.replies.last().map_or_else(|| thread.root_ts.clone(), |r| r.msg.ts.clone());
+            let count = thread.root_msg.map_or(thread.replies.len(), |root| {
+                marker_count(root.msg.reply_count, thread.replies.len())
+            });
+            let header = match thread.root_msg {
+                Some(root) => {
+                    let mut row = self.message_row(&root.msg);
+                    row.text = digest_header_text(count, &row.text);
+                    row.time_hhmm = format_ts(&activity_ts, SystemTime::now());
+                    row.kind = RowKind::ThreadHeader;
+                    row
+                }
+                // Synthetic header for a root never seen locally: same `SelKind::Message`
+                // identity as a real header, so selecting it and hitting Enter still routes
+                // through `refresh_thread` → `conversations.replies`, which returns the real
+                // root as its first message; the next projection replaces this synthetic row
                 // with the real one — no explicit cleanup needed anywhere.
                 None => Row {
                     conv_label: self.conv_label(&thread.conv),
                     author: String::new(),
-                    time_hhmm: format_ts(&thread.root_ts, SystemTime::now()),
-                    text: "(thread — root not loaded)".to_string(),
-                    kind: RowKind::Message,
+                    time_hhmm: format_ts(&activity_ts, SystemTime::now()),
+                    text: digest_header_text(count, "(thread — root not loaded)"),
+                    kind: RowKind::ThreadHeader,
                 },
             };
-            rows.push((id, root_row));
-            for reply in thread.replies {
-                let mut row = self.message_row(&reply.msg);
-                row.text = format!("\u{21b3} {}", row.text);
-                rows.push((Some((thread.conv.clone(), reply.msg.ts.clone())), row));
+            rows.push((id.clone(), header));
+
+            // The digest is a triage surface, not an archive: only the last few replies show,
+            // with a muted overflow row (spec: Enter anywhere in the thread — this row
+            // included, it carries the root's id — refetches the full thread).
+            let shown_from = thread.replies.len().saturating_sub(DIGEST_REPLY_CAP);
+            if shown_from > 0 {
+                rows.push((
+                    id,
+                    Row {
+                        conv_label: String::new(),
+                        author: String::new(),
+                        time_hhmm: String::new(),
+                        text: format!("… {shown_from} earlier replies"),
+                        kind: RowKind::ThreadMarker { replies: shown_from, expanded: true },
+                    },
+                ));
+            }
+            let label_width = self.conv_label(&thread.conv).chars().count();
+            let shown = &thread.replies[shown_from..];
+            let n = shown.len();
+            for (i, reply) in shown.iter().enumerate() {
+                rows.push((
+                    Some((thread.conv.clone(), reply.msg.ts.clone())),
+                    self.reply_row(&reply.msg, i + 1 == n, label_width),
+                ));
             }
         }
         rows
@@ -1562,7 +1629,10 @@ impl App {
     fn expand_target_root(&self, conv: &str, sel_ts: &str, row: &Row) -> Option<String> {
         match row.kind {
             RowKind::ThreadMarker { .. } => Some(sel_ts.to_string()),
-            RowKind::Message => {
+            // A `Reply` rail row is, identity-wise, the reply message it renders (see
+            // `sel_kind_of`), so it resolves exactly like a `Message` row that happens to be a
+            // reply — Enter on it collapses/expands the thread it belongs to.
+            RowKind::Message | RowKind::Reply { .. } => {
                 if self.is_thread_root_with_replies(conv, sel_ts) {
                     return Some(sel_ts.to_string());
                 }
@@ -1809,26 +1879,44 @@ impl App {
         }
     }
 
-    /// A reply row nested under an expanded root (today's behavior), or an orphaned reply whose
-    /// root isn't locally known at all (spec §6: "keep their existing inline treatment"): the
-    /// plain message row with a "↳ " nesting prefix, sharing `SelKind::Message` identity with
-    /// whatever other rendering of the same `(conv, ts)` the caller is choosing between.
+    /// An orphaned reply's row — its root isn't locally known at all, so there is no thread
+    /// block to rail it under: the plain message row with a "↳ " nesting prefix, sharing
+    /// `SelKind::Message` identity with whatever other rendering of the same `(conv, ts)` the
+    /// caller is choosing between.
     fn nested_reply_row(&self, msg: &Message) -> Row {
         let mut row = self.message_row(msg);
         row.text = format!("\u{21b3} {}", row.text);
         row
     }
 
-    /// A reply to a *collapsed* thread, rendered as a discoverable activity row at its own
-    /// chronological position (spec §6) instead of vanishing entirely: the same row shape as any
-    /// other message (conv label/author/time styled normally), with the text replaced by
-    /// `↳ @author replied: <text>` so it still reads as thread context. `RowKind::Message` and
-    /// the reply's own `(conv, ts)` identity are kept (see `feed_rows_with_ids`'s caller), so
-    /// Enter on it resolves here and expands the root via `expand_target_root`.
-    fn activity_row(&self, msg: &Message) -> Row {
+    /// A reply rendered beneath its root (Timeline expanded, or the Threads digest): the plain
+    /// message row with its conv label swapped for the tree-connector rail ([`reply_rail`],
+    /// padded to `label_width` — the root row's label width — so author/time/text columns stay
+    /// aligned with the root's) and `RowKind::Reply` so the renderer can mute the rail.
+    fn reply_row(&self, msg: &Message, last: bool, label_width: usize) -> Row {
         let mut row = self.message_row(msg);
-        row.text = format!("\u{21b3} @{} replied: {}", row.author, row.text);
+        row.conv_label = reply_rail(last, label_width);
+        row.kind = RowKind::Reply { last };
         row
+    }
+
+    /// The latest locally-known reply's `(resolved author, resolved text)` for a collapsed
+    /// thread's enriched marker ([`marker_text`]) — `None` when no reply is stored yet (the
+    /// marker then shows only Slack's metadata count). `replies` must already be `ts`-sorted;
+    /// the caller's are.
+    fn latest_reply_summary(&self, replies: &[&Stored]) -> Option<(String, String)> {
+        let latest = replies.last()?;
+        let author = self
+            .user_names
+            .get(&latest.msg.author)
+            .cloned()
+            .unwrap_or_else(|| latest.msg.author.clone());
+        let text = entities::resolve(
+            &latest.msg.text,
+            |id| self.user_names.get(id).cloned(),
+            |id| self.conv_names.get(id).cloned(),
+        );
+        Some((author, text))
     }
 
     fn conv_label(&self, conv_id: &str) -> String {
@@ -1908,6 +1996,36 @@ fn apply_backfill(
         }
     }
     Ok(())
+}
+
+/// The tree-connector rail a reply row shows in place of its conversation label: `├─` for a
+/// mid-thread reply, `└─` for the last one (so the eye sees where the thread block closes),
+/// space-padded to `label_width` (the root row's conv-label width) so the reply's author/time/
+/// text columns align exactly with the root's — without the padding, replies would zigzag left
+/// of their root and the thread would not read as one visual unit.
+fn reply_rail(last: bool, label_width: usize) -> String {
+    let glyph = if last { "\u{2514}\u{2500}" } else { "\u{251c}\u{2500}" };
+    format!("{glyph:<label_width$}")
+}
+
+/// A collapsed thread's one-row summary: the reply count first (fixed position, so it survives
+/// any pane width — only the variable snippet ever gets clipped), then the latest reply's
+/// author and text when one is locally known. Replaces the old scattered per-reply
+/// `↳ @author replied:` activity rows: the marker itself now carries the freshness those rows
+/// existed to show, and the feed's length stays one row per thread no matter how busy it gets.
+fn marker_text(count: usize, latest: Option<(&str, &str)>) -> String {
+    let noun = if count == 1 { "reply" } else { "replies" };
+    match latest {
+        Some((author, text)) => format!("\u{21b3} {count} {noun} · @{author}: {text}"),
+        None => format!("\u{21b3} {count} {noun}"),
+    }
+}
+
+/// A Threads-digest header row's text: the reply count first (same clip-survival reasoning as
+/// [`marker_text`]), then the root message's text.
+fn digest_header_text(count: usize, root_text: &str) -> String {
+    let noun = if count == 1 { "reply" } else { "replies" };
+    format!("{count} {noun} · {root_text}")
 }
 
 /// The reply count a `ThreadMarker` row should display: the greater of Slack's own
@@ -2269,10 +2387,11 @@ mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
         RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, budget_exhausted,
-        capped_sleep_secs, catchup_after_reconnect, clamp_oldest, cooldown_active, dm_scan_due,
-        expand_status, format_ts, key_for, live_event_admitted, lookback_cutoff_ts, marker_count,
-        next_batch, pick_changed_dm, poll_error_status, resolve_im_names, resume_cursor,
-        thread_slot_count, track_newest, updated_ms_to_ts,
+        capped_sleep_secs, catchup_after_reconnect, clamp_oldest, cooldown_active,
+        digest_header_text, dm_scan_due, expand_status, format_ts, key_for, live_event_admitted,
+        lookback_cutoff_ts, marker_count, marker_text, next_batch, pick_changed_dm,
+        poll_error_status, reply_rail, resolve_im_names, resume_cursor, thread_slot_count,
+        track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -2442,37 +2561,18 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
         app.touch();
 
-        // Spec §6: a collapsed thread still shows its `ThreadMarker` right after the root, but
-        // each known reply also gets its own discoverable activity row at its chronological
-        // position, rather than vanishing entirely.
+        // A collapsed thread is exactly two rows — the root and its enriched marker (count +
+        // latest reply snippet); replies never emit their own chronological rows.
         let rows = app.feed_rows();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, RowKind::Message);
         assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 2, expanded: false });
-        assert_eq!(rows[2].text, "\u{21b3} @dan replied: reply one");
-        assert_eq!(rows[2].kind, RowKind::Message);
-        assert_eq!(rows[3].text, "\u{21b3} @dan replied: reply two");
+        assert_eq!(rows[1].text, "\u{21b3} 2 replies · @dan: reply two");
     }
 
-    // ---- reply activity rows (Task 2, spec §6): a collapsed thread's replies get a discoverable
-    // activity row at their own chronological position instead of vanishing entirely; an
-    // expanded thread still nests them under the root with no activity rows at all. --------------
-
-    #[test]
-    fn a_collapsed_threads_reply_activity_row_carries_the_replys_own_identity() {
-        let mut app = empty_app();
-        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
-        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
-        app.touch();
-
-        let rows = app.feed_rows_with_ids();
-        let (id, row) = rows
-            .into_iter()
-            .find(|(_, r)| r.text.contains("replied:"))
-            .expect("an activity row must be present for the collapsed reply");
-        assert_eq!(id, Some(("C1".to_string(), "1.000002".to_string())));
-        assert_eq!(row.kind, RowKind::Message);
-    }
+    // ---- collapsed-thread summarization: a reply to a collapsed thread surfaces through its
+    // root's enriched marker (count + latest snippet, arrival = the newest reply's so the
+    // unread divider still lands on it), never as its own chronological row. --------------------
 
     #[test]
     fn an_expanded_thread_emits_no_activity_rows_for_its_replies() {
@@ -2529,30 +2629,6 @@ mod tests {
         assert!(
             !rows.iter().any(|r| matches!(r.kind, RowKind::ThreadMarker { .. })),
             "Enter on the root row must expand the thread just like Enter on its marker"
-        );
-        assert!(rows.iter().any(|r| r.text == "reply one"));
-    }
-
-    #[test]
-    fn entering_on_an_activity_row_expands_the_root_thread() {
-        let mut app = empty_app();
-        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
-        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
-        app.touch();
-
-        let rows = app.feed_rows_with_ids();
-        let pos = rows.iter().position(|(_, r)| r.text.contains("replied:")).unwrap();
-        app.cursor = pos;
-        app.selected = None;
-
-        let cancelled = AtomicBool::new(false);
-        let rest = precancelled_rest(&cancelled);
-        app.toggle_expand_or_read(&rest);
-
-        let rows = app.feed_rows();
-        assert!(
-            !rows.iter().any(|r| r.text.contains("replied:")),
-            "the activity row must disappear once the thread is expanded:\n{rows:?}"
         );
         assert!(rows.iter().any(|r| r.text == "reply one"));
     }
@@ -2628,16 +2704,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "root");
         assert_eq!(rows[1].text, "reply one");
-        assert_eq!(rows[1].kind, RowKind::Message);
+        assert_eq!(rows[1].kind, RowKind::Reply { last: true });
 
         let collapsed = app.toggle_thread("C1", "1.000001", Vec::new());
         assert!(!collapsed);
-        // Recollapsing brings back the `ThreadMarker` *and* now also the reply's own activity
-        // row (spec §6) — the reply is no longer nested, but it doesn't vanish either.
+        // Recollapsing brings back the enriched `ThreadMarker` — the reply's freshness lives
+        // in the marker's snippet now, not in a separate chronological row.
         let rows = app.feed_rows();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 1, expanded: false });
-        assert_eq!(rows[2].text, "\u{21b3} @dan replied: reply one");
+        assert_eq!(rows[1].text, "\u{21b3} 1 reply · @dan: reply one");
     }
 
     #[test]
@@ -2968,6 +3044,171 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- threading display (2026-07-18 redesign): quiet enriched markers instead of scattered
+    // per-reply activity rows; tree-connector rails aligning reply columns under their root;
+    // Threads-digest headers carrying count + latest-activity time, capped at the last three
+    // replies with an overflow row. ----------------------------------------------------------
+
+    #[test]
+    fn reply_rail_pads_the_connector_to_the_root_label_width() {
+        assert_eq!(reply_rail(false, 10), "\u{251c}\u{2500}        ");
+        assert_eq!(reply_rail(true, 10), "\u{2514}\u{2500}        ");
+        // Never narrower than the glyph itself, even for a label shorter than the connector.
+        assert_eq!(reply_rail(true, 1), "\u{2514}\u{2500}");
+    }
+
+    #[test]
+    fn marker_text_leads_with_the_count_then_the_latest_reply_snippet() {
+        assert_eq!(
+            marker_text(3, Some(("alice", "agreed"))),
+            "\u{21b3} 3 replies · @alice: agreed"
+        );
+        assert_eq!(marker_text(1, Some(("dan", "yes"))), "\u{21b3} 1 reply · @dan: yes");
+        assert_eq!(marker_text(2, None), "\u{21b3} 2 replies");
+    }
+
+    #[test]
+    fn digest_header_text_leads_with_the_count_then_the_root_snippet() {
+        assert_eq!(digest_header_text(2, "ship it?"), "2 replies · ship it?");
+        assert_eq!(digest_header_text(1, "ship it?"), "1 reply · ship it?");
+    }
+
+    #[test]
+    fn a_collapsed_thread_is_root_plus_one_enriched_marker_row_only() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
+        app.touch();
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 2, "no scattered per-reply activity rows:\n{rows:?}");
+        assert_eq!(rows[1].kind, RowKind::ThreadMarker { replies: 2, expanded: false });
+        assert_eq!(rows[1].text, "\u{21b3} 2 replies · @dan: reply two");
+    }
+
+    #[test]
+    fn expanded_replies_render_with_a_padded_rail_in_place_of_the_conv_label() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
+        app.touch();
+        app.toggle_thread("C1", "1.000001", Vec::new());
+
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].kind, RowKind::Reply { last: false });
+        assert_eq!(rows[2].kind, RowKind::Reply { last: true });
+        // "#eng" is 4 columns wide, so the rail pads to 4 and author/time/text stay aligned.
+        assert_eq!(rows[1].conv_label, "\u{251c}\u{2500}  ");
+        assert_eq!(rows[2].conv_label, "\u{2514}\u{2500}  ");
+        assert_eq!(rows[1].text, "reply one");
+        assert_eq!(rows[2].text, "reply two");
+    }
+
+    #[test]
+    fn threads_digest_header_carries_count_activity_time_and_root_snippet() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1000.000001", None, "U1", "ship it?")));
+        app.apply(SocketEvent::Message(msg("C1", "2000.000001", Some("1000.000001"), "U1", "yes")));
+        app.apply(SocketEvent::Message(msg(
+            "C1",
+            "3000.000001",
+            Some("1000.000001"),
+            "U1",
+            "agreed",
+        )));
+        app.touch();
+        let rows = app.thread_rows();
+        assert_eq!(rows[0].kind, RowKind::ThreadHeader);
+        assert_eq!(rows[0].text, "2 replies · ship it?");
+        assert_eq!(rows[0].author, "dan");
+        // The header's time is the thread's latest activity (the digest's sort key), not the
+        // root's own — a three-day-old root time would mislead the triage scan.
+        assert_eq!(
+            rows[0].time_hhmm,
+            format_ts("3000.000001", std::time::SystemTime::now()),
+            "header time must be the newest reply's, not the root's"
+        );
+        assert_eq!(rows[1].kind, RowKind::Reply { last: false });
+        assert_eq!(rows[2].kind, RowKind::Reply { last: true });
+        assert_eq!(rows[2].text, "agreed");
+    }
+
+    #[test]
+    fn threads_digest_caps_replies_at_the_last_three_with_an_overflow_row() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        for i in 2..=6 {
+            let ts = format!("1.00000{i}");
+            app.apply(SocketEvent::Message(msg(
+                "C1",
+                &ts,
+                Some("1.000001"),
+                "U1",
+                &format!("r{i}"),
+            )));
+        }
+        app.touch();
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 5, "header + overflow + last three replies:\n{rows:?}");
+        assert_eq!(rows[0].kind, RowKind::ThreadHeader);
+        assert_eq!(rows[1].text, "… 2 earlier replies");
+        assert_eq!(rows[2].text, "r4");
+        assert_eq!(rows[3].text, "r5");
+        assert_eq!(rows[4].text, "r6");
+        assert_eq!(rows[4].kind, RowKind::Reply { last: true });
+    }
+
+    #[test]
+    fn threads_digest_overflow_row_targets_the_thread_root_so_enter_refetches() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        for i in 2..=6 {
+            let ts = format!("1.00000{i}");
+            app.apply(SocketEvent::Message(msg("C1", &ts, Some("1.000001"), "U1", "r")));
+        }
+        let rows = app.thread_rows_with_ids();
+        let (id, row) = &rows[1];
+        assert!(row.text.contains("earlier replies"), "{row:?}");
+        assert_eq!(id, &Some(("C1".to_string(), "1.000001".to_string())));
+    }
+
+    #[test]
+    fn threads_digest_shows_all_replies_without_overflow_when_three_or_fewer() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        for i in 2..=4 {
+            let ts = format!("1.00000{i}");
+            app.apply(SocketEvent::Message(msg("C1", &ts, Some("1.000001"), "U1", "r")));
+        }
+        app.touch();
+        let rows = app.thread_rows();
+        assert_eq!(rows.len(), 4, "header + all three replies, no overflow row:\n{rows:?}");
+        assert!(!rows.iter().any(|r| r.text.contains("earlier replies")), "{rows:?}");
+    }
+
+    #[test]
+    fn entering_on_an_expanded_reply_rail_row_still_collapses_the_thread() {
+        // The rail rows carry `RowKind::Reply` now, not `Message` — Enter's root resolution
+        // (`expand_target_root`) must treat them identically or nested-reply collapse breaks.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+        app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+        app.touch();
+        app.toggle_thread("C1", "1.000001", Vec::new());
+        app.move_cursor(1);
+        assert_eq!(app.feed_rows()[app.cursor].kind, RowKind::Reply { last: true });
+
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.toggle_expand_or_read(&rest);
+        assert!(
+            app.feed_rows().iter().any(|r| matches!(r.kind, RowKind::ThreadMarker { .. })),
+            "Enter on a rail row must collapse back to the marker"
+        );
     }
 
     // ---- live-event admission: the `channels` allow-list must govern live socket delivery,
@@ -4148,8 +4389,8 @@ mod tests {
 
         let rows = app.thread_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text, "root");
-        assert_eq!(rows[0].kind, RowKind::Message);
+        assert_eq!(rows[0].text, "3 replies · root");
+        assert_eq!(rows[0].kind, RowKind::ThreadHeader);
     }
 
     #[test]
@@ -4161,9 +4402,11 @@ mod tests {
 
         let rows = app.thread_rows();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].text, "root");
-        assert_eq!(rows[1].text, "\u{21b3} earlier");
-        assert_eq!(rows[2].text, "\u{21b3} later");
+        assert_eq!(rows[0].text, "2 replies · root");
+        assert_eq!(rows[1].text, "earlier");
+        assert_eq!(rows[1].kind, RowKind::Reply { last: false });
+        assert_eq!(rows[2].text, "later");
+        assert_eq!(rows[2].kind, RowKind::Reply { last: true });
     }
 
     #[test]
@@ -4177,10 +4420,13 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "50.0", Some("5.0"), "U1", "reply B1")));
 
         let rows = app.thread_rows();
-        assert_eq!(rows[0].text, "root A", "A's latest reply (10.1) beats B's (50.0) for last");
-        assert_eq!(rows[1].text, "\u{21b3} reply A1");
-        assert_eq!(rows[2].text, "root B");
-        assert_eq!(rows[3].text, "\u{21b3} reply B1");
+        assert_eq!(
+            rows[0].text, "1 reply · root A",
+            "A's latest reply (10.1) beats B's (50.0) for last"
+        );
+        assert_eq!(rows[1].text, "reply A1");
+        assert_eq!(rows[2].text, "1 reply · root B");
+        assert_eq!(rows[3].text, "reply B1");
     }
 
     #[test]
@@ -4194,8 +4440,8 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "2.1", Some("2.0"), "U1", "reply")));
 
         let rows = app.thread_rows();
-        assert_eq!(rows[0].text, "old root, no replies fetched yet");
-        assert_eq!(rows[1].text, "newer root");
+        assert_eq!(rows[0].text, "1 reply · old root, no replies fetched yet");
+        assert_eq!(rows[1].text, "1 reply · newer root");
     }
 
     // ---- thread_rows: orphaned replies (root not locally known) get a synthetic thread --------
@@ -4216,9 +4462,9 @@ mod tests {
 
         let rows = app.thread_rows();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].kind, RowKind::Message);
-        assert_eq!(rows[0].text, "(thread — root not loaded)");
-        assert_eq!(rows[1].text, "\u{21b3} reply to an unknown root");
+        assert_eq!(rows[0].kind, RowKind::ThreadHeader);
+        assert_eq!(rows[0].text, "1 reply · (thread — root not loaded)");
+        assert_eq!(rows[1].text, "reply to an unknown root");
     }
 
     #[test]
@@ -4231,17 +4477,17 @@ mod tests {
         app.apply(SocketEvent::Message(msg("C1", "50.0", Some("40.0"), "U1", "orphaned reply")));
 
         let rows = app.thread_rows();
-        assert_eq!(rows[0].text, "root A");
-        assert_eq!(rows[1].text, "\u{21b3} reply A1");
-        assert_eq!(rows[2].text, "(thread — root not loaded)");
-        assert_eq!(rows[3].text, "\u{21b3} orphaned reply");
+        assert_eq!(rows[0].text, "1 reply · root A");
+        assert_eq!(rows[1].text, "reply A1");
+        assert_eq!(rows[2].text, "1 reply · (thread — root not loaded)");
+        assert_eq!(rows[3].text, "orphaned reply");
     }
 
     #[test]
     fn thread_rows_synthetic_thread_self_heals_when_the_root_arrives() {
         let mut app = empty_app();
         app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply")));
-        assert_eq!(app.thread_rows()[0].text, "(thread — root not loaded)");
+        assert_eq!(app.thread_rows()[0].text, "1 reply · (thread — root not loaded)");
 
         // The root arrives — e.g. `refresh_thread`'s `conversations.replies` call returns the
         // actual root as the first message, and it goes through the normal upsert path.
@@ -4249,8 +4495,8 @@ mod tests {
 
         let rows = app.thread_rows();
         assert_eq!(rows.len(), 2, "the synthetic header must be replaced, not duplicated");
-        assert_eq!(rows[0].text, "actual root");
-        assert_eq!(rows[1].text, "\u{21b3} reply");
+        assert_eq!(rows[0].text, "1 reply · actual root");
+        assert_eq!(rows[1].text, "reply");
     }
 
     // ---- toggle_view: Feed-tab-only projection flip (Task 2, spec §3) --------------------------
@@ -4287,7 +4533,7 @@ mod tests {
         app.toggle_view();
         assert_eq!(app.view, FeedView::Threads);
         assert_eq!(app.cursor, 0, "the 1-row threads projection clamps the stale cursor");
-        assert_eq!(app.thread_rows()[app.cursor].text, "a thread root");
+        assert_eq!(app.thread_rows()[app.cursor].text, "1 reply · a thread root");
     }
 
     // ---- toggle_focus / mutual exclusion with Threads (Task 3, spec §3) ------------------------
@@ -4489,7 +4735,7 @@ mod tests {
         )]);
 
         let rows = app.thread_rows();
-        assert!(rows.iter().any(|r| r.text == "\u{21b3} fetched reply"));
+        assert!(rows.iter().any(|r| r.text == "fetched reply"));
     }
 
     // ---- jump_newest / jump_first (Task 1, spec §2) --------------------------------------------

@@ -281,33 +281,54 @@ were looking elsewhere," not as a precise per-tab row count.
 
 `t` toggles the Feed tab (only) between two projections of the same message store:
 
-- **Timeline** (default) — the chronological stream described above, threads collapsed under
-  their root with `↳ n replies`.
-- **Threads** — a digest of threads only. Every thread with at least one reply (Slack's own
-  `reply_count` metadata, or a locally-known reply, whichever is greater) gets one entry, ordered
-  by latest activity — the newest reply's time, or the root's own time if it has none yet —
-  ascending, newest at the bottom (see [Navigation](#navigation)), so a thread that just got a
-  reply jumps back to the bottom. The root and every locally-known reply render nested beneath it,
-  always expanded here — there is no collapsed/expanded state in this view the way the Timeline
-  has. Non-threaded messages (anything that never got a reply) are excluded entirely.
-- **`Enter` in the Threads view** always (re)fetches the selected thread's replies over REST,
-  rather than the Timeline's expand/collapse toggle — there is no "collapsed" state here for a
-  toggle to mean.
+- **Timeline** (default) — the chronological stream described above. A collapsed thread is
+  exactly two rows: its root, and one enriched marker carrying the count *and* the latest reply —
+  `↳ 3 replies · @alice: sounds good` — so a busy thread stays quiet in the feed while the marker
+  itself tells you what just happened in it. (The count comes first deliberately: at any pane
+  width, only the snippet ever gets clipped.) An expanded thread nests its replies beneath the
+  root on a muted connector rail, padded so the columns line up:
+
+  ```text
+  #eng-infra  @carol  13:57  should we ship it?
+  ├─          @dan    13:58  yes — after CI
+  └─          @alice  13:59  agreed
+  #eng-infra  @bob    14:02  unrelated message
+  ```
+
+  The leftmost character tells you the row type at a glance: `#`/`@` starts a message, `├`/`└`
+  is inside a thread, `↳` is a collapsed thread's summary. New replies to a collapsed thread
+  bump the marker's arrival, so the unread divider and the `↓ n new` counter still count them —
+  page up to the divider and every new reply is there, at its thread.
+- **Threads** — a triage digest of threads only, ordered by latest activity ascending (newest at
+  the bottom — see [Navigation](#navigation)), so a thread that just got a reply jumps back to
+  the bottom. Each thread is a **bold header row** — the root's text led by the reply count, its
+  time column showing the thread's *latest activity* (the thing you're actually triaging by), not
+  the root's age — followed by its newest three replies on the same connector rail; anything
+  older collapses into one muted `… n earlier replies` line:
+
+  ```text
+  #eng-infra  @carol  13:59  2 replies · should we ship it?
+  ├─          @dan    13:58  yes — after CI
+  └─          @alice  13:59  agreed
+  #release    @kim    14:02  5 replies · rollout plan?
+  … 3 earlier replies
+  ├─          @sam    13:40  staging green
+  └─          @dan    14:02  starting now
+  ```
+
+  Non-threaded messages are excluded entirely. Threads whose root predates the pane's history
+  window get a synthetic `n replies · (thread — root not loaded)` header that self-heals once
+  the root is fetched.
+- **`Enter` in the Threads view** always (re)fetches the selected thread's replies over REST —
+  from the header, a reply row, or the `… n earlier replies` line alike (there is no "collapsed"
+  state here for a toggle to mean, and refetching from the overflow line is how you pull the full
+  thread in).
 - **Discoverable expansion, anywhere on a thread.** In the Timeline, `Enter` expands/collapses a
-  thread not just from its collapsed `↳ n replies` marker row, but also from the thread's own root
-  message row, any of its nested replies once expanded, or a collapsed thread's reply activity rows
-  (below) — you no longer have to hunt for the exact marker row. Expanding or collapsing sets a
-  one-line status confirming what happened: `thread expanded — n replies` (`thread expanded — 1
-  reply` for exactly one) or `thread collapsed`. The footer also shows an `enter expand/collapse
-  thread` hint whenever the selected row would actually do something thread-related.
-- **Reply activity rows.** A reply to a *collapsed* thread no longer just disappears into its
-  root's `↳ n replies` count — it also renders its own row at its actual chronological position in
-  the Timeline, styled like any other message but with its text prefixed `↳ @author replied:
-  <text>`. The collapsed root keeps its usual `↳ n replies` marker at the same time — the marker
-  and the activity rows for its replies coexist (the marker names the total, the activity rows show
-  which messages it's hiding and when they landed) — and `Enter` on an activity row expands the
-  thread it belongs to, same as `Enter` on the marker. Once a thread is expanded, its replies go
-  back to nesting under the root as before and stop emitting activity rows (no double-counting).
+  thread from its marker row, the thread's own root message row, or any rail row once expanded —
+  you never have to hunt for the exact marker row. Expanding or collapsing sets a one-line status
+  confirming what happened: `thread expanded — n replies` (`thread expanded — 1 reply` for
+  exactly one) or `thread collapsed`. The footer also shows an `enter expand/collapse thread`
+  hint whenever the selected row would actually do something thread-related.
 - **Orphaned threads self-heal.** A reply whose root was never backfilled or seen still shows up
   here, as a synthetic entry headed `(thread — root not loaded)` instead of being dropped.
   Selecting it and hitting `Enter` fetches the real root over REST like any other refresh; once

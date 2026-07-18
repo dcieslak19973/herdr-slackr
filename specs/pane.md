@@ -31,8 +31,10 @@ Row shapes, identical structure across both tabs:
 | kind          | rendered as                                                     |
 | -------------- | ------------------------------------------------------------------|
 | message       | `#chan  @author  HH:MM  text` (`@chan` prefix for a DM)          |
-| thread marker | `#chan  ↳ n replies` — a collapsed thread's root, in place of its replies |
-| reply activity | `#chan  @author  HH:MM  ↳ @author replied: <text>` — a reply to a *collapsed* thread, at its own chronological position (see §Reply activity rows) |
+| thread marker | `#chan  ↳ n replies · @author: <latest reply text>` — a collapsed thread's one-row summary: count first (fixed position, clip-safe at any width), then the latest locally-known reply's resolved author and text; just `↳ n replies` when no reply is stored yet. Replaces the old scattered per-reply activity rows entirely (see P2a). |
+| reply (rail)  | `├─  @author  HH:MM  text` — a reply beneath its root (Timeline expanded, Threads view), its conv label swapped for a tree-connector rail (`└─` on the thread's last reply) space-padded to the root row's label width so author/time/text columns align with the root's |
+| thread header | the Threads view's per-thread anchor: `#chan  @author  <last-activity time>  n replies · <root text>`, all spans bold — the time column is the thread's *latest activity* (the view's sort key), not the root's own age |
+| overflow      | `… n earlier replies` — the Threads view's muted stand-in for replies past the last-3 cap (T2); carries the root's id, so `Enter` on it refetches the full thread |
 | divider       | a bare horizontal rule                                            |
 | mention       | `●`/`○` read marker, then the same message header as above        |
 
@@ -41,10 +43,10 @@ across every configured palette (see `config.md`'s theme list):
 
 | segment                        | palette field | applies to                                          |
 | -------------------------------- | --------------- | -------------------------------------------------------|
-| conversation label (`#chan`/`@dm`) | `lavender`    | message, thread marker, mention                        |
-| author (`@name`)                | `green`       | message, mention                                        |
-| time (`HH:MM`) / thread markers / divider | `overlay1` | message, thread marker (`↳ n replies`), divider |
-| message text                    | `text` (default fg) | message, mention                                 |
+| conversation label (`#chan`/`@dm`) | `lavender`    | message, thread marker, mention, thread header (bold) |
+| author (`@name`)                | `green`       | message, reply, mention, thread header (bold)          |
+| time (`HH:MM`) / thread markers / divider / reply rail (`├─`/`└─`) / overflow | `overlay1` | message, thread marker, divider, reply, overflow |
+| message text                    | `text` (default fg) | message, reply, mention, thread header (bold)    |
 
 A selected row's cursor highlight fills the whole line uniformly (all spans share the same
 background), so the color-segmentation never competes with the selection indicator. A mention
@@ -65,10 +67,10 @@ same message store, tracked as `FeedView`:
 | #   | Always true                                                                                       |
 | --- | ---------------------------------------------------------------------------------------------------|
 | T1  | Only qualifying threads appear — a root whose reply count (Slack's `reply_count` metadata or the number of locally-known replies, whichever is greater) is nonzero. A root with zero replies either way is excluded, same as any other non-threaded message. |
-| T2  | Each qualifying thread renders as its root row immediately followed by every locally-known reply, in chronological order, nested with the same `↳ ` prefix the Timeline uses for an expanded thread or an orphaned reply — **always shown regardless of the Timeline's `expanded` flag** for that thread; there is no collapsed state in this view. |
+| T2  | Each qualifying thread renders as its bold *thread header* row (count-first text, latest-activity time — see the row-shapes table) immediately followed by its newest **three** locally-known replies as connector-rail rows in chronological order; when more exist, one muted `… n earlier replies` overflow row (carrying the root's id — Enter refetches, T4) stands in for the rest. Shown regardless of the Timeline's `expanded` flag; there is no collapsed state in this view. The digest is a triage surface, not an archive — a 40-reply thread must not push every other thread off screen. |
 | T3  | Threads are ordered by latest activity ascending — oldest activity first, newest at the bottom, unified with every view's newest-at-the-bottom direction (P1a): the newest locally-known reply's `ts`, or the root's own `ts` if it has no reply yet — a thread that just received a reply jumps back to the bottom even if its root is old. |
 | T4  | `Enter` on any row in this view (re)fetches that thread's replies via `conversations.replies` unconditionally — not the Timeline's expand/collapse toggle, and it never reads or flips `App`'s `expanded` set. A reply row's Enter resolves to the thread it belongs to, same as its root's. |
-| T5  | A reply whose root was never backfilled or otherwise seen still gets an entry — a *synthetic* one, headed `(thread — root not loaded)` in place of the normal `#chan @author HH:MM text` header, grouped with every other reply sharing that same unknown root. Selecting it and pressing `Enter` fetches the real root via the same `conversations.replies` call (Slack returns the root as the first message); once the fetch lands, the very next redraw naturally shows the real root row in place of the placeholder — no explicit cleanup step. |
+| T5  | A reply whose root was never backfilled or otherwise seen still gets an entry — a *synthetic* one, its header reading `n replies · (thread — root not loaded)` in place of the root's text, grouped with every other reply sharing that same unknown root. Selecting it and pressing `Enter` fetches the real root via the same `conversations.replies` call (Slack returns the root as the first message); once the fetch lands, the very next redraw naturally shows the real root row in place of the placeholder — no explicit cleanup step. |
 | T6  | Root and reply rows in this view share `SelKind::Message` identity with their Timeline counterparts (same `(conv, ts)`), so a selection made in one view still resolves in the other if the row exists there too. |
 | T7  | Switching views (`t`) resyncs cursor/selection into the new projection exactly like switching tabs (P8): the old selected identity is kept if it still names a row in the new view, otherwise cursor/selection are clamped/re-derived from scratch. |
 
@@ -112,8 +114,8 @@ and symmetrically `f` pressed while in `Threads` lands on `Focus` directly.
 | -- | --------------------------------------------------------------------------------------------------------------- |
 | P1 | The Feed tab is one chronological stream across every subscribed conversation, ordered by message `ts`.         |
 | P1a | Every tab/projection (Feed Timeline, Feed Threads, Mentions) orders its rows ascending — oldest at the top, newest at the bottom — the same direction, unified across the pane. |
-| P2 | A thread's replies render collapsed under its root as one `ThreadMarker` row unless expanded; `Enter` toggles it, fetching replies via REST on first expand. `Enter` toggles the same thread whether the selection is the `ThreadMarker` row itself, the root message's own row (when it has at least one reply), a nested reply row within an already-expanded thread, or one of that thread's reply-activity rows (P2a) while collapsed — see `App::expand_target_root`. |
-| P2a | A reply to a *collapsed* thread renders a `ReplyActivity` row at its own chronological position — text `↳ @author replied: <text>` — instead of vanishing into the root's count; the root's `ThreadMarker` (`↳ n replies`) still renders too, so the marker (the total) and the activity rows (which messages, and when) coexist rather than one replacing the other. Once the thread is expanded, its replies nest under the root as plain `Message` rows and stop emitting activity rows — no double count. |
+| P2 | A thread's replies render collapsed under its root as one enriched `ThreadMarker` row unless expanded; `Enter` toggles it, fetching replies via REST on first expand. `Enter` toggles the same thread whether the selection is the `ThreadMarker` row itself, the root message's own row (when it has at least one reply), or a connector-rail reply row within an already-expanded thread — see `App::expand_target_root`. |
+| P2a | A reply to a *collapsed* thread surfaces exclusively through its root's enriched marker — `↳ n replies · @author: <latest text>` — never as its own chronological row: the feed stays one row per thread no matter how busy the thread gets. Freshness the old per-reply activity rows carried lives in the marker's snippet instead, and the marker's arrival counter is the newest reply's, so the unread divider (P4) still lands on the thread when new replies are unseen and the `↓ n new` counter still counts them. Once expanded, replies nest under the root as `Reply` rail rows (row-shapes table). |
 | P2b | Expanding/collapsing a thread sets a one-line status: `thread expanded — n replies` (singular `thread expanded — 1 reply` for exactly one) or `thread collapsed`. A failed replies fetch sets `replies failed: …` instead and leaves the expand/collapse state unchanged. |
 | P3 | A reply whose root the pane never backfilled still renders, as a normal row prefixed `↳`, rather than vanishing. |
 | P4 | An unread divider sits before the first Feed row that arrived since the last keypress in the pane — any key, not only navigation, since a terminal child process has no other attention signal. |
@@ -137,7 +139,7 @@ and symmetrically `f` pressed while in `Threads` lands on `Focus` directly.
 | `g` / `Home`          | jump to the oldest row (top) — `App::jump_first`                  |
 | `PageDown` / `PageUp` | move a full page (`±viewport_rows`) — `App::page_move`            |
 | `Ctrl-d` / `Ctrl-u`   | move a half page (`±viewport_rows / 2`) — `App::page_move`        |
-| `Enter`               | Feed Timeline: expand/collapse the selected thread (root/marker/reply/activity row — P2). Feed Threads view: (re)fetch the selected thread's replies. Mentions: toggle read |
+| `Enter`               | Feed Timeline: expand/collapse the selected thread (root/marker/rail row — P2). Feed Threads view: (re)fetch the selected thread's replies (header, rail, or overflow row alike). Mentions: toggle read |
 | `t`                   | Feed tab only: toggle between the Timeline and the Threads-only view (see below) |
 | `f`                   | Feed tab only: toggle into/out of the Focus view (see above) — mutually exclusive with `t`'s Threads toggle |
 | `o`                   | open the selected row's Slack permalink (`chat.getPermalink`) in the browser |
