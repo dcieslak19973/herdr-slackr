@@ -29,6 +29,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Naming an archived channel in `channels` now fails resolution like any unknown name.
 
 ### Fixed
+- **The `channels` allow-list now governs live delivery, not only fetching.** Socket Mode
+  delivers events for every conversation the token can see, and the pane applied them all — so
+  every joined channel in the workspace leaked into the Feed (with raw `#C…` id labels),
+  regardless of config. Live `Message`/`Changed` events for channels/groups not named in
+  `channels` are now dropped. DMs/MPIMs keep their documented always-arrive guarantee — including
+  out-of-cap DMs and DMs first opened mid-session (admitted by Slack's `D` id prefix) — unless
+  `dms = false`, which now suppresses live DM delivery the same way it suppresses subscription.
+  If you relied on the firehose, name those channels in `channels`.
+
 - **Poll batches now meter requests, not conversations.** History pagination made one
   conversation cost anywhere from one request (caught up) to ten (a large gap), so an
   8-conversation batch could issue up to ~80 requests right after a long outage — past Slack's

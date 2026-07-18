@@ -249,6 +249,10 @@ pub struct App {
     /// substring via `entities::keyword_hit` — deliberately not reusing `keywords` (the Mentions
     /// trigger list); see `PluginConfig::focus_keywords`'s doc for why the two must stay distinct.
     focus_keywords: Vec<String>,
+    /// `PluginConfig::dms`, kept for live-event admission (`admits_live`): `dms = false` must
+    /// suppress live DM/MPIM delivery the same way it suppresses DM subscription — an explicit
+    /// "no DMs" wins everywhere.
+    dms: bool,
     /// The look-back horizon in days (`PluginConfig::lookback_days`, 0 = unlimited): backfill
     /// drops messages older than this, and every incremental fetch clamps its `oldest` to it
     /// (see [`lookback_cutoff_ts`]/[`clamp_oldest`]).
@@ -387,6 +391,7 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: config.focus_keywords().to_vec(),
+            dms: config.dms(),
             lookback_days: config.lookback_days(),
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
@@ -451,6 +456,7 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            dms: true,
             // Unlimited by default in fixtures: `empty` exists for network-free tests, whose
             // fixture timestamps are tiny epoch-era values a real 7-day horizon (computed from
             // the actual clock) would silently exclude.
@@ -520,8 +526,21 @@ impl App {
                 self.polling = true;
                 self.status = format!("socket unavailable ({reason}) — polling");
             }
-            SocketEvent::Message(msg) => self.upsert_new(msg),
-            SocketEvent::Changed(msg) => self.upsert_edit(msg),
+            // Message-family events pass through the live-admission gate (`admits_live`): the
+            // `channels` allow-list governs live delivery, not only fetching — Socket Mode
+            // delivers events for every conversation the token can see, and without this gate
+            // every joined channel in the workspace leaks into the Feed regardless of config.
+            // `Deleted` needs no gate: removing a message that was never admitted is a no-op.
+            SocketEvent::Message(msg) => {
+                if self.admits_live(&msg.conv) {
+                    self.upsert_new(msg);
+                }
+            }
+            SocketEvent::Changed(msg) => {
+                if self.admits_live(&msg.conv) {
+                    self.upsert_edit(msg);
+                }
+            }
             SocketEvent::Deleted { conv, ts } => self.remove(&conv, &ts),
         }
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
@@ -556,6 +575,20 @@ impl App {
                 .expect("arrival_seq delta always fits usize on any platform this runs on");
             self.pending_new += delta;
         }
+    }
+
+    /// Whether a live socket event for `conv` should be applied (see `apply`'s gate and
+    /// [`live_event_admitted`]'s rules): subscribed conversations always; DM/MPIM
+    /// conversations — including out-of-cap ones this `App` never subscribed — when `dms` is
+    /// on; everything else (any channel the config never named) is dropped. The kind of an
+    /// unsubscribed conversation comes from the `all_conversations` snapshot; a conversation
+    /// in neither (e.g. a DM opened after startup) is admitted only on Slack's `D` id prefix.
+    fn admits_live(&self, conv: &str) -> bool {
+        if self.conv_kinds.contains_key(conv) {
+            return true; // subscribed — the common case, before the linear snapshot scan below
+        }
+        let all_kind = self.all_conversations.iter().find(|c| c.id == conv).map(|c| c.kind);
+        live_event_admitted(conv, false, all_kind, self.dms)
     }
 
     /// Whether `cursor` currently sits on the active tab's last row (the "scrolled to the
@@ -1940,6 +1973,33 @@ fn budget_exhausted(spent: usize, budget: usize) -> bool {
     spent >= budget
 }
 
+/// PURE admission rule for one live socket event (see `App::admits_live` for the lookups
+/// feeding it): a subscribed conversation always passes; with `dms` on, a known `Im`/`Mpim`
+/// passes regardless of subscription (the documented out-of-cap DM arrival guarantee), and a
+/// conversation absent from the list snapshot passes only on Slack's `D` id prefix (a DM
+/// opened after startup — the snapshot can't know it yet, but the guarantee must still hold).
+/// Everything else — any channel or group the `channels` allow-list never named — is dropped:
+/// Socket Mode is a workspace-wide firehose, and the allow-list governs live delivery exactly
+/// as it governs fetching. With `dms` off, only subscribed conversations pass at all.
+fn live_event_admitted(
+    conv: &str,
+    subscribed: bool,
+    all_kind: Option<ConvKind>,
+    dms: bool,
+) -> bool {
+    if subscribed {
+        return true;
+    }
+    if !dms {
+        return false;
+    }
+    match all_kind {
+        Some(ConvKind::Im | ConvKind::Mpim) => true,
+        Some(ConvKind::Channel | ConvKind::Group) => false,
+        None => conv.starts_with('D'),
+    }
+}
+
 /// The look-back horizon as a synthetic Slack `ts` (`<secs>.000000`, same shape trick as
 /// [`updated_ms_to_ts`] — `oldest` only needs a chronological cutoff, not a real message
 /// identity), or `None` when `lookback_days` is `0` (unlimited). This is the *depth* companion
@@ -2210,9 +2270,9 @@ mod tests {
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
         RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, budget_exhausted,
         capped_sleep_secs, catchup_after_reconnect, clamp_oldest, cooldown_active, dm_scan_due,
-        expand_status, format_ts, key_for, lookback_cutoff_ts, marker_count, next_batch,
-        pick_changed_dm, poll_error_status, resolve_im_names, resume_cursor, thread_slot_count,
-        track_newest, updated_ms_to_ts,
+        expand_status, format_ts, key_for, live_event_admitted, lookback_cutoff_ts, marker_count,
+        next_batch, pick_changed_dm, poll_error_status, resolve_im_names, resume_cursor,
+        thread_slot_count, track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -2276,6 +2336,7 @@ mod tests {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            dms: true,
             // Unlimited by default in fixtures: `empty` exists for network-free tests, whose
             // fixture timestamps are tiny epoch-era values a real 7-day horizon (computed from
             // the actual clock) would silently exclude.
@@ -2907,6 +2968,78 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- live-event admission: the `channels` allow-list must govern live socket delivery,
+    // not only fetching. Socket Mode delivers events for every conversation the token can see,
+    // so without this gate a 600-person workspace's every joined channel leaks into the Feed
+    // regardless of config. DMs/MPIMs keep their documented always-arrive guarantee (gated on
+    // `dms`), including out-of-cap and never-seen `D`-prefixed conversations. ----------------
+
+    #[test]
+    fn live_event_admitted_subscribed_always_passes() {
+        assert!(live_event_admitted("C1", true, None, true));
+        assert!(live_event_admitted("C1", true, None, false));
+    }
+
+    #[test]
+    fn live_event_admitted_drops_an_unconfigured_channel() {
+        assert!(!live_event_admitted("C9", false, Some(ConvKind::Channel), true));
+        assert!(!live_event_admitted("G9", false, Some(ConvKind::Group), true));
+    }
+
+    #[test]
+    fn live_event_admitted_passes_an_out_of_cap_dm_when_dms_are_on() {
+        assert!(live_event_admitted("D9", false, Some(ConvKind::Im), true));
+        assert!(live_event_admitted("G8", false, Some(ConvKind::Mpim), true));
+    }
+
+    #[test]
+    fn live_event_admitted_drops_dms_when_dms_are_off() {
+        assert!(!live_event_admitted("D9", false, Some(ConvKind::Im), false));
+        assert!(!live_event_admitted("D9", false, None, false));
+    }
+
+    #[test]
+    fn live_event_admitted_unknown_conversation_passes_only_with_a_dm_id_prefix() {
+        // Not in the conversation-list snapshot at all (e.g. a DM opened after startup):
+        // Slack DM ids start with `D`, so that prefix keeps the arrival guarantee; an unknown
+        // `C`/`G` id is a channel the config never named, dropped like any other.
+        assert!(live_event_admitted("D0NEW", false, None, true));
+        assert!(!live_event_admitted("C0NEW", false, None, true));
+    }
+
+    #[test]
+    fn a_live_message_on_an_unconfigured_channel_never_reaches_the_feed() {
+        let mut app = empty_app();
+        app.all_conversations.push(conv("C9", "random-firmwide", ConvKind::Channel));
+        app.apply(SocketEvent::Message(msg("C9", "1.0", None, "U1", "firehose noise")));
+        assert!(app.feed_rows().is_empty());
+        // An edit for the same unconfigured conversation must not sneak it in either
+        // (`upsert_edit` inserts fresh when the original was never stored).
+        app.apply(SocketEvent::Changed(Message {
+            edited: true,
+            ..msg("C9", "1.0", None, "U1", "edited noise")
+        }));
+        assert!(app.feed_rows().is_empty());
+    }
+
+    #[test]
+    fn a_live_message_on_an_out_of_cap_dm_still_reaches_the_feed() {
+        let mut app = empty_app();
+        app.all_conversations.push(conv("D9", "U77", ConvKind::Im));
+        app.apply(SocketEvent::Message(msg("D9", "1.0", None, "U77", "dm arrives")));
+        app.touch();
+        assert_eq!(app.feed_rows().len(), 1);
+    }
+
+    #[test]
+    fn a_live_dm_message_is_dropped_when_dms_are_disabled() {
+        let mut app = empty_app();
+        app.dms = false;
+        app.all_conversations.push(conv("D9", "U77", ConvKind::Im));
+        app.apply(SocketEvent::Message(msg("D9", "1.0", None, "U77", "suppressed dm")));
+        assert!(app.feed_rows().is_empty());
     }
 
     // ---- look-back horizon (`lookback_days`): bounds how deep any history fetch reaches, the

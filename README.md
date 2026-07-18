@@ -205,11 +205,19 @@ backfill couldn't.
 `0` means none are polled or backfilled by default. `dm_allow` (below) always-subscribes named DMs
 regardless of this cap, on top of whichever ones rank inside it.
 
-**`dm_limit` never blocks a new message from arriving in any DM, capped or not, in either delivery
-mode.** Over the live Socket Mode connection this is automatic: the socket subscribes to events for
-the whole workspace regardless of which conversations the pane chose to actively track, so a
+**Channels are strictly allow-list, in both delivery modes.** Only channels named in `channels`
+are backfilled, polled, *or shown live*: Socket Mode delivers events for every conversation the
+token can see — at a firm-sized workspace, that's every channel you've ever joined — and the pane
+drops live events for any channel the config didn't name, rather than letting the whole workspace
+firehose into the Feed. (Before this gate existed, an unconfigured channel's messages appeared
+with a raw `#C…` id label; if you relied on that, name the channel in `channels`.)
+
+**`dm_limit`, by contrast, never blocks a new message from arriving in any DM, capped or not, in
+either delivery mode.** Over the live Socket Mode connection this is automatic: DM/MPIM events
+pass the live gate regardless of subscription (including a DM first opened mid-session), so a
 message on an out-of-cap DM shows up in the Feed/Mentions tabs immediately, same as any subscribed
-one. In polling mode there is a dedicated detection path for it: every 5 minutes, a scan re-fetches
+one — unless `dms = false`, which suppresses live DM delivery the same way it suppresses DM
+subscription. In polling mode there is a dedicated detection path for it: every 5 minutes, a scan re-fetches
 the conversation list — DMs and MPIMs only, so the scan never pages through the workspace's public
 channels — and checks every out-of-cap DM/MPIM's Slack-reported activity stamp
 against what was last seen. If none moved, the scan costs nothing beyond that one list call. If one
