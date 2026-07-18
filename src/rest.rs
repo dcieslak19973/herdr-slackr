@@ -149,12 +149,30 @@ const HISTORY_PAGE_CAP: usize = 10;
 /// A mid-pagination failure (including `RateLimited`) discards the pages already fetched and
 /// returns the error: nothing was folded in, so the caller's watermark is untouched and the
 /// whole span is re-fetched cleanly after the cooldown.
+///
+/// Note the page cap is deliberately *larger* than `App`'s per-conversation retention
+/// (`MAX_PER_CONV`, currently 300 vs the 500 messages ten 50-message pages can carry): every
+/// fetched message runs through the mention scan before the prune considers it, and the prune
+/// exempts unread mentions — so the pages beyond retention still surface a mention buried deep
+/// in a burst even though their ordinary messages are pruned right away.
 pub fn history(
     rest: &Rest,
     conv: &str,
     limit: u32,
     oldest: Option<&str>,
 ) -> Result<Vec<Message>, RestError> {
+    history_counted(rest, conv, limit, oldest).map(|(msgs, _)| msgs)
+}
+
+/// As [`history`], additionally reporting how many requests (pages) the fetch actually issued —
+/// what `App::poll_conversations`'s request-budget accounting needs, since a paginated catch-up
+/// fetch can cost up to [`HISTORY_PAGE_CAP`] requests while a caught-up conversation costs one.
+pub fn history_counted(
+    rest: &Rest,
+    conv: &str,
+    limit: u32,
+    oldest: Option<&str>,
+) -> Result<(Vec<Message>, usize), RestError> {
     let limit = limit.to_string();
     let mut out = Vec::new();
     let mut cursor = String::new();
@@ -177,7 +195,7 @@ pub fn history(
         };
         cursor = c;
     }
-    Ok(out)
+    Ok((out, pages))
 }
 
 /// Pure page-continuation decision for [`history`]: follow `cursor` for another page only when

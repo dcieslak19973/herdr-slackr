@@ -279,9 +279,11 @@ pub struct App {
 /// `App` isn't otherwise polling at all, not to keep already-subscribed conversations fresh.
 const DM_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Ticks poll at most this many conversations, round-robin, per call — request count is what
-/// Slack's rate limits meter, so a tick over every subscribed conversation every time is what
-/// triggers them in the first place (see `next_batch`).
+/// Each tick's request budget: request count is what Slack's rate limits meter, so both the
+/// number of conversations a tick visits *and* the pages a gap fetch is allowed to spend are
+/// charged against this one number (see `poll_conversations` — a caught-up conversation costs
+/// one request, a paginated catch-up fetch costs one per page). A tick over every subscribed
+/// conversation every time is what triggers rate limits in the first place (see `next_batch`).
 const POLL_BATCH: usize = 8;
 
 /// How many messages one conversation retains after a prune (`prune_conv`): enough scrollback
@@ -690,12 +692,16 @@ impl App {
         self.catchup_remaining > 0
     }
 
-    /// Work off one `POLL_BATCH`-sized batch of the post-reconnect catch-up sweep (see
-    /// `catchup_remaining`'s field doc): the same watermarked, continue-past-errors
-    /// conversation fetch `poll_tick` uses, sharing `poll_cursor`'s round-robin so the sweep
-    /// and any later polling never double-visit. Gated by the rate-limit cooldown exactly like
-    /// `poll_tick` — a sweep batch that hits `RateLimited` sets the cooldown, leaves its
-    /// unvisited remainder armed, and resumes once the cooldown lapses.
+    /// Work off one `POLL_BATCH`-request batch of the post-reconnect catch-up sweep (see
+    /// `catchup_remaining`'s field doc): the same watermarked, continue-past-errors,
+    /// request-budgeted conversation fetch `poll_tick` uses, sharing `poll_cursor`'s
+    /// round-robin so the sweep and any later polling never double-visit. Because the budget
+    /// meters requests, a sweep over conversations with big gaps (each fetch paginating —
+    /// exactly the post-outage case this sweep exists for) automatically visits fewer
+    /// conversations per batch instead of multiplying the batch's request volume; the
+    /// unvisited remainder stays armed for the next paced batch. Gated by the rate-limit
+    /// cooldown exactly like `poll_tick` — a sweep batch that hits `RateLimited` sets the
+    /// cooldown, leaves its remainder armed, and resumes once the cooldown lapses.
     pub fn catchup_tick(&mut self, rest: &Rest) {
         self.catchup_tick_at(rest, Instant::now());
     }
@@ -839,25 +845,49 @@ impl App {
         failed_at.is_some()
     }
 
-    /// The conversation half of `poll_tick_at`'s split budget (its slot count is `conv_slots`,
-    /// `POLL_BATCH` minus whatever the thread round-robin took), shared with `catchup_tick_at`'s
-    /// post-reconnect sweep. Returns a [`BatchOutcome`]: whether a `RateLimited` hit occurred
-    /// (`poll_tick_at` uses it to decide whether the DM scan still runs this tick) and how many
-    /// conversations were actually visited (`catchup_tick_at` uses it to retire sweep slots).
-    /// A mid-batch `RateLimited` stops the batch and rewinds `poll_cursor` to the conversation
-    /// it hit (`resume_cursor`), so the unvisited remainder is retried next tick rather than
-    /// silently skipped until the round-robin wraps.
-    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) -> BatchOutcome {
+    /// The conversation half of `poll_tick_at`'s split budget, shared with `catchup_tick_at`'s
+    /// post-reconnect sweep. `request_budget` meters what Slack's rate limits actually meter —
+    /// *requests*, not conversations: a caught-up conversation costs exactly one request, but a
+    /// paginated gap fetch (`rest::history_counted`) can cost up to `rest`'s page cap, so a
+    /// conversation-counted batch could issue ~10× its intended request volume right after a
+    /// long outage — the exact moment Slack is most likely to answer 429. The batch stops early
+    /// (`budget_exhausted`, checked before each conversation) once the spent count reaches the
+    /// budget; one conversation's own pagination may overshoot the budget it started under,
+    /// bounded by the page cap, which is accepted rather than truncating that fetch mid-span
+    /// (a truncated span would advance the watermark past unfetched messages — the exact gap
+    /// bug pagination exists to fix). A failed fetch costs one request.
+    ///
+    /// Returns a [`BatchOutcome`]: whether a `RateLimited` hit occurred (`poll_tick_at` uses it
+    /// to decide whether the DM scan still runs this tick) and how many conversations were
+    /// actually visited (`catchup_tick_at` uses it to retire sweep slots). A mid-batch
+    /// `RateLimited` *or* budget stop rewinds `poll_cursor` to the first unvisited conversation
+    /// (`resume_cursor`), so the remainder is picked up next tick rather than silently skipped
+    /// until the round-robin wraps.
+    fn poll_conversations(
+        &mut self,
+        rest: &Rest,
+        request_budget: usize,
+        now: Instant,
+    ) -> BatchOutcome {
         let n = self.conversations.len();
-        let (indices, planned_next) = next_batch(self.poll_cursor, n, conv_slots);
+        // Each conversation costs at least one request, so the budget also bounds how many
+        // conversations this batch could possibly visit — plan exactly that many.
+        let (indices, planned_next) = next_batch(self.poll_cursor, n, request_budget);
 
-        let mut failed_at = None;
+        let mut spent = 0;
+        let mut rate_limited = false;
+        let mut stopped_at = None;
         for (j, &i) in indices.iter().enumerate() {
+            if budget_exhausted(spent, request_budget) {
+                stopped_at = Some(j);
+                break;
+            }
             let conv_id = self.conversations[i].id.clone();
             let conv_name = self.conversations[i].name.clone();
             let oldest = self.newest_ts.get(&conv_id).cloned();
-            match crate::rest::history(rest, &conv_id, 50, oldest.as_deref()) {
-                Ok(msgs) => {
+            match crate::rest::history_counted(rest, &conv_id, 50, oldest.as_deref()) {
+                Ok((msgs, requests)) => {
+                    spent += requests;
                     for msg in msgs {
                         self.upsert_new(msg);
                     }
@@ -865,19 +895,18 @@ impl App {
                 Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&conv_name, &err);
                     self.cooldown_until = Some(now + Duration::from_secs(secs));
-                    failed_at = Some(j);
+                    rate_limited = true;
+                    stopped_at = Some(j);
                     break;
                 }
                 Err(err) => {
+                    spent += 1;
                     self.status = poll_error_status(&conv_name, &err);
                 }
             }
         }
-        self.poll_cursor = resume_cursor(&indices, planned_next, failed_at);
-        BatchOutcome {
-            completed: failed_at.unwrap_or(indices.len()),
-            rate_limited: failed_at.is_some(),
-        }
+        self.poll_cursor = resume_cursor(&indices, planned_next, stopped_at);
+        BatchOutcome { completed: stopped_at.unwrap_or(indices.len()), rate_limited }
     }
 
     /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
@@ -1877,11 +1906,19 @@ fn catchup_after_reconnect(was_polling: bool, n_conversations: usize) -> usize {
 }
 
 /// The round-robin cursor to store after a batch over `indices` (planned by `next_batch`,
-/// which proposed `planned_next`): the index the `RateLimited` stop hit when there was one
-/// (`failed_at` is its *batch position*, so the failed conversation and everything after it
-/// are retried next tick), else the planned advance.
-fn resume_cursor(indices: &[usize], planned_next: usize, failed_at: Option<usize>) -> usize {
-    failed_at.and_then(|j| indices.get(j).copied()).unwrap_or(planned_next)
+/// which proposed `planned_next`): the batch position a `RateLimited` or budget stop hit, when
+/// there was one (`stopped_at` — that conversation and everything after it are retried next
+/// tick), else the planned advance.
+fn resume_cursor(indices: &[usize], planned_next: usize, stopped_at: Option<usize>) -> usize {
+    stopped_at.and_then(|j| indices.get(j).copied()).unwrap_or(planned_next)
+}
+
+/// Whether a batch's request budget is used up before visiting its next conversation (see
+/// `poll_conversations`'s doc for why the budget meters requests, not conversations). `>=`
+/// rather than `>`: a batch that has spent exactly its budget has nothing left for the next
+/// conversation's guaranteed minimum of one request.
+fn budget_exhausted(spent: usize, budget: usize) -> bool {
+    spent >= budget
 }
 
 /// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
@@ -2114,10 +2151,10 @@ fn resolve_im_names(
 mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
-        RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, capped_sleep_secs,
-        catchup_after_reconnect, cooldown_active, dm_scan_due, expand_status, format_ts, key_for,
-        marker_count, next_batch, pick_changed_dm, poll_error_status, resolve_im_names,
-        resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
+        RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, budget_exhausted,
+        capped_sleep_secs, catchup_after_reconnect, cooldown_active, dm_scan_due, expand_status,
+        format_ts, key_for, marker_count, next_batch, pick_changed_dm, poll_error_status,
+        resolve_im_names, resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -2808,6 +2845,19 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- request-budget batching: POLL_BATCH meters what Slack meters — requests, not
+    // conversations. A paginated catch-up fetch can cost up to HISTORY_PAGE_CAP requests for
+    // one conversation, so a conversation-counted batch could issue ~10× its intended request
+    // volume right after a long gap — the exact moment Slack is most likely to 429. ----------
+
+    #[test]
+    fn budget_exhausted_only_once_spent_reaches_the_budget() {
+        assert!(!budget_exhausted(0, 8));
+        assert!(!budget_exhausted(7, 8));
+        assert!(budget_exhausted(8, 8));
+        assert!(budget_exhausted(9, 8));
     }
 
     // ---- resume_cursor: a mid-batch RateLimited must not advance the round-robin past the

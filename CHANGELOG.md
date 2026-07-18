@@ -7,6 +7,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **Poll batches now meter requests, not conversations.** History pagination made one
+  conversation cost anywhere from one request (caught up) to ten (a large gap), so an
+  8-conversation batch could issue up to ~80 requests right after a long outage — past Slack's
+  Tier-3 budget at the exact moment a 429 was most likely, in the code that exists to recover
+  from outages. `POLL_BATCH` is now a request budget shared by the poll tick and the
+  post-reconnect catch-up sweep: a batch stops early once its spent requests reach the budget and
+  the round-robin cursor rewinds to the first unvisited conversation, so big-gap sweeps
+  automatically cover fewer conversations per tick instead of multiplying request volume. One
+  conversation's own pagination may overshoot the budget it started under (bounded by the
+  10-page cap) — accepted deliberately, since truncating a fetch mid-span would advance the
+  watermark past unfetched messages, recreating the gap bug pagination exists to fix.
+
 - **Messages arriving during a socket outage could be lost for good.** Slack Socket Mode never
   redelivers events that fired while the connection was down, and the polling fallback both waits
   out a grace period and round-robins only 8 conversations per tick — so a brief disconnect (or one

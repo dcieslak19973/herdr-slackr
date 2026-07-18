@@ -145,19 +145,25 @@ A channel you can't read surfaces Slack's error verbatim in the status line.
 ### Rate limits
 
 herdr-slackr is deliberately conservative about how hard it hits Slack's Web API. The polling
-fallback (while the socket is down) fetches only 8 conversations per tick, round-robin across
-every subscribed conversation, and asks Slack only for messages newer than the last one already
-seen — a caught-up tick's response is typically empty rather than re-shipping the last 50 messages
-every time (and when a burst *is* larger than one page, the fetch follows Slack's cursor for up to
-10 pages so the middle of the burst isn't silently lost). If Slack answers with a real rate limit,
-the pane reads its actual `Retry-After` value and pauses all polling until that deadline passes,
-rather than guessing at a fixed backoff, and resumes the round-robin at the conversation the limit
-interrupted rather than skipping past it; a socket reconnect always clears a pending cooldown
-immediately, since a healthy socket means Slack has already accepted the connection. Because
-Socket Mode never redelivers events that fired while the connection was down, every reconnect also
-arms a one-time catch-up sweep: each subscribed conversation gets one watermarked history fetch,
-paced out in 8-conversation batches every 10 seconds — a conversation that missed nothing answers
-with an empty body, so a sweep after a brief blip is close to free. The workspace's `users.list`
+fallback (while the socket is down) spends at most an 8-*request* budget per tick, round-robin
+across every subscribed conversation, and asks Slack only for messages newer than the last one
+already seen — a caught-up tick's response is typically empty rather than re-shipping the last 50
+messages every time (and when a burst *is* larger than one page, the fetch follows Slack's cursor
+for up to 10 pages so the middle of the burst isn't silently lost). The budget meters requests
+rather than conversations because that's what Slack's rate limits meter: a caught-up conversation
+costs one request, but a paginated gap fetch can cost up to ten, so right after a long outage — a
+laptop asleep over lunch in a busy workspace — a batch automatically covers fewer conversations
+per tick instead of multiplying its request volume tenfold at the exact moment Slack is most
+likely to answer 429. If Slack answers with a real rate limit, the pane reads its actual
+`Retry-After` value and pauses all polling until that deadline passes, rather than guessing at a
+fixed backoff, and resumes the round-robin at the conversation it stopped at (whether the stop was
+the rate limit or the budget) rather than skipping past it; a socket reconnect always clears a
+pending cooldown immediately, since a healthy socket means Slack has already accepted the
+connection. Because Socket Mode never redelivers events that fired while the connection was down,
+every reconnect also arms a one-time catch-up sweep: each subscribed conversation gets one
+watermarked history fetch, paced out in 8-request batches every 10 seconds — a conversation that
+missed nothing answers with an empty body, so a sweep after a brief blip is close to free, while a
+sweep over real gaps spreads itself out under the same budget. The workspace's `users.list`
 directory (used for display names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so
 a pane restart or a CLI invocation doesn't refetch the whole member list every time. Startup
 backfill retries a rate-limited conversation exactly once (sleeping the real `Retry-After` first)
