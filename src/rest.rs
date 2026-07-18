@@ -124,8 +124,12 @@ fn list_conversations_of(types: &str, rest: &Rest) -> Result<Vec<Conversation>, 
 
 /// Pure param-list construction for [`list_conversations_of`], split out (like
 /// [`history_params`]) so the `types` threading is unit-tested without a real REST call.
+/// `exclude_archived` is always sent: an older workspace accumulates thousands of archived
+/// channels that would otherwise double the page count of this Tier-2 call, and a live feed
+/// pane can never usefully subscribe to an archived channel anyway (naming one in `channels`
+/// now fails resolution like any other unknown name — the correct outcome for a feed).
 fn conversation_list_params<'a>(types: &'a str, cursor: &'a str) -> Vec<(&'a str, &'a str)> {
-    vec![("types", types), ("limit", "200"), ("cursor", cursor)]
+    vec![("types", types), ("exclude_archived", "true"), ("limit", "200"), ("cursor", cursor)]
 }
 
 /// How many pages an incremental [`history`] fetch may follow at most — a defensive bound so a
@@ -592,16 +596,25 @@ mod tests {
     fn conversation_list_params_threads_the_requested_types() {
         assert_eq!(
             conversation_list_params("im,mpim", ""),
-            vec![("types", "im,mpim"), ("limit", "200"), ("cursor", "")]
+            vec![
+                ("types", "im,mpim"),
+                ("exclude_archived", "true"),
+                ("limit", "200"),
+                ("cursor", "")
+            ]
         );
     }
 
     #[test]
-    fn conversation_list_params_carries_the_page_cursor() {
+    fn conversation_list_params_carries_the_page_cursor_and_excludes_archived() {
+        // exclude_archived: an older workspace accumulates thousands of dead channels that
+        // would otherwise double a Tier-2 call's page count; a feed pane can never usefully
+        // subscribe to an archived channel anyway.
         assert_eq!(
             conversation_list_params("public_channel,private_channel,im,mpim", "abc"),
             vec![
                 ("types", "public_channel,private_channel,im,mpim"),
+                ("exclude_archived", "true"),
                 ("limit", "200"),
                 ("cursor", "abc")
             ]

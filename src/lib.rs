@@ -165,6 +165,8 @@ fn event_loop(
     let mut last_poll_tick = Instant::now();
     let mut last_catchup: Option<Instant> = None;
     let poll_fallback = Duration::from_secs(poll_fallback_secs);
+    let mut next_poll_gap = jittered(poll_fallback);
+    let mut next_catchup_gap = jittered(CATCHUP_INTERVAL);
     let backoff_cycle = Duration::from_secs(socket::backoff_secs(0, |b| b));
     // Drawing is event-driven, not every-tick: a frame is only rebuilt after something that
     // can change it (a socket event, a poll/catch-up tick, a keypress, a terminal resize, or
@@ -188,12 +190,17 @@ fn event_loop(
             }
         }
 
+        // Both recurring request cadences below re-jitter their next interval after every
+        // firing (see `jittered`): panes sharing one app key all enter polling mode anchored
+        // to the same Slack outage, and fixed intervals would keep their request batches in
+        // lockstep against the shared rate-limit pool indefinitely.
         if app.polling
             && down_since.is_some_and(|since| since.elapsed() >= backoff_cycle)
-            && last_poll_tick.elapsed() >= poll_fallback
+            && last_poll_tick.elapsed() >= next_poll_gap
         {
             app.poll_tick(rest);
             last_poll_tick = Instant::now();
+            next_poll_gap = jittered(poll_fallback);
             dirty = true;
         }
 
@@ -204,10 +211,11 @@ fn event_loop(
         // freshness, and the next `Connected` re-arms the sweep in full anyway.
         if !app.polling
             && app.catchup_due()
-            && last_catchup.is_none_or(|at: Instant| at.elapsed() >= CATCHUP_INTERVAL)
+            && last_catchup.is_none_or(|at: Instant| at.elapsed() >= next_catchup_gap)
         {
             app.catchup_tick(rest);
             last_catchup = Some(Instant::now());
+            next_catchup_gap = jittered(CATCHUP_INTERVAL);
             dirty = true;
         }
 
@@ -289,6 +297,18 @@ fn event_loop(
     }
 }
 
+/// `base` with `±25%` jitter applied — the same spread (and the same cheap clock-derived
+/// entropy) as `socket::run`'s reconnect schedule, here de-synchronizing the poll-fallback and
+/// catch-up cadences across panes: a Slack outage flips *every* pane on a shared app key into
+/// polling mode anchored to the same outage moment, and without jitter they then fire their
+/// request batches in lockstep against one shared rate-limit pool. With ±25% per cycle, the
+/// cohort spreads out within a few cycles instead of thundering together indefinitely.
+fn jittered(base: Duration) -> Duration {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let pct = 75 + u64::from(nanos % 51); // 75..=125
+    base.saturating_mul(u32::try_from(pct).expect("pct is at most 125")) / 100
+}
+
 /// Whole UTC days since the epoch, for the event loop's redraw-on-day-flip check: row
 /// timestamps render dated once their UTC calendar day is no longer "today" (`app::format_ts`),
 /// so a frame drawn before UTC midnight goes stale at midnight even with no state change —
@@ -312,6 +332,18 @@ fn theme_warning(theme_name: &str) -> Option<String> {
 mod tests {
     use super::{theme_warning, utc_day};
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn jittered_stays_within_the_twenty_five_percent_band() {
+        // The exact value is entropy-driven; the contract is the band. Sampling repeatedly
+        // keeps a bad constant (e.g. an off-by-percent bound) from passing by luck.
+        let base = Duration::from_secs(30);
+        for _ in 0..100 {
+            let j = super::jittered(base);
+            assert!(j >= Duration::from_millis(22_500), "{j:?} below 75% of base");
+            assert!(j <= Duration::from_millis(37_500), "{j:?} above 125% of base");
+        }
+    }
 
     #[test]
     fn utc_day_counts_whole_days_since_the_epoch() {

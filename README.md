@@ -178,9 +178,14 @@ person. If the Slack app behind your tokens is shared (several teammates running
 other tooling on the same bot), every consumer draws from the same budget. herdr-slackr's own
 worst sustained rate is deliberately kept well under half of Tier 3 (~8 requests/30s polling,
 ~8/15s during a catch-up sweep, ≤2 per 5-minute DM scan) precisely so it behaves as a good tenant
-on a shared key; if you still see `slack rate limit` notices while the pane is idle-ish, the
-budget is being spent elsewhere on the same app, and raising `poll_fallback_secs` and/or lowering
-`lookback_days` are the two knobs that cut this pane's share further. The workspace's `users.list`
+on a shared key. Every recurring cadence — socket reconnects, poll-fallback ticks, catch-up
+batches — carries ±25% jitter, because a Slack outage flips *every* pane on the key into polling
+mode at the same moment, and without jitter their request batches would then fire in lockstep
+against the shared pool indefinitely. Conversation listing always excludes archived channels,
+which in an older workspace can otherwise double the page count of the startup list call for rows
+a live feed could never use. If you still see `slack rate limit` notices while the pane is
+idle-ish, the budget is being spent elsewhere on the same app, and raising `poll_fallback_secs`
+and/or lowering `lookback_days` are the two knobs that cut this pane's share further. The workspace's `users.list`
 directory (used for display names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so
 a pane restart or a CLI invocation doesn't refetch the whole member list every time. Startup
 backfill retries a rate-limited conversation exactly once (sleeping the real `Retry-After` first)

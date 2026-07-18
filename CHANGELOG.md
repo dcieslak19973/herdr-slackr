@@ -19,6 +19,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Catch-up sweep pacing relaxed from 10s to 15s between batches.** Worst sustained sweep rate
   drops from ~48 to ~32 requests/min, leaving real Tier-3 headroom for other consumers of a
   shared app key.
+- **Poll-fallback and catch-up cadences now carry ±25% jitter** (the socket reconnect schedule
+  already did). A Slack outage flips every pane on a shared app key into polling mode anchored to
+  the same moment; fixed intervals kept their request batches in lockstep against the shared
+  rate-limit pool indefinitely, jitter spreads the cohort out within a few cycles.
+- **Conversation listing excludes archived channels** (`exclude_archived=true` on every
+  `conversations.list` call). An older workspace accumulates thousands of dead channels that
+  doubled the startup list's Tier-2 page count for rows a live feed can never subscribe to.
+  Naming an archived channel in `channels` now fails resolution like any unknown name.
 
 ### Fixed
 - **Poll batches now meter requests, not conversations.** History pagination made one
