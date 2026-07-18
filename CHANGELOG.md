@@ -6,7 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`lookback_days` config key (default 7, `0..=365`, `0` = unlimited).** Bounds how far back any
+  history fetch reaches — the *depth* companion to the request budget's *rate* cap. Startup
+  backfill drops messages older than the horizon, and every incremental fetch (polling, the
+  post-reconnect catch-up sweep, the DM scan) clamps its `oldest` to it, so a watermark left over
+  from a weeks-long gap no longer sends pagination chasing history the 300-message retention cap
+  would mostly discard anyway. Deliberately conservative for shared Slack apps, where the
+  rate-limit pool is per app + workspace and this pane is not the only consumer.
+
+### Changed
+- **Catch-up sweep pacing relaxed from 10s to 15s between batches.** Worst sustained sweep rate
+  drops from ~48 to ~32 requests/min, leaving real Tier-3 headroom for other consumers of a
+  shared app key.
+- **Poll-fallback and catch-up cadences now carry ±25% jitter** (the socket reconnect schedule
+  already did). A Slack outage flips every pane on a shared app key into polling mode anchored to
+  the same moment; fixed intervals kept their request batches in lockstep against the shared
+  rate-limit pool indefinitely, jitter spreads the cohort out within a few cycles.
+- **Conversation listing excludes archived channels** (`exclude_archived=true` on every
+  `conversations.list` call). An older workspace accumulates thousands of dead channels that
+  doubled the startup list's Tier-2 page count for rows a live feed can never subscribe to.
+  Naming an archived channel in `channels` now fails resolution like any unknown name.
+
 ### Fixed
+- **The `channels` allow-list now governs live delivery, not only fetching.** Socket Mode
+  delivers events for every conversation the token can see, and the pane applied them all — so
+  every joined channel in the workspace leaked into the Feed (with raw `#C…` id labels),
+  regardless of config. Live `Message`/`Changed` events for channels/groups not named in
+  `channels` are now dropped. DMs/MPIMs keep their documented always-arrive guarantee — including
+  out-of-cap DMs and DMs first opened mid-session (admitted by Slack's `D` id prefix) — unless
+  `dms = false`, which now suppresses live DM delivery the same way it suppresses subscription.
+  If you relied on the firehose, name those channels in `channels`.
+
+- **Poll batches now meter requests, not conversations.** History pagination made one
+  conversation cost anywhere from one request (caught up) to ten (a large gap), so an
+  8-conversation batch could issue up to ~80 requests right after a long outage — past Slack's
+  Tier-3 budget at the exact moment a 429 was most likely, in the code that exists to recover
+  from outages. `POLL_BATCH` is now a request budget shared by the poll tick and the
+  post-reconnect catch-up sweep: a batch stops early once its spent requests reach the budget and
+  the round-robin cursor rewinds to the first unvisited conversation, so big-gap sweeps
+  automatically cover fewer conversations per tick instead of multiplying request volume. One
+  conversation's own pagination may overshoot the budget it started under (bounded by the
+  10-page cap) — accepted deliberately, since truncating a fetch mid-span would advance the
+  watermark past unfetched messages, recreating the gap bug pagination exists to fix.
+
 - **Messages arriving during a socket outage could be lost for good.** Slack Socket Mode never
   redelivers events that fired while the connection was down, and the polling fallback both waits
   out a grace period and round-robins only 8 conversations per tick — so a brief disconnect (or one

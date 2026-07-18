@@ -249,6 +249,14 @@ pub struct App {
     /// substring via `entities::keyword_hit` — deliberately not reusing `keywords` (the Mentions
     /// trigger list); see `PluginConfig::focus_keywords`'s doc for why the two must stay distinct.
     focus_keywords: Vec<String>,
+    /// `PluginConfig::dms`, kept for live-event admission (`admits_live`): `dms = false` must
+    /// suppress live DM/MPIM delivery the same way it suppresses DM subscription — an explicit
+    /// "no DMs" wins everywhere.
+    dms: bool,
+    /// The look-back horizon in days (`PluginConfig::lookback_days`, 0 = unlimited): backfill
+    /// drops messages older than this, and every incremental fetch clamps its `oldest` to it
+    /// (see [`lookback_cutoff_ts`]/[`clamp_oldest`]).
+    lookback_days: u64,
     /// Per-conversation message counts, maintained incrementally by `upsert_new`/`upsert_edit`
     /// (insert paths), `remove`, and `prune_conv` itself — so the "is this conversation over
     /// its retention cap" check is O(1) per insert instead of a full store scan (`messages` is
@@ -279,9 +287,11 @@ pub struct App {
 /// `App` isn't otherwise polling at all, not to keep already-subscribed conversations fresh.
 const DM_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Ticks poll at most this many conversations, round-robin, per call — request count is what
-/// Slack's rate limits meter, so a tick over every subscribed conversation every time is what
-/// triggers them in the first place (see `next_batch`).
+/// Each tick's request budget: request count is what Slack's rate limits meter, so both the
+/// number of conversations a tick visits *and* the pages a gap fetch is allowed to spend are
+/// charged against this one number (see `poll_conversations` — a caught-up conversation costs
+/// one request, a paginated catch-up fetch costs one per page). A tick over every subscribed
+/// conversation every time is what triggers rate limits in the first place (see `next_batch`).
 const POLL_BATCH: usize = 8;
 
 /// How many messages one conversation retains after a prune (`prune_conv`): enough scrollback
@@ -381,13 +391,16 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: config.focus_keywords().to_vec(),
+            dms: config.dms(),
+            lookback_days: config.lookback_days(),
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs,
         };
 
+        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), app.lookback_days);
         for conv in app.conversations.clone() {
-            match backfill_one(&mut app, rest, &conv) {
+            match backfill_one(&mut app, rest, &conv, cutoff.as_deref()) {
                 BackfillOutcome::Ok => {}
                 BackfillOutcome::SkipRemaining => break,
                 BackfillOutcome::Fail(msg) => return Err(msg),
@@ -443,6 +456,11 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            dms: true,
+            // Unlimited by default in fixtures: `empty` exists for network-free tests, whose
+            // fixture timestamps are tiny epoch-era values a real 7-day horizon (computed from
+            // the actual clock) would silently exclude.
+            lookback_days: 0,
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
@@ -508,8 +526,21 @@ impl App {
                 self.polling = true;
                 self.status = format!("socket unavailable ({reason}) — polling");
             }
-            SocketEvent::Message(msg) => self.upsert_new(msg),
-            SocketEvent::Changed(msg) => self.upsert_edit(msg),
+            // Message-family events pass through the live-admission gate (`admits_live`): the
+            // `channels` allow-list governs live delivery, not only fetching — Socket Mode
+            // delivers events for every conversation the token can see, and without this gate
+            // every joined channel in the workspace leaks into the Feed regardless of config.
+            // `Deleted` needs no gate: removing a message that was never admitted is a no-op.
+            SocketEvent::Message(msg) => {
+                if self.admits_live(&msg.conv) {
+                    self.upsert_new(msg);
+                }
+            }
+            SocketEvent::Changed(msg) => {
+                if self.admits_live(&msg.conv) {
+                    self.upsert_edit(msg);
+                }
+            }
             SocketEvent::Deleted { conv, ts } => self.remove(&conv, &ts),
         }
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
@@ -544,6 +575,20 @@ impl App {
                 .expect("arrival_seq delta always fits usize on any platform this runs on");
             self.pending_new += delta;
         }
+    }
+
+    /// Whether a live socket event for `conv` should be applied (see `apply`'s gate and
+    /// [`live_event_admitted`]'s rules): subscribed conversations always; DM/MPIM
+    /// conversations — including out-of-cap ones this `App` never subscribed — when `dms` is
+    /// on; everything else (any channel the config never named) is dropped. The kind of an
+    /// unsubscribed conversation comes from the `all_conversations` snapshot; a conversation
+    /// in neither (e.g. a DM opened after startup) is admitted only on Slack's `D` id prefix.
+    fn admits_live(&self, conv: &str) -> bool {
+        if self.conv_kinds.contains_key(conv) {
+            return true; // subscribed — the common case, before the linear snapshot scan below
+        }
+        let all_kind = self.all_conversations.iter().find(|c| c.id == conv).map(|c| c.kind);
+        live_event_admitted(conv, false, all_kind, self.dms)
     }
 
     /// Whether `cursor` currently sits on the active tab's last row (the "scrolled to the
@@ -690,12 +735,16 @@ impl App {
         self.catchup_remaining > 0
     }
 
-    /// Work off one `POLL_BATCH`-sized batch of the post-reconnect catch-up sweep (see
-    /// `catchup_remaining`'s field doc): the same watermarked, continue-past-errors
-    /// conversation fetch `poll_tick` uses, sharing `poll_cursor`'s round-robin so the sweep
-    /// and any later polling never double-visit. Gated by the rate-limit cooldown exactly like
-    /// `poll_tick` — a sweep batch that hits `RateLimited` sets the cooldown, leaves its
-    /// unvisited remainder armed, and resumes once the cooldown lapses.
+    /// Work off one `POLL_BATCH`-request batch of the post-reconnect catch-up sweep (see
+    /// `catchup_remaining`'s field doc): the same watermarked, continue-past-errors,
+    /// request-budgeted conversation fetch `poll_tick` uses, sharing `poll_cursor`'s
+    /// round-robin so the sweep and any later polling never double-visit. Because the budget
+    /// meters requests, a sweep over conversations with big gaps (each fetch paginating —
+    /// exactly the post-outage case this sweep exists for) automatically visits fewer
+    /// conversations per batch instead of multiplying the batch's request volume; the
+    /// unvisited remainder stays armed for the next paced batch. Gated by the rate-limit
+    /// cooldown exactly like `poll_tick` — a sweep batch that hits `RateLimited` sets the
+    /// cooldown, leaves its remainder armed, and resumes once the cooldown lapses.
     pub fn catchup_tick(&mut self, rest: &Rest) {
         self.catchup_tick_at(rest, Instant::now());
     }
@@ -782,7 +831,9 @@ impl App {
         let Some(updated) = conv.updated else {
             return;
         };
-        let oldest = self.dm_last_seen.get(&conv.id).copied().map(updated_ms_to_ts);
+        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), self.lookback_days);
+        let oldest =
+            clamp_oldest(self.dm_last_seen.get(&conv.id).copied().map(updated_ms_to_ts), cutoff);
         match crate::rest::history(rest, &conv.id, 50, oldest.as_deref()) {
             Ok(msgs) => {
                 for msg in msgs {
@@ -839,25 +890,50 @@ impl App {
         failed_at.is_some()
     }
 
-    /// The conversation half of `poll_tick_at`'s split budget (its slot count is `conv_slots`,
-    /// `POLL_BATCH` minus whatever the thread round-robin took), shared with `catchup_tick_at`'s
-    /// post-reconnect sweep. Returns a [`BatchOutcome`]: whether a `RateLimited` hit occurred
-    /// (`poll_tick_at` uses it to decide whether the DM scan still runs this tick) and how many
-    /// conversations were actually visited (`catchup_tick_at` uses it to retire sweep slots).
-    /// A mid-batch `RateLimited` stops the batch and rewinds `poll_cursor` to the conversation
-    /// it hit (`resume_cursor`), so the unvisited remainder is retried next tick rather than
-    /// silently skipped until the round-robin wraps.
-    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) -> BatchOutcome {
+    /// The conversation half of `poll_tick_at`'s split budget, shared with `catchup_tick_at`'s
+    /// post-reconnect sweep. `request_budget` meters what Slack's rate limits actually meter —
+    /// *requests*, not conversations: a caught-up conversation costs exactly one request, but a
+    /// paginated gap fetch (`rest::history_counted`) can cost up to `rest`'s page cap, so a
+    /// conversation-counted batch could issue ~10× its intended request volume right after a
+    /// long outage — the exact moment Slack is most likely to answer 429. The batch stops early
+    /// (`budget_exhausted`, checked before each conversation) once the spent count reaches the
+    /// budget; one conversation's own pagination may overshoot the budget it started under,
+    /// bounded by the page cap, which is accepted rather than truncating that fetch mid-span
+    /// (a truncated span would advance the watermark past unfetched messages — the exact gap
+    /// bug pagination exists to fix). A failed fetch costs one request.
+    ///
+    /// Returns a [`BatchOutcome`]: whether a `RateLimited` hit occurred (`poll_tick_at` uses it
+    /// to decide whether the DM scan still runs this tick) and how many conversations were
+    /// actually visited (`catchup_tick_at` uses it to retire sweep slots). A mid-batch
+    /// `RateLimited` *or* budget stop rewinds `poll_cursor` to the first unvisited conversation
+    /// (`resume_cursor`), so the remainder is picked up next tick rather than silently skipped
+    /// until the round-robin wraps.
+    fn poll_conversations(
+        &mut self,
+        rest: &Rest,
+        request_budget: usize,
+        now: Instant,
+    ) -> BatchOutcome {
         let n = self.conversations.len();
-        let (indices, planned_next) = next_batch(self.poll_cursor, n, conv_slots);
+        // Each conversation costs at least one request, so the budget also bounds how many
+        // conversations this batch could possibly visit — plan exactly that many.
+        let (indices, planned_next) = next_batch(self.poll_cursor, n, request_budget);
+        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), self.lookback_days);
 
-        let mut failed_at = None;
+        let mut spent = 0;
+        let mut rate_limited = false;
+        let mut stopped_at = None;
         for (j, &i) in indices.iter().enumerate() {
+            if budget_exhausted(spent, request_budget) {
+                stopped_at = Some(j);
+                break;
+            }
             let conv_id = self.conversations[i].id.clone();
             let conv_name = self.conversations[i].name.clone();
-            let oldest = self.newest_ts.get(&conv_id).cloned();
-            match crate::rest::history(rest, &conv_id, 50, oldest.as_deref()) {
-                Ok(msgs) => {
+            let oldest = clamp_oldest(self.newest_ts.get(&conv_id).cloned(), cutoff.clone());
+            match crate::rest::history_counted(rest, &conv_id, 50, oldest.as_deref()) {
+                Ok((msgs, requests)) => {
+                    spent += requests;
                     for msg in msgs {
                         self.upsert_new(msg);
                     }
@@ -865,19 +941,18 @@ impl App {
                 Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&conv_name, &err);
                     self.cooldown_until = Some(now + Duration::from_secs(secs));
-                    failed_at = Some(j);
+                    rate_limited = true;
+                    stopped_at = Some(j);
                     break;
                 }
                 Err(err) => {
+                    spent += 1;
                     self.status = poll_error_status(&conv_name, &err);
                 }
             }
         }
-        self.poll_cursor = resume_cursor(&indices, planned_next, failed_at);
-        BatchOutcome {
-            completed: failed_at.unwrap_or(indices.len()),
-            rate_limited: failed_at.is_some(),
-        }
+        self.poll_cursor = resume_cursor(&indices, planned_next, stopped_at);
+        BatchOutcome { completed: stopped_at.unwrap_or(indices.len()), rate_limited }
     }
 
     /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
@@ -1813,18 +1888,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// Fold one conversation's backfill result into `app`, or produce an error naming which
-/// conversation's history fetch failed (spec: "a per-channel history error fails build with an
-/// error naming the channel"). Split out of `build`'s loop so the error-naming path is
-/// unit-tested without a real REST call.
+/// Fold one conversation's backfill result into `app` — dropping messages older than the
+/// look-back `cutoff` ([`within_lookback`]; backfill's plain last-50 fetch is not bounded
+/// server-side the way the incremental paths' `oldest` is, so the horizon is applied here
+/// instead) — or produce an error naming which conversation's history fetch failed (spec: "a
+/// per-channel history error fails build with an error naming the channel"). Split out of
+/// `build`'s loop so the error-naming and horizon paths are unit-tested without a real REST
+/// call.
 fn apply_backfill(
     app: &mut App,
     conv_name: &str,
     msgs: Result<Vec<Message>, RestError>,
+    cutoff: Option<&str>,
 ) -> Result<(), String> {
     let msgs = msgs.map_err(|e| format!("history failed for {conv_name}: {e:?}"))?;
     for msg in msgs {
-        app.upsert_new(msg);
+        if within_lookback(&msg.ts, cutoff) {
+            app.upsert_new(msg);
+        }
     }
     Ok(())
 }
@@ -1877,11 +1958,77 @@ fn catchup_after_reconnect(was_polling: bool, n_conversations: usize) -> usize {
 }
 
 /// The round-robin cursor to store after a batch over `indices` (planned by `next_batch`,
-/// which proposed `planned_next`): the index the `RateLimited` stop hit when there was one
-/// (`failed_at` is its *batch position*, so the failed conversation and everything after it
-/// are retried next tick), else the planned advance.
-fn resume_cursor(indices: &[usize], planned_next: usize, failed_at: Option<usize>) -> usize {
-    failed_at.and_then(|j| indices.get(j).copied()).unwrap_or(planned_next)
+/// which proposed `planned_next`): the batch position a `RateLimited` or budget stop hit, when
+/// there was one (`stopped_at` — that conversation and everything after it are retried next
+/// tick), else the planned advance.
+fn resume_cursor(indices: &[usize], planned_next: usize, stopped_at: Option<usize>) -> usize {
+    stopped_at.and_then(|j| indices.get(j).copied()).unwrap_or(planned_next)
+}
+
+/// Whether a batch's request budget is used up before visiting its next conversation (see
+/// `poll_conversations`'s doc for why the budget meters requests, not conversations). `>=`
+/// rather than `>`: a batch that has spent exactly its budget has nothing left for the next
+/// conversation's guaranteed minimum of one request.
+fn budget_exhausted(spent: usize, budget: usize) -> bool {
+    spent >= budget
+}
+
+/// PURE admission rule for one live socket event (see `App::admits_live` for the lookups
+/// feeding it): a subscribed conversation always passes; with `dms` on, a known `Im`/`Mpim`
+/// passes regardless of subscription (the documented out-of-cap DM arrival guarantee), and a
+/// conversation absent from the list snapshot passes only on Slack's `D` id prefix (a DM
+/// opened after startup — the snapshot can't know it yet, but the guarantee must still hold).
+/// Everything else — any channel or group the `channels` allow-list never named — is dropped:
+/// Socket Mode is a workspace-wide firehose, and the allow-list governs live delivery exactly
+/// as it governs fetching. With `dms` off, only subscribed conversations pass at all.
+fn live_event_admitted(
+    conv: &str,
+    subscribed: bool,
+    all_kind: Option<ConvKind>,
+    dms: bool,
+) -> bool {
+    if subscribed {
+        return true;
+    }
+    if !dms {
+        return false;
+    }
+    match all_kind {
+        Some(ConvKind::Im | ConvKind::Mpim) => true,
+        Some(ConvKind::Channel | ConvKind::Group) => false,
+        None => conv.starts_with('D'),
+    }
+}
+
+/// The look-back horizon as a synthetic Slack `ts` (`<secs>.000000`, same shape trick as
+/// [`updated_ms_to_ts`] — `oldest` only needs a chronological cutoff, not a real message
+/// identity), or `None` when `lookback_days` is `0` (unlimited). This is the *depth* companion
+/// to the request budget's *rate* cap: without it, a watermark from a weeks-long gap sends
+/// every fetch paginating toward history the retention prune would mostly discard — wasted
+/// requests that matter double when the Slack app's rate-limit pool is shared with other
+/// consumers (limits are per app + workspace, not per pane).
+fn lookback_cutoff_ts(now_epoch_secs: u64, lookback_days: u64) -> Option<String> {
+    (lookback_days > 0).then(|| {
+        let cutoff = now_epoch_secs.saturating_sub(lookback_days.saturating_mul(86_400));
+        format!("{cutoff}.000000")
+    })
+}
+
+/// The `oldest` an incremental history fetch should send: the newer of the conversation's
+/// newest-seen watermark and the look-back cutoff ([`lookback_cutoff_ts`]) — the watermark
+/// already bounds a short gap tighter than the horizon does, while a long-gap (or first-ever)
+/// fetch is bounded by the horizon instead of reaching arbitrarily far back.
+fn clamp_oldest(watermark: Option<String>, cutoff: Option<String>) -> Option<String> {
+    match (watermark, cutoff) {
+        (Some(w), Some(c)) => Some(if ts_cmp(&w, &c) == std::cmp::Ordering::Less { c } else { w }),
+        (w, c) => w.or(c),
+    }
+}
+
+/// Whether `ts` is at or inside the look-back horizon (`None` cutoff = unlimited, everything
+/// qualifies). Inclusive at the boundary, matching `clamp_oldest`'s "newer of" rule.
+fn within_lookback(ts: &str, cutoff: Option<&str>) -> bool {
+    cutoff.is_none_or(|c| ts_cmp(ts, c) != std::cmp::Ordering::Less)
 }
 
 /// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
@@ -2050,7 +2197,12 @@ enum BackfillOutcome {
 /// retries the same conversation exactly once via `backfill_retry_decision`. Any error other
 /// than the initial `RateLimited` keeps the unchanged contract: a misconfigured channel fails
 /// `build` loud, naming it.
-fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutcome {
+fn backfill_one(
+    app: &mut App,
+    rest: &Rest,
+    conv: &Conversation,
+    cutoff: Option<&str>,
+) -> BackfillOutcome {
     match crate::rest::history(rest, &conv.id, 50, None) {
         Err(RestError::RateLimited(secs)) => {
             std::thread::sleep(Duration::from_secs(capped_sleep_secs(secs)));
@@ -2058,7 +2210,9 @@ fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutc
             match backfill_retry_decision(&conv.name, retry) {
                 BackfillRetry::Continue(msgs) => {
                     for msg in msgs {
-                        app.upsert_new(msg);
+                        if within_lookback(&msg.ts, cutoff) {
+                            app.upsert_new(msg);
+                        }
                     }
                     BackfillOutcome::Ok
                 }
@@ -2069,7 +2223,7 @@ fn backfill_one(app: &mut App, rest: &Rest, conv: &Conversation) -> BackfillOutc
                 BackfillRetry::HardFail(msg) => BackfillOutcome::Fail(msg),
             }
         }
-        other => match apply_backfill(app, &conv.name, other) {
+        other => match apply_backfill(app, &conv.name, other, cutoff) {
             Ok(()) => BackfillOutcome::Ok,
             Err(msg) => BackfillOutcome::Fail(msg),
         },
@@ -2114,10 +2268,11 @@ fn resolve_im_names(
 mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
-        RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, capped_sleep_secs,
-        catchup_after_reconnect, cooldown_active, dm_scan_due, expand_status, format_ts, key_for,
-        marker_count, next_batch, pick_changed_dm, poll_error_status, resolve_im_names,
-        resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
+        RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, budget_exhausted,
+        capped_sleep_secs, catchup_after_reconnect, clamp_oldest, cooldown_active, dm_scan_due,
+        expand_status, format_ts, key_for, live_event_admitted, lookback_cutoff_ts, marker_count,
+        next_batch, pick_changed_dm, poll_error_status, resolve_im_names, resume_cursor,
+        thread_slot_count, track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -2181,6 +2336,11 @@ mod tests {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            dms: true,
+            // Unlimited by default in fixtures: `empty` exists for network-free tests, whose
+            // fixture timestamps are tiny epoch-era values a real 7-day horizon (computed from
+            // the actual clock) would silently exclude.
+            lookback_days: 0,
             conv_msg_counts: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
@@ -2810,6 +2970,145 @@ mod tests {
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
     }
 
+    // ---- live-event admission: the `channels` allow-list must govern live socket delivery,
+    // not only fetching. Socket Mode delivers events for every conversation the token can see,
+    // so without this gate a 600-person workspace's every joined channel leaks into the Feed
+    // regardless of config. DMs/MPIMs keep their documented always-arrive guarantee (gated on
+    // `dms`), including out-of-cap and never-seen `D`-prefixed conversations. ----------------
+
+    #[test]
+    fn live_event_admitted_subscribed_always_passes() {
+        assert!(live_event_admitted("C1", true, None, true));
+        assert!(live_event_admitted("C1", true, None, false));
+    }
+
+    #[test]
+    fn live_event_admitted_drops_an_unconfigured_channel() {
+        assert!(!live_event_admitted("C9", false, Some(ConvKind::Channel), true));
+        assert!(!live_event_admitted("G9", false, Some(ConvKind::Group), true));
+    }
+
+    #[test]
+    fn live_event_admitted_passes_an_out_of_cap_dm_when_dms_are_on() {
+        assert!(live_event_admitted("D9", false, Some(ConvKind::Im), true));
+        assert!(live_event_admitted("G8", false, Some(ConvKind::Mpim), true));
+    }
+
+    #[test]
+    fn live_event_admitted_drops_dms_when_dms_are_off() {
+        assert!(!live_event_admitted("D9", false, Some(ConvKind::Im), false));
+        assert!(!live_event_admitted("D9", false, None, false));
+    }
+
+    #[test]
+    fn live_event_admitted_unknown_conversation_passes_only_with_a_dm_id_prefix() {
+        // Not in the conversation-list snapshot at all (e.g. a DM opened after startup):
+        // Slack DM ids start with `D`, so that prefix keeps the arrival guarantee; an unknown
+        // `C`/`G` id is a channel the config never named, dropped like any other.
+        assert!(live_event_admitted("D0NEW", false, None, true));
+        assert!(!live_event_admitted("C0NEW", false, None, true));
+    }
+
+    #[test]
+    fn a_live_message_on_an_unconfigured_channel_never_reaches_the_feed() {
+        let mut app = empty_app();
+        app.all_conversations.push(conv("C9", "random-firmwide", ConvKind::Channel));
+        app.apply(SocketEvent::Message(msg("C9", "1.0", None, "U1", "firehose noise")));
+        assert!(app.feed_rows().is_empty());
+        // An edit for the same unconfigured conversation must not sneak it in either
+        // (`upsert_edit` inserts fresh when the original was never stored).
+        app.apply(SocketEvent::Changed(Message {
+            edited: true,
+            ..msg("C9", "1.0", None, "U1", "edited noise")
+        }));
+        assert!(app.feed_rows().is_empty());
+    }
+
+    #[test]
+    fn a_live_message_on_an_out_of_cap_dm_still_reaches_the_feed() {
+        let mut app = empty_app();
+        app.all_conversations.push(conv("D9", "U77", ConvKind::Im));
+        app.apply(SocketEvent::Message(msg("D9", "1.0", None, "U77", "dm arrives")));
+        app.touch();
+        assert_eq!(app.feed_rows().len(), 1);
+    }
+
+    #[test]
+    fn a_live_dm_message_is_dropped_when_dms_are_disabled() {
+        let mut app = empty_app();
+        app.dms = false;
+        app.all_conversations.push(conv("D9", "U77", ConvKind::Im));
+        app.apply(SocketEvent::Message(msg("D9", "1.0", None, "U77", "suppressed dm")));
+        assert!(app.feed_rows().is_empty());
+    }
+
+    // ---- look-back horizon (`lookback_days`): bounds how deep any history fetch reaches, the
+    // *depth* companion to the request budget's *rate* cap — a watermark from a two-week gap
+    // must not send pagination chasing history the retention prune would mostly discard,
+    // especially on a Slack app whose rate-limit pool is shared with other consumers. --------
+
+    #[test]
+    fn lookback_cutoff_ts_is_none_when_unlimited() {
+        assert_eq!(lookback_cutoff_ts(1_752_300_000, 0), None);
+    }
+
+    #[test]
+    fn lookback_cutoff_ts_subtracts_whole_days_as_a_synthetic_ts() {
+        // 7 days = 604_800 seconds; 1_752_300_000 - 604_800 = 1_751_695_200.
+        assert_eq!(lookback_cutoff_ts(1_752_300_000, 7), Some("1751695200.000000".to_string()));
+    }
+
+    #[test]
+    fn lookback_cutoff_ts_saturates_rather_than_underflowing() {
+        assert_eq!(lookback_cutoff_ts(100, 7), Some("0.000000".to_string()));
+    }
+
+    #[test]
+    fn clamp_oldest_takes_the_newer_of_watermark_and_cutoff() {
+        let clamp = |w: Option<&str>, c: Option<&str>| {
+            clamp_oldest(w.map(str::to_string), c.map(str::to_string))
+        };
+        // Watermark newer than cutoff: the watermark already bounds the fetch tighter.
+        assert_eq!(clamp(Some("100.000001"), Some("50.000000")), Some("100.000001".to_string()));
+        // Watermark older than cutoff (a long gap): the horizon wins.
+        assert_eq!(clamp(Some("100.000001"), Some("200.000000")), Some("200.000000".to_string()));
+        // No watermark yet (first fetch): the horizon alone bounds it.
+        assert_eq!(clamp(None, Some("200.000000")), Some("200.000000".to_string()));
+        // Unlimited look-back: watermark behavior unchanged.
+        assert_eq!(clamp(Some("100.000001"), None), Some("100.000001".to_string()));
+        assert_eq!(clamp(None, None), None);
+    }
+
+    #[test]
+    fn apply_backfill_drops_messages_older_than_the_lookback_cutoff() {
+        let mut app = empty_app();
+        let msgs = vec![
+            msg("C1", "50.000000", None, "U1", "beyond the horizon"),
+            msg("C1", "100.000000", None, "U1", "exactly at the horizon"),
+            msg("C1", "150.000000", None, "U1", "inside the horizon"),
+        ];
+        apply_backfill(&mut app, "eng", Ok(msgs), Some("100.000000")).unwrap();
+        assert!(!app.messages.contains_key(&key_for("C1", "50.000000")));
+        assert!(
+            app.messages.contains_key(&key_for("C1", "100.000000")),
+            "the horizon is inclusive"
+        );
+        assert!(app.messages.contains_key(&key_for("C1", "150.000000")));
+    }
+
+    // ---- request-budget batching: POLL_BATCH meters what Slack meters — requests, not
+    // conversations. A paginated catch-up fetch can cost up to HISTORY_PAGE_CAP requests for
+    // one conversation, so a conversation-counted batch could issue ~10× its intended request
+    // volume right after a long gap — the exact moment Slack is most likely to 429. ----------
+
+    #[test]
+    fn budget_exhausted_only_once_spent_reaches_the_budget() {
+        assert!(!budget_exhausted(0, 8));
+        assert!(!budget_exhausted(7, 8));
+        assert!(budget_exhausted(8, 8));
+        assert!(budget_exhausted(9, 8));
+    }
+
     // ---- resume_cursor: a mid-batch RateLimited must not advance the round-robin past the
     // conversations it never actually visited ------------------------------------------------
 
@@ -3095,9 +3394,13 @@ mod tests {
     #[test]
     fn a_backfill_history_error_fails_build_naming_the_channel() {
         let mut app = empty_app();
-        let error =
-            apply_backfill(&mut app, "eng", Err(RestError::SlackError("channel_not_found".into())))
-                .unwrap_err();
+        let error = apply_backfill(
+            &mut app,
+            "eng",
+            Err(RestError::SlackError("channel_not_found".into())),
+            None,
+        )
+        .unwrap_err();
         assert!(error.contains("eng"), "{error}");
         assert!(error.contains("channel_not_found"), "{error}");
     }
@@ -3105,7 +3408,8 @@ mod tests {
     #[test]
     fn a_successful_backfill_upserts_every_message() {
         let mut app = empty_app();
-        apply_backfill(&mut app, "eng", Ok(vec![msg("C1", "1.0", None, "U1", "hi")])).unwrap();
+        apply_backfill(&mut app, "eng", Ok(vec![msg("C1", "1.0", None, "U1", "hi")]), None)
+            .unwrap();
         app.touch();
         assert_eq!(app.feed_rows().len(), 1);
     }
@@ -3785,7 +4089,7 @@ mod tests {
             kind: ConvKind::Channel,
             updated: None,
         };
-        match super::backfill_one(&mut app, &rest, &conv) {
+        match super::backfill_one(&mut app, &rest, &conv, None) {
             BackfillOutcome::Fail(message) => assert!(message.contains("eng"), "{message}"),
             _ => panic!("expected Fail for a non-rate-limit history error"),
         }

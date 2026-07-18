@@ -130,6 +130,7 @@ poll_fallback_secs = 30                  # seconds between polls while the socke
 dm_limit = 20                            # cap on subscribed DMs/MPIMs when dms=true; 0..=200
 dm_allow = ["alice", "Bob Smith"]        # DM/MPIM names always subscribed, ignoring dm_limit (default none)
 focus_keywords = ["incident", "p1"]      # Focus-view triggers, distinct from `keywords` (default none)
+lookback_days = 7                        # how far back any history fetch reaches; 0..=365, 0 = unlimited
 ```
 
 `channels` is the only required key; every other key has a documented default. A missing config
@@ -145,19 +146,46 @@ A channel you can't read surfaces Slack's error verbatim in the status line.
 ### Rate limits
 
 herdr-slackr is deliberately conservative about how hard it hits Slack's Web API. The polling
-fallback (while the socket is down) fetches only 8 conversations per tick, round-robin across
-every subscribed conversation, and asks Slack only for messages newer than the last one already
-seen — a caught-up tick's response is typically empty rather than re-shipping the last 50 messages
-every time (and when a burst *is* larger than one page, the fetch follows Slack's cursor for up to
-10 pages so the middle of the burst isn't silently lost). If Slack answers with a real rate limit,
-the pane reads its actual `Retry-After` value and pauses all polling until that deadline passes,
-rather than guessing at a fixed backoff, and resumes the round-robin at the conversation the limit
-interrupted rather than skipping past it; a socket reconnect always clears a pending cooldown
-immediately, since a healthy socket means Slack has already accepted the connection. Because
-Socket Mode never redelivers events that fired while the connection was down, every reconnect also
-arms a one-time catch-up sweep: each subscribed conversation gets one watermarked history fetch,
-paced out in 8-conversation batches every 10 seconds — a conversation that missed nothing answers
-with an empty body, so a sweep after a brief blip is close to free. The workspace's `users.list`
+fallback (while the socket is down) spends at most an 8-*request* budget per tick, round-robin
+across every subscribed conversation, and asks Slack only for messages newer than the last one
+already seen — a caught-up tick's response is typically empty rather than re-shipping the last 50
+messages every time (and when a burst *is* larger than one page, the fetch follows Slack's cursor
+for up to 10 pages so the middle of the burst isn't silently lost). The budget meters requests
+rather than conversations because that's what Slack's rate limits meter: a caught-up conversation
+costs one request, but a paginated gap fetch can cost up to ten, so right after a long outage — a
+laptop asleep over lunch in a busy workspace — a batch automatically covers fewer conversations
+per tick instead of multiplying its request volume tenfold at the exact moment Slack is most
+likely to answer 429. If Slack answers with a real rate limit, the pane reads its actual
+`Retry-After` value and pauses all polling until that deadline passes, rather than guessing at a
+fixed backoff, and resumes the round-robin at the conversation it stopped at (whether the stop was
+the rate limit or the budget) rather than skipping past it; a socket reconnect always clears a
+pending cooldown immediately, since a healthy socket means Slack has already accepted the
+connection. Because Socket Mode never redelivers events that fired while the connection was down,
+every reconnect also arms a one-time catch-up sweep: each subscribed conversation gets one
+watermarked history fetch, paced out in 8-request batches every 15 seconds — a conversation that
+missed nothing answers with an empty body, so a sweep after a brief blip is close to free, while a
+sweep over real gaps spreads itself out under the same budget.
+
+`lookback_days` (default 7, valid `0..=365`, `0` = unlimited) is the *depth* companion to that
+request-budget *rate* cap: startup backfill drops messages older than the horizon, and every
+incremental fetch (polling, catch-up, the DM scan) clamps its "fetch since" bound to it. Without a
+horizon, a watermark left over from a two-week gap would send pagination chasing history the
+300-message retention cap would mostly discard anyway — pure request waste. With it, the deepest
+any conversation's catch-up can reach is bounded no matter how long the pane was away.
+
+**Shared app credentials.** Slack rate limits pool per app + workspace — not per pane, not per
+person. If the Slack app behind your tokens is shared (several teammates running herdr-slackr, or
+other tooling on the same bot), every consumer draws from the same budget. herdr-slackr's own
+worst sustained rate is deliberately kept well under half of Tier 3 (~8 requests/30s polling,
+~8/15s during a catch-up sweep, ≤2 per 5-minute DM scan) precisely so it behaves as a good tenant
+on a shared key. Every recurring cadence — socket reconnects, poll-fallback ticks, catch-up
+batches — carries ±25% jitter, because a Slack outage flips *every* pane on the key into polling
+mode at the same moment, and without jitter their request batches would then fire in lockstep
+against the shared pool indefinitely. Conversation listing always excludes archived channels,
+which in an older workspace can otherwise double the page count of the startup list call for rows
+a live feed could never use. If you still see `slack rate limit` notices while the pane is
+idle-ish, the budget is being spent elsewhere on the same app, and raising `poll_fallback_secs`
+and/or lowering `lookback_days` are the two knobs that cut this pane's share further. The workspace's `users.list`
 directory (used for display names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so
 a pane restart or a CLI invocation doesn't refetch the whole member list every time. Startup
 backfill retries a rate-limited conversation exactly once (sleeping the real `Retry-After` first)
@@ -177,11 +205,19 @@ backfill couldn't.
 `0` means none are polled or backfilled by default. `dm_allow` (below) always-subscribes named DMs
 regardless of this cap, on top of whichever ones rank inside it.
 
-**`dm_limit` never blocks a new message from arriving in any DM, capped or not, in either delivery
-mode.** Over the live Socket Mode connection this is automatic: the socket subscribes to events for
-the whole workspace regardless of which conversations the pane chose to actively track, so a
+**Channels are strictly allow-list, in both delivery modes.** Only channels named in `channels`
+are backfilled, polled, *or shown live*: Socket Mode delivers events for every conversation the
+token can see — at a firm-sized workspace, that's every channel you've ever joined — and the pane
+drops live events for any channel the config didn't name, rather than letting the whole workspace
+firehose into the Feed. (Before this gate existed, an unconfigured channel's messages appeared
+with a raw `#C…` id label; if you relied on that, name the channel in `channels`.)
+
+**`dm_limit`, by contrast, never blocks a new message from arriving in any DM, capped or not, in
+either delivery mode.** Over the live Socket Mode connection this is automatic: DM/MPIM events
+pass the live gate regardless of subscription (including a DM first opened mid-session), so a
 message on an out-of-cap DM shows up in the Feed/Mentions tabs immediately, same as any subscribed
-one. In polling mode there is a dedicated detection path for it: every 5 minutes, a scan re-fetches
+one — unless `dms = false`, which suppresses live DM delivery the same way it suppresses DM
+subscription. In polling mode there is a dedicated detection path for it: every 5 minutes, a scan re-fetches
 the conversation list — DMs and MPIMs only, so the scan never pages through the workspace's public
 channels — and checks every out-of-cap DM/MPIM's Slack-reported activity stamp
 against what was last seen. If none moved, the scan costs nothing beyond that one list call. If one

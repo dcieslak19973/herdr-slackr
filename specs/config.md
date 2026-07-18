@@ -21,6 +21,7 @@ poll_fallback_secs = 45                  # default 30
 dm_limit = 15                            # default 20
 dm_allow = ["alice", "Bob Smith"]        # default []
 focus_keywords = ["incident", "p1"]      # default []
+lookback_days = 14                       # default 7
 ```
 
 | key                   | value                                                              |
@@ -33,6 +34,7 @@ focus_keywords = ["incident", "p1"]      # default []
 | `dm_limit`            | integer in `0..=200`; caps how many `Im`/`Mpim` conversations are subscribed when `dms = true`, ranked by most-recently-active (`conversations.list`'s `updated`); `0` subscribes none even when `dms = true` |
 | `dm_allow`            | array of non-empty strings (no other format restriction — free-form Slack display names, not `#`-prefixed); `Im`/`Mpim` counterpart names always subscribed regardless of `dm_limit`, matched exactly and case-insensitively against the conversation's resolved name; `dms = false` still suppresses them |
 | `focus_keywords`      | array of strings; Focus-view triggers (see `pane.md`), matched case-insensitively as a substring — the same rule `keywords` uses, but a distinct list kept deliberately separate from it |
+| `lookback_days`       | integer in `0..=365`; how far back any history fetch reaches — backfill drops messages older than the horizon, and every incremental fetch (polling, catch-up, DM scan) clamps its `oldest` to it; `0` means unlimited |
 
 Tokens live in a separate file, `tokens.toml` in the same directory, or the environment:
 
@@ -59,6 +61,7 @@ Tokens live in a separate file, `tokens.toml` in the same directory, or the envi
 | C12 | When the subscribed DM/MPIM set exceeds `dm_limit`, the cap keeps the most-recently-active ones (`updated` descending); if any candidate is missing `updated`, ranking falls back to Slack's own list order instead of guessing, logged once. `dm_limit = 0` excludes DMs entirely, independent of `dms`. A DM outside the cap is not backfilled or polled by the regular per-tick round-robin, but a message on it can still arrive live over the socket, and polling mode has its own out-of-cap activity scan (`slack-host.md` F12) — `dm_limit` bounds active-subscription *count*, never new-arrival *delivery*. |
 | C13 | A DM/MPIM whose resolved name exactly matches (case-insensitively, no substring matching) a `dm_allow` entry is always included in the subscribed set, never subject to the `dm_limit` cut — the cap applies only to the remaining non-allow-listed pool. `dms = false` suppresses allow-listed DMs too; an explicit "no DMs" wins over the allow-list. |
 | C14 | `focus_keywords` is validated and matched exactly like `keywords` (array of strings, case-insensitive substring), but is a wholly separate list consulted only by the Focus view (`pane.md`) — setting one never changes what the other matches. |
+| C15 | `lookback_days` bounds fetch *depth*, never live *delivery*: a socket event upserts regardless of age, and the horizon is applied at fetch boundaries only (backfill filters client-side; incremental paths clamp `oldest` server-side, inclusive at the boundary). `0` disables the horizon entirely, restoring watermark-only behavior. |
 
 An error names the config path and the read, syntax, key, or value failure, and states the expected form when a value is invalid.
 
