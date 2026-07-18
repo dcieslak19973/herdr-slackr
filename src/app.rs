@@ -207,12 +207,14 @@ pub struct App {
     /// page-move issued before the first draw (or in a headless test) still moves rather than
     /// no-oping on `0`.
     viewport_rows: usize,
-    /// The unfiltered `conversations.list` snapshot — every channel/group/DM/MPIM the workspace
-    /// has, not just the `dm_limit`-capped `conversations` this `App` actually subscribes to.
-    /// Set once at `build` (before `resolve_channels` narrows it) and refreshed by every
-    /// `maybe_scan_out_of_cap_dms` scan, so [`pick_changed_dm`] always has a "what did we see
-    /// last time" baseline for conversations this `App` otherwise never looks at again (spec
-    /// §1: "previous messages stay capped, new ones always arrive" in polling mode too).
+    /// The previous conversation-list snapshot [`pick_changed_dm`] baselines against — every
+    /// conversation the workspace has at `build` time (set before `resolve_channels` narrows
+    /// it), then refreshed by every `maybe_scan_out_of_cap_dms` scan with that scan's own
+    /// DM/MPIM-only fetch (`rest::list_dm_conversations`; the scan never selects any other
+    /// kind, so carrying channels here after `build` would be dead weight). This is what gives
+    /// the scan a "what did we see last time" baseline for conversations this `App` otherwise
+    /// never looks at again (spec §1: "previous messages stay capped, new ones always arrive"
+    /// in polling mode too).
     all_conversations: Vec<Conversation>,
     /// The newest `updated` (Slack's millisecond-epoch conversation-activity stamp) this `App`
     /// has actually issued a `history` call for, per out-of-cap DM/MPIM conversation id — the
@@ -247,6 +249,21 @@ pub struct App {
     /// substring via `entities::keyword_hit` — deliberately not reusing `keywords` (the Mentions
     /// trigger list); see `PluginConfig::focus_keywords`'s doc for why the two must stay distinct.
     focus_keywords: Vec<String>,
+    /// Per-conversation message counts, maintained incrementally by `upsert_new`/`upsert_edit`
+    /// (insert paths), `remove`, and `prune_conv` itself — so the "is this conversation over
+    /// its retention cap" check is O(1) per insert instead of a full store scan (`messages` is
+    /// one global `BTreeMap` with no per-conversation index, the same reason `newest_ts` is
+    /// maintained incrementally — see its doc).
+    conv_msg_counts: HashMap<String, usize>,
+    /// Conversations still to visit in the post-reconnect catch-up sweep: Slack Socket Mode
+    /// never replays events missed while the connection was down, so `apply`'s `Connected` arm
+    /// arms one full sweep (`catchup_after_reconnect`) over every subscribed conversation, each
+    /// fetched with its `newest_ts` watermark as `oldest` — cheap, since a conversation with no
+    /// missed messages answers with an empty body. Worked off in `POLL_BATCH`-sized batches by
+    /// `catchup_tick` (paced by the event loop), decremented by how many conversations each
+    /// batch actually visited (a mid-batch `RateLimited` stops the batch and leaves the
+    /// remainder armed — see `resume_cursor`). `0` means no sweep is pending.
+    catchup_remaining: usize,
     /// The subscribed conversation ids that are allow-listed DMs (`PluginConfig::dm_allow`),
     /// computed once at `build` time from the resolved `Conversation` list (case-insensitive
     /// exact match against each Im/Mpim's name, mirroring `resolve_channels`'s own `is_allowed`
@@ -266,6 +283,18 @@ const DM_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 /// Slack's rate limits meter, so a tick over every subscribed conversation every time is what
 /// triggers them in the first place (see `next_batch`).
 const POLL_BATCH: usize = 8;
+
+/// How many messages one conversation retains after a prune (`prune_conv`): enough scrollback
+/// that no realistic session ever notices the cap (backfill is 50), small enough that a pane
+/// left running for weeks in a busy workspace stays bounded in memory *and* in the per-frame
+/// row-projection work that iterates the whole store. Unread mentions are exempt — see
+/// `prune_conv`'s doc.
+const MAX_PER_CONV: usize = 300;
+
+/// Prune hysteresis: a conversation is only pruned once it exceeds `MAX_PER_CONV` by this many
+/// messages, so the prune's oldest-first sweep runs once per `PRUNE_SLACK` inserts (amortized)
+/// rather than on every single arrival at the cap boundary.
+const PRUNE_SLACK: usize = 50;
 
 impl App {
     /// Build the initial state: resolve configured channel names to ids (erroring on an
@@ -352,6 +381,8 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: config.focus_keywords().to_vec(),
+            conv_msg_counts: HashMap::new(),
+            catchup_remaining: 0,
             dm_allow_convs,
         };
 
@@ -412,6 +443,8 @@ impl App {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            conv_msg_counts: HashMap::new(),
+            catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
         }
     }
@@ -457,6 +490,12 @@ impl App {
         let arrival_before = self.arrival_seq;
         match ev {
             SocketEvent::Connected => {
+                // A reconnect after a down streak (not the startup hello) arms a catch-up
+                // sweep: events that fired while the socket was down are never redelivered,
+                // so every subscribed conversation gets one watermarked history fetch (see
+                // `catchup_remaining`'s field doc).
+                self.catchup_remaining =
+                    catchup_after_reconnect(self.polling, self.conversations.len());
                 self.polling = false;
                 self.status.clear();
                 // A cooldown set from a `RateLimited` hit before this reconnect must not
@@ -635,9 +674,47 @@ impl App {
         let conv_slots = POLL_BATCH - thread_slots;
 
         let rate_limited = self.poll_active_threads(rest, &active, thread_slots, now);
-        let rate_limited =
-            if rate_limited { true } else { self.poll_conversations(rest, conv_slots, now) };
+        let rate_limited = if rate_limited {
+            true
+        } else {
+            self.poll_conversations(rest, conv_slots, now).rate_limited
+        };
         self.run_or_skip_dm_scan(rest, now, rate_limited);
+        self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
+    }
+
+    /// Whether a post-reconnect catch-up sweep still has conversations to visit (see
+    /// `catchup_remaining`'s field doc). The event loop polls this each tick and paces
+    /// `catchup_tick` calls while it holds.
+    pub fn catchup_due(&self) -> bool {
+        self.catchup_remaining > 0
+    }
+
+    /// Work off one `POLL_BATCH`-sized batch of the post-reconnect catch-up sweep (see
+    /// `catchup_remaining`'s field doc): the same watermarked, continue-past-errors
+    /// conversation fetch `poll_tick` uses, sharing `poll_cursor`'s round-robin so the sweep
+    /// and any later polling never double-visit. Gated by the rate-limit cooldown exactly like
+    /// `poll_tick` — a sweep batch that hits `RateLimited` sets the cooldown, leaves its
+    /// unvisited remainder armed, and resumes once the cooldown lapses.
+    pub fn catchup_tick(&mut self, rest: &Rest) {
+        self.catchup_tick_at(rest, Instant::now());
+    }
+
+    /// `catchup_tick`'s real logic, taking `now` as a parameter for the same testability
+    /// reason as `poll_tick_at` (see its doc).
+    fn catchup_tick_at(&mut self, rest: &Rest, now: Instant) {
+        if self.catchup_remaining == 0 || cooldown_active(now, self.cooldown_until) {
+            return;
+        }
+        self.cooldown_until = None;
+
+        let follow_bottom = self.is_cursor_at_last_row();
+        let had_rows_before = !self.current_ids().is_empty();
+        let arrival_before = self.arrival_seq;
+
+        let slots = POLL_BATCH.min(self.catchup_remaining);
+        let outcome = self.poll_conversations(rest, slots, now);
+        self.catchup_remaining = self.catchup_remaining.saturating_sub(outcome.completed);
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
     }
 
@@ -678,7 +755,10 @@ impl App {
         }
         self.next_dm_scan = Some(now + DM_SCAN_INTERVAL);
 
-        let new_all = match crate::rest::list_conversations(rest) {
+        // DM/MPIM types only: this scan never selects anything else, and the full-types list
+        // pages through every public channel in the workspace each interval — see
+        // `rest::list_dm_conversations`'s doc.
+        let new_all = match crate::rest::list_dm_conversations(rest) {
             Ok(v) => v,
             Err(err @ RestError::RateLimited(secs)) => {
                 self.status = poll_error_status("dm scan", &err);
@@ -734,11 +814,11 @@ impl App {
         thread_slots: usize,
         now: Instant,
     ) -> bool {
-        let (indices, next_cursor) =
+        let (indices, planned_next) =
             next_batch(self.poll_thread_cursor, active.len(), thread_slots);
-        self.poll_thread_cursor = next_cursor;
 
-        for i in indices {
+        let mut failed_at = None;
+        for (j, &i) in indices.iter().enumerate() {
             let (conv_id, root_ts) = active[i].clone();
             let oldest = self.newest_reply_ts(&conv_id, &root_ts);
             let label = format!("{conv_id} thread {root_ts}");
@@ -747,27 +827,32 @@ impl App {
                 Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&label, &err);
                     self.cooldown_until = Some(now + Duration::from_secs(secs));
-                    return true;
+                    failed_at = Some(j);
+                    break;
                 }
                 Err(err) => {
                     self.status = poll_error_status(&label, &err);
                 }
             }
         }
-        false
+        self.poll_thread_cursor = resume_cursor(&indices, planned_next, failed_at);
+        failed_at.is_some()
     }
 
-    /// The conversation half of `poll_tick_at`'s split budget: unchanged from before the split
-    /// except that its slot count is now `conv_slots` (`POLL_BATCH` minus whatever the thread
-    /// round-robin took) rather than the full `POLL_BATCH`. Returns whether a `RateLimited` hit
-    /// occurred, mirroring `poll_active_threads`'s own return — `poll_tick_at` combines both to
-    /// decide whether anything after this budget (the DM scan) still runs this tick.
-    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) -> bool {
+    /// The conversation half of `poll_tick_at`'s split budget (its slot count is `conv_slots`,
+    /// `POLL_BATCH` minus whatever the thread round-robin took), shared with `catchup_tick_at`'s
+    /// post-reconnect sweep. Returns a [`BatchOutcome`]: whether a `RateLimited` hit occurred
+    /// (`poll_tick_at` uses it to decide whether the DM scan still runs this tick) and how many
+    /// conversations were actually visited (`catchup_tick_at` uses it to retire sweep slots).
+    /// A mid-batch `RateLimited` stops the batch and rewinds `poll_cursor` to the conversation
+    /// it hit (`resume_cursor`), so the unvisited remainder is retried next tick rather than
+    /// silently skipped until the round-robin wraps.
+    fn poll_conversations(&mut self, rest: &Rest, conv_slots: usize, now: Instant) -> BatchOutcome {
         let n = self.conversations.len();
-        let (indices, next_cursor) = next_batch(self.poll_cursor, n, conv_slots);
-        self.poll_cursor = next_cursor;
+        let (indices, planned_next) = next_batch(self.poll_cursor, n, conv_slots);
 
-        for i in indices {
+        let mut failed_at = None;
+        for (j, &i) in indices.iter().enumerate() {
             let conv_id = self.conversations[i].id.clone();
             let conv_name = self.conversations[i].name.clone();
             let oldest = self.newest_ts.get(&conv_id).cloned();
@@ -780,14 +865,19 @@ impl App {
                 Err(err @ RestError::RateLimited(secs)) => {
                     self.status = poll_error_status(&conv_name, &err);
                     self.cooldown_until = Some(now + Duration::from_secs(secs));
-                    return true;
+                    failed_at = Some(j);
+                    break;
                 }
                 Err(err) => {
                     self.status = poll_error_status(&conv_name, &err);
                 }
             }
         }
-        false
+        self.poll_cursor = resume_cursor(&indices, planned_next, failed_at);
+        BatchOutcome {
+            completed: failed_at.unwrap_or(indices.len()),
+            rate_limited: failed_at.is_some(),
+        }
     }
 
     /// Every reply-worthy "active thread" `poll_tick_at`'s second round-robin should keep fresh:
@@ -799,21 +889,43 @@ impl App {
     /// `poll_thread_cursor`'s round-robin, which only needs a consistent order across ticks, not
     /// any particular one.
     fn active_threads(&self) -> Vec<(String, String)> {
+        let replies_index = self.replies_by_root();
         let mut ids: Vec<(String, String)> = self.expanded.iter().cloned().collect();
+        let mut seen: HashSet<(String, String)> = ids.iter().cloned().collect();
         for stored in self.messages.values() {
             if stored.msg.thread_ts.is_some() {
                 continue; // only roots are candidates
             }
             let id = (stored.msg.conv.clone(), stored.msg.ts.clone());
-            if ids.contains(&id) {
+            if seen.contains(&id) {
                 continue;
             }
-            let local = self.local_reply_count(&stored.msg.conv, &stored.msg.ts);
+            let local = replies_index
+                .get(&(stored.msg.conv.as_str(), stored.msg.ts.as_str()))
+                .map_or(0, Vec::len);
             if stored.msg.reply_count.unwrap_or(0) as usize > local {
+                seen.insert(id.clone());
                 ids.push(id);
             }
         }
         ids
+    }
+
+    /// One pass over the store grouping every reply by its `(conv, root_ts)` thread id — the
+    /// shared lookup `feed_rows_with_ids`/`thread_rows_with_ids`/`active_threads` resolve a
+    /// root's replies through, instead of each re-scanning the whole store once *per root*
+    /// (O(roots × messages) per call — quadratic in the store, which made every frame and every
+    /// poll tick more expensive as a long session accumulated history). Values keep the
+    /// `BTreeMap`'s chronological iteration order; callers that need strict `ts_cmp` order
+    /// still sort, exactly as they did over the scan results before.
+    fn replies_by_root(&self) -> HashMap<(&str, &str), Vec<&Stored>> {
+        let mut index: HashMap<(&str, &str), Vec<&Stored>> = HashMap::new();
+        for stored in self.messages.values() {
+            if let Some(root_ts) = stored.msg.thread_ts.as_deref() {
+                index.entry((stored.msg.conv.as_str(), root_ts)).or_default().push(stored);
+            }
+        }
+        index
     }
 
     /// How many replies to `root_ts` in `conv` are already stored locally.
@@ -959,6 +1071,7 @@ impl App {
     /// As `feed_rows`, but each row is paired with the `(conv, ts)` a Feed-tab action (expand,
     /// permalink) should act on — `None` for the synthetic `Divider` row.
     fn feed_rows_with_ids(&self) -> Vec<IdRow> {
+        let replies_index = self.replies_by_root();
         let mut rows: Vec<ArrivalRow> = Vec::new();
         for stored in self.messages.values() {
             if let Some(root_ts) = stored.msg.thread_ts.clone() {
@@ -995,13 +1108,8 @@ impl App {
                 self.message_row(&stored.msg),
             ));
 
-            let mut replies: Vec<&Stored> = self
-                .messages
-                .values()
-                .filter(|s| {
-                    s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts.as_str())
-                })
-                .collect();
+            let mut replies: Vec<&Stored> =
+                replies_index.get(&(conv.as_str(), root_ts.as_str())).cloned().unwrap_or_default();
             let count = marker_count(stored.msg.reply_count, replies.len());
             if count == 0 {
                 continue;
@@ -1102,6 +1210,7 @@ impl App {
             replies: Vec<&'a Stored>,
         }
 
+        let replies_index = self.replies_by_root();
         let mut threads: Vec<Thread<'_>> = Vec::new();
         // Every reply attached to a root this loop already knows about (whether or not that root
         // clears `marker_count`) — used below to find orphaned replies, i.e. those whose
@@ -1114,13 +1223,8 @@ impl App {
             seen_roots.insert((stored.msg.conv.as_str(), stored.msg.ts.as_str()));
             let conv = stored.msg.conv.clone();
             let root_ts = stored.msg.ts.clone();
-            let mut replies: Vec<&Stored> = self
-                .messages
-                .values()
-                .filter(|s| {
-                    s.msg.conv == conv && s.msg.thread_ts.as_deref() == Some(root_ts.as_str())
-                })
-                .collect();
+            let mut replies: Vec<&Stored> =
+                replies_index.get(&(conv.as_str(), root_ts.as_str())).cloned().unwrap_or_default();
             let count = marker_count(stored.msg.reply_count, replies.len());
             if count == 0 {
                 continue; // not a thread — excluded from this view entirely.
@@ -1520,7 +1624,10 @@ impl App {
         track_newest(&mut self.newest_ts, &msg.conv, &msg.ts);
         self.arrival_seq += 1;
         let arrival = self.arrival_seq;
+        let conv = msg.conv.clone();
+        *self.conv_msg_counts.entry(conv.clone()).or_insert(0) += 1;
         self.messages.insert(key, Stored { msg, arrival });
+        self.prune_conv(&conv);
     }
 
     /// Replace an edited message's fields in place; if it was never seen before (e.g. its
@@ -1538,15 +1645,69 @@ impl App {
         } else {
             self.arrival_seq += 1;
             let arrival = self.arrival_seq;
+            let conv = msg.conv.clone();
+            *self.conv_msg_counts.entry(conv.clone()).or_insert(0) += 1;
             self.messages.insert(key, Stored { msg, arrival });
+            self.prune_conv(&conv);
         }
     }
 
     fn remove(&mut self, conv: &str, ts: &str) {
-        self.messages.remove(&key_for(conv, ts));
+        if self.messages.remove(&key_for(conv, ts)).is_some()
+            && let Some(count) = self.conv_msg_counts.get_mut(conv)
+        {
+            *count = count.saturating_sub(1);
+        }
         let id = (conv.to_string(), ts.to_string());
         self.read_mentions.remove(&id);
         self.expanded.remove(&id);
+    }
+
+    /// Housekeeping for a long-running pane: once `conv` holds more than `MAX_PER_CONV +
+    /// PRUNE_SLACK` messages, drop its oldest down to `MAX_PER_CONV` (the `BTreeMap`'s key
+    /// order *is* chronological order, so "oldest first" is just iteration order), along with
+    /// each pruned id's `read_mentions`/`expanded` bookkeeping so those sets can't leak either.
+    ///
+    /// Unread mentions are exempt: an old mention the user hasn't acknowledged is the one thing
+    /// this pane exists to not lose, so it outlives ordinary history until read (after which it
+    /// prunes like anything else). A currently-expanded thread's root and replies are exempt
+    /// too: expanding an old thread fetches its replies into the store, and in an at-cap
+    /// conversation the oldest-first sweep would otherwise remove exactly what the user just
+    /// opened, visibly collapsing it out from under them (the exemption ends when the thread is
+    /// collapsed — `expanded` is consulted live on each prune). Either exemption can leave the
+    /// conversation somewhat above the cap; the overhang is bounded by the unread-mention count
+    /// (which the tab badge is actively nagging about) plus the handful of open threads.
+    fn prune_conv(&mut self, conv: &str) {
+        let count = self.conv_msg_counts.get(conv).copied().unwrap_or(0);
+        if count <= MAX_PER_CONV + PRUNE_SLACK {
+            return;
+        }
+        let excess = count - MAX_PER_CONV;
+        let victims: Vec<Key> = self
+            .messages
+            .iter()
+            .filter(|(_, s)| s.msg.conv == conv)
+            .filter(|(_, s)| {
+                let unread_mention = self.is_mention_stored(s)
+                    && !self.read_mentions.contains(&(s.msg.conv.clone(), s.msg.ts.clone()));
+                let in_expanded_thread = match s.msg.thread_ts.as_ref() {
+                    Some(root) => self.expanded.contains(&(s.msg.conv.clone(), root.clone())),
+                    None => self.expanded.contains(&(s.msg.conv.clone(), s.msg.ts.clone())),
+                };
+                !unread_mention && !in_expanded_thread
+            })
+            .map(|(k, _)| k.clone())
+            .take(excess)
+            .collect();
+        for key in victims {
+            let id = (key.2.clone(), key.3.clone());
+            self.messages.remove(&key);
+            self.read_mentions.remove(&id);
+            self.expanded.remove(&id);
+            if let Some(count) = self.conv_msg_counts.get_mut(conv) {
+                *count = count.saturating_sub(1);
+            }
+        }
     }
 
     // ---- Row/label rendering helpers ------------------------------------------------------
@@ -1696,6 +1857,31 @@ fn expand_status(now_expanded: bool, reply_count: usize) -> String {
     } else {
         "thread collapsed".to_string()
     }
+}
+
+/// One conversation batch's outcome (`poll_conversations`): how many of the batch's planned
+/// slots were actually visited — success or continue-past non-rate-limit error both count;
+/// the conversation a `RateLimited` stop hit, and everything after it, does not — and whether
+/// such a stop occurred.
+struct BatchOutcome {
+    completed: usize,
+    rate_limited: bool,
+}
+
+/// How many catch-up sweep slots a `Connected` event arms: one per subscribed conversation
+/// when the socket was down before this event (`was_polling` — `apply` flips `polling` on
+/// every `Down`, so it is exactly "a down streak preceded this hello"), and none for the
+/// startup hello (no gap to recover; a sweep would just repeat `build`'s backfill burst).
+fn catchup_after_reconnect(was_polling: bool, n_conversations: usize) -> usize {
+    if was_polling { n_conversations } else { 0 }
+}
+
+/// The round-robin cursor to store after a batch over `indices` (planned by `next_batch`,
+/// which proposed `planned_next`): the index the `RateLimited` stop hit when there was one
+/// (`failed_at` is its *batch position*, so the failed conversation and everything after it
+/// are retried next tick), else the planned advance.
+fn resume_cursor(indices: &[usize], planned_next: usize, failed_at: Option<usize>) -> usize {
+    failed_at.and_then(|j| indices.get(j).copied()).unwrap_or(planned_next)
 }
 
 /// Up to how many of `poll_tick_at`'s `POLL_BATCH`-sized budget go to the active-thread
@@ -1927,10 +2113,11 @@ fn resolve_im_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, RowKind, SelKind, Tab,
-        apply_backfill, backfill_retry_decision, capped_sleep_secs, cooldown_active, dm_scan_due,
-        expand_status, format_ts, marker_count, next_batch, pick_changed_dm, poll_error_status,
-        resolve_im_names, thread_slot_count, track_newest, updated_ms_to_ts,
+        App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
+        RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, capped_sleep_secs,
+        catchup_after_reconnect, cooldown_active, dm_scan_due, expand_status, format_ts, key_for,
+        marker_count, next_batch, pick_changed_dm, poll_error_status, resolve_im_names,
+        resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -1994,6 +2181,8 @@ mod tests {
             next_dm_scan: None,
             session_watermark: 0,
             focus_keywords: Vec::new(),
+            conv_msg_counts: HashMap::new(),
+            catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
         }
     }
@@ -2482,6 +2671,158 @@ mod tests {
         // run both conversations (observable via the cursor wrapping back to 0), not skip.
         app.poll_tick_at(&rest, now);
         assert_eq!(app.poll_cursor, 0, "both conversations were visited and the cursor wrapped");
+    }
+
+    // ---- per-conversation prune: a long-running session must not grow the message store (and
+    // with it, every per-frame row-projection pass) without bound ------------------------------
+
+    #[test]
+    fn a_conversation_over_the_cap_prunes_back_down_keeping_the_newest_messages() {
+        let mut app = empty_app();
+        for i in 0..=(MAX_PER_CONV + PRUNE_SLACK) {
+            app.apply(SocketEvent::Message(msg("C1", &format!("{i}.000000"), None, "U1", "m")));
+        }
+        let stored = app.messages.values().filter(|s| s.msg.conv == "C1").count();
+        assert_eq!(stored, MAX_PER_CONV, "the store must prune back to the cap once exceeded");
+        assert!(
+            !app.messages.contains_key(&key_for("C1", "0.000000")),
+            "the oldest message is the first to go"
+        );
+        let newest = format!("{}.000000", MAX_PER_CONV + PRUNE_SLACK);
+        assert!(app.messages.contains_key(&key_for("C1", &newest)), "the newest always survives");
+    }
+
+    #[test]
+    fn pruning_one_conversation_leaves_other_conversations_untouched() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C2", "0.000001", None, "U1", "old, other conv")));
+        for i in 0..=(MAX_PER_CONV + PRUNE_SLACK) {
+            app.apply(SocketEvent::Message(msg("C1", &format!("{i}.000000"), None, "U1", "m")));
+        }
+        assert!(
+            app.messages.contains_key(&key_for("C2", "0.000001")),
+            "C2 is nowhere near its own cap — C1's prune must not touch it"
+        );
+    }
+
+    #[test]
+    fn an_unread_mention_survives_the_prune() {
+        let mut app = empty_app();
+        // Oldest message in the store, but an unread mention — the one thing a user must
+        // never lose to housekeeping.
+        app.apply(SocketEvent::Message(msg("C1", "0.000000", None, "U1", "<@SELF> ping")));
+        for i in 1..=(MAX_PER_CONV + PRUNE_SLACK + 1) {
+            app.apply(SocketEvent::Message(msg("C1", &format!("{i}.000000"), None, "U1", "m")));
+        }
+        assert!(app.messages.contains_key(&key_for("C1", "0.000000")));
+        assert_eq!(app.unread_mentions(), 1);
+    }
+
+    #[test]
+    fn an_expanded_threads_root_and_replies_survive_the_prune() {
+        // Expanding an old thread fetches its replies into the store; if the conversation is
+        // at cap, the prune's oldest-first sweep would otherwise remove exactly what the user
+        // just opened, visibly collapsing the thread out from under them.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "0.000000", None, "U1", "old root")));
+        app.apply(SocketEvent::Message(msg("C1", "0.000001", Some("0.000000"), "U1", "old reply")));
+        app.toggle_thread("C1", "0.000000", Vec::new()); // expanded inline
+        for i in 1..=(MAX_PER_CONV + PRUNE_SLACK + 1) {
+            app.apply(SocketEvent::Message(msg("C1", &format!("{i}.000000"), None, "U1", "m")));
+        }
+        assert!(app.messages.contains_key(&key_for("C1", "0.000000")));
+        assert!(app.messages.contains_key(&key_for("C1", "0.000001")));
+    }
+
+    #[test]
+    fn a_pruned_read_mentions_bookkeeping_goes_with_it() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "0.000000", None, "U1", "<@SELF> seen it")));
+        app.toggle_mention_read("C1", "0.000000");
+        for i in 1..=(MAX_PER_CONV + PRUNE_SLACK + 1) {
+            app.apply(SocketEvent::Message(msg("C1", &format!("{i}.000000"), None, "U1", "m")));
+        }
+        assert!(
+            !app.messages.contains_key(&key_for("C1", "0.000000")),
+            "a mention already read is ordinary history — it prunes like anything else"
+        );
+        assert!(
+            !app.read_mentions.contains(&("C1".to_string(), "0.000000".to_string())),
+            "the read-mark must not leak once its message is gone"
+        );
+    }
+
+    // ---- reconnect catch-up sweep (spec §Polling fallback): Socket Mode never replays events
+    // missed while the connection was down, so a reconnect must arm one full round-robin sweep
+    // over every subscribed conversation (each with its `oldest` watermark — cheap, mostly-empty
+    // responses) or those messages are silently lost forever. ---------------------------------
+
+    #[test]
+    fn catchup_after_reconnect_arms_only_when_the_socket_was_down() {
+        assert_eq!(catchup_after_reconnect(true, 5), 5);
+        assert_eq!(catchup_after_reconnect(false, 5), 0, "the startup hello is not a reconnect");
+        assert_eq!(catchup_after_reconnect(true, 0), 0);
+    }
+
+    #[test]
+    fn a_reconnect_after_a_down_streak_arms_a_full_catchup_sweep() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Down("x".to_string()));
+        app.apply(SocketEvent::Connected);
+        assert_eq!(app.catchup_remaining, 2, "one sweep slot per subscribed conversation");
+        assert!(app.catchup_due());
+    }
+
+    #[test]
+    fn the_startup_connected_event_arms_no_catchup() {
+        // The very first `hello` lands right after `build`'s backfill — there is no gap to
+        // recover, and a sweep here would just repeat the backfill burst.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Connected);
+        assert_eq!(app.catchup_remaining, 0);
+        assert!(!app.catchup_due());
+    }
+
+    #[test]
+    fn catchup_tick_visits_a_batch_and_retires_the_swept_conversations() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Down("x".to_string()));
+        app.apply(SocketEvent::Connected);
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // precancelled_rest fails every call with a non-rate-limit error; a failed conversation
+        // still counts as visited (the same continue-past-errors rule poll_tick applies).
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.catchup_remaining, 0);
+        assert!(!app.catchup_due());
+    }
+
+    #[test]
+    fn catchup_tick_spends_no_budget_during_an_active_cooldown() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Down("x".to_string()));
+        app.apply(SocketEvent::Connected);
+        let now = Instant::now();
+        app.cooldown_until = Some(now + Duration::from_secs(30));
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.catchup_tick_at(&rest, now);
+        assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- resume_cursor: a mid-batch RateLimited must not advance the round-robin past the
+    // conversations it never actually visited ------------------------------------------------
+
+    #[test]
+    fn resume_cursor_resumes_at_the_rate_limited_index() {
+        // Planned batch indices [4, 5, 6]; the fetch at batch position 1 (index 5) hit the
+        // rate limit, so the next tick must start over at 5, not at the planned 7.
+        assert_eq!(resume_cursor(&[4, 5, 6], 7, Some(1)), 5);
+    }
+
+    #[test]
+    fn resume_cursor_advances_to_the_planned_next_when_nothing_rate_limited() {
+        assert_eq!(resume_cursor(&[4, 5, 6], 7, None), 7);
     }
 
     // ---- toggle_expand_or_read / toggle_read dispatch by tab ---------------------------------

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -41,6 +41,12 @@ use crate::ui::PaneState;
 /// The event loop's tick: how often crossterm's input poll wakes up to drain the socket
 /// channel and re-check the polling-fallback clock even with no keypress pending.
 const TICK: Duration = Duration::from_millis(250);
+
+/// Pacing between post-reconnect catch-up batches (`App::catchup_tick`, `POLL_BATCH`
+/// conversations each): fast enough that a typical subscription list is swept within a
+/// minute of reconnecting, slow enough that a large one (whose sweep is one `history` call
+/// per conversation) stays comfortably under Slack's per-minute request budget.
+const CATCHUP_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Entry point: resolve config/tokens, build the pane, run the loop, restore the terminal.
 /// A config or token failure (or `App::build`'s own REST failure) never crashes — it renders
@@ -62,26 +68,43 @@ pub fn run() -> Result<()> {
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let rest = Rest { user_token: &tokens.user, cancelled: &cancelled };
-    let mut app = match App::build(config, &tokens, &rest) {
-        Ok(app) => app,
-        Err(error) => return run_blocked(&error),
-    };
 
-    let (tx, rx) = mpsc::channel::<SocketEvent>();
-    let worker_cancelled = cancelled.clone();
-    let app_token = tokens.app.clone();
-    let worker = thread::spawn(move || socket::run(app_token, tx, worker_cancelled));
-
+    // The terminal comes up *before* `App::build`: the backfill it runs can legitimately block
+    // for a while (a rate-limited conversation sleeps up to 60s before its one retry — see
+    // `app::backfill_one`), and without a frame drawn first the pane sits blank that whole
+    // time, indistinguishable from a hang.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &rx, &rest, poll_fallback_secs, &theme_name);
-    ratatui::restore();
+    let palette = theme::resolve(Some(&theme_name));
+    let _ = terminal.draw(|f| {
+        ui::render(
+            f,
+            &palette,
+            &PaneState::Blocked(
+                "connecting to slack — backfilling recent history\n\
+                 (a rate-limited start can take up to a minute)",
+            ),
+        );
+    });
 
-    // Signal the worker and detach rather than join: `socket::run`'s read loop blocks on a
-    // 30s read timeout with no state here that needs flushing, so joining it would make `q`
-    // hang the terminal restore for up to 30s. The thread exits on its own once `cancelled`
-    // is observed; the process must return control instantly.
-    cancelled.store(true, Ordering::Release);
-    drop(worker);
+    let result = match App::build(config, &tokens, &rest) {
+        Ok(mut app) => {
+            let (tx, rx) = mpsc::channel::<SocketEvent>();
+            let worker_cancelled = cancelled.clone();
+            let app_token = tokens.app.clone();
+            let worker = thread::spawn(move || socket::run(app_token, tx, worker_cancelled));
+            let result =
+                event_loop(&mut terminal, &mut app, &rx, &rest, poll_fallback_secs, &theme_name);
+            // Signal the worker and detach rather than join: `socket::run`'s read loop blocks
+            // on a 30s read timeout with no state here that needs flushing, so joining it would
+            // make `q` hang the terminal restore for up to 30s. The thread exits on its own
+            // once `cancelled` is observed; the process must return control instantly.
+            cancelled.store(true, Ordering::Release);
+            drop(worker);
+            result
+        }
+        Err(error) => blocked_loop(&mut terminal, &error),
+    };
+    ratatui::restore();
     result
 }
 
@@ -93,21 +116,26 @@ fn plugin_dir() -> PathBuf {
 /// actionable message (reviewr's degraded-state pattern).
 fn run_blocked(msg: &str) -> Result<()> {
     let mut terminal = ratatui::init();
-    let palette = theme::resolve(None);
-    let result = (|| -> Result<()> {
-        loop {
-            terminal.draw(|f| ui::render(f, &palette, &PaneState::Blocked(msg)))?;
-            if event::poll(TICK)?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-                && k.code == KeyCode::Char('q')
-            {
-                return Ok(());
-            }
-        }
-    })();
+    let result = blocked_loop(&mut terminal, msg);
     ratatui::restore();
     result
+}
+
+/// The remedy screen's draw-until-`q` loop, on an already-initialized terminal — shared
+/// between `run_blocked` (config/token failures, which happen before any terminal exists) and
+/// `run`'s `App::build` failure arm (which already drew the loading frame on its terminal).
+fn blocked_loop(terminal: &mut DefaultTerminal, msg: &str) -> Result<()> {
+    let palette = theme::resolve(None);
+    loop {
+        terminal.draw(|f| ui::render(f, &palette, &PaneState::Blocked(msg)))?;
+        if event::poll(TICK)?
+            && let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+            && k.code == KeyCode::Char('q')
+        {
+            return Ok(());
+        }
+    }
 }
 
 /// Draw, drain the socket channel, and dispatch keys, until `q`.
@@ -133,14 +161,23 @@ fn event_loop(
     let mut last_unread = app.unread_mentions();
     let mut down_since: Option<Instant> = None;
     let mut last_poll_tick = Instant::now();
+    let mut last_catchup: Option<Instant> = None;
     let poll_fallback = Duration::from_secs(poll_fallback_secs);
     let backoff_cycle = Duration::from_secs(socket::backoff_secs(0, |b| b));
+    // Drawing is event-driven, not every-tick: a frame is only rebuilt after something that
+    // can change it (a socket event, a poll/catch-up tick, a keypress, a terminal resize, or
+    // the UTC day flipping under `format_ts`'s dated-timestamp rendering). An idle pane's
+    // 250ms wakeups otherwise re-projected every stored message into rows each tick, burning
+    // CPU that grew with the store for frames identical to the last one.
+    let mut dirty = true;
+    let mut drawn_day: Option<u64> = None;
 
     loop {
         while let Ok(ev) = rx.try_recv() {
             let went_down = matches!(ev, SocketEvent::Down(_));
             let reconnected = matches!(ev, SocketEvent::Connected);
             app.apply(ev);
+            dirty = true;
             if went_down {
                 down_since.get_or_insert_with(Instant::now);
             }
@@ -155,64 +192,107 @@ fn event_loop(
         {
             app.poll_tick(rest);
             last_poll_tick = Instant::now();
+            dirty = true;
         }
 
-        let unread = app.unread_mentions();
-        if unread != last_unread {
-            let _ = write!(io::stdout(), "{}", ui::nav_title(unread));
-            let _ = io::stdout().flush();
-            last_unread = unread;
-        }
-
-        terminal.draw(|f| {
-            // Threaded into `App` once per draw (rather than measured only on a page-move key)
-            // so `page_move`'s caller below always has the pane's current on-screen height,
-            // including right after a terminal resize — see `App::set_viewport_rows`'s doc and
-            // `ui::body_rows` for the same chrome-row math `render_ready`'s layout uses.
-            app.set_viewport_rows(ui::body_rows(f.area().height));
-            ui::render(f, &palette, &PaneState::Ready(app));
-        })?;
-
-        if event::poll(TICK)?
-            && let Event::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
+        // Post-reconnect catch-up (spec §Polling fallback): the socket never redelivers events
+        // missed while it was down, so once it is healthy again the armed sweep re-fetches every
+        // subscribed conversation from its watermark, one paced batch at a time. Only while the
+        // socket is up — during a renewed outage the ordinary poll fallback above covers
+        // freshness, and the next `Connected` re-arms the sweep in full anyway.
+        if !app.polling
+            && app.catchup_due()
+            && last_catchup.is_none_or(|at: Instant| at.elapsed() >= CATCHUP_INTERVAL)
         {
-            app.touch();
-            match k.code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('1') => app.set_tab(Tab::Feed),
-                KeyCode::Char('2') => app.set_tab(Tab::Mentions),
-                KeyCode::Tab => {
-                    let next = if app.tab == Tab::Feed { Tab::Mentions } else { Tab::Feed };
-                    app.set_tab(next);
-                }
-                KeyCode::Char('j') | KeyCode::Down => app.move_cursor(1),
-                KeyCode::Char('k') | KeyCode::Up => app.move_cursor(-1),
-                KeyCode::Char('G') | KeyCode::End => app.jump_newest(),
-                KeyCode::Char('g') | KeyCode::Home => app.jump_first(),
-                KeyCode::PageDown => app.page_move(app.viewport_rows() as isize),
-                KeyCode::PageUp => app.page_move(-(app.viewport_rows() as isize)),
-                KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.page_move((app.viewport_rows() / 2) as isize);
-                }
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.page_move(-((app.viewport_rows() / 2) as isize));
-                }
-                KeyCode::Enter => app.toggle_expand_or_read(rest),
-                KeyCode::Char('t') => app.toggle_view(),
-                KeyCode::Char('f') => app.toggle_focus(),
-                KeyCode::Char('o') => {
-                    if let Some(url) = app.permalink_of_selected(rest)
-                        && let Err(error) = browser::open(&url)
-                    {
-                        app.status = format!("open failed: {error}");
-                    }
-                }
-                KeyCode::Char('r') => app.poll_tick(rest),
-                _ => {}
+            app.catchup_tick(rest);
+            last_catchup = Some(Instant::now());
+            dirty = true;
+        }
+
+        let today = utc_day(SystemTime::now());
+        if drawn_day != Some(today) {
+            dirty = true;
+        }
+
+        if dirty {
+            let unread = app.unread_mentions();
+            if unread != last_unread {
+                let _ = write!(io::stdout(), "{}", ui::nav_title(unread));
+                let _ = io::stdout().flush();
+                last_unread = unread;
             }
+
+            terminal.draw(|f| {
+                // Threaded into `App` once per draw (rather than measured only on a page-move
+                // key) so `page_move`'s caller below always has the pane's current on-screen
+                // height, including right after a terminal resize — see
+                // `App::set_viewport_rows`'s doc and `ui::body_rows` for the same chrome-row
+                // math `render_ready`'s layout uses.
+                app.set_viewport_rows(ui::body_rows(f.area().height));
+                ui::render(f, &palette, &PaneState::Ready(app));
+            })?;
+            drawn_day = Some(today);
+            dirty = false;
+        }
+
+        if !event::poll(TICK)? {
+            continue;
+        }
+        // Read as a match, not a Key-only let-chain: a `Resize` must mark the frame dirty too
+        // (drawing is no longer unconditional, so a resize with no other traffic would
+        // otherwise leave the old layout on screen until the next unrelated event).
+        let k = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Resize(_, _) => {
+                dirty = true;
+                continue;
+            }
+            _ => continue,
+        };
+        app.touch();
+        dirty = true;
+        match k.code {
+            KeyCode::Char('q') => return Ok(()),
+            KeyCode::Char('1') => app.set_tab(Tab::Feed),
+            KeyCode::Char('2') => app.set_tab(Tab::Mentions),
+            KeyCode::Tab => {
+                let next = if app.tab == Tab::Feed { Tab::Mentions } else { Tab::Feed };
+                app.set_tab(next);
+            }
+            KeyCode::Char('j') | KeyCode::Down => app.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_cursor(-1),
+            KeyCode::Char('G') | KeyCode::End => app.jump_newest(),
+            KeyCode::Char('g') | KeyCode::Home => app.jump_first(),
+            KeyCode::PageDown => app.page_move(app.viewport_rows() as isize),
+            KeyCode::PageUp => app.page_move(-(app.viewport_rows() as isize)),
+            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.page_move((app.viewport_rows() / 2) as isize);
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.page_move(-((app.viewport_rows() / 2) as isize));
+            }
+            KeyCode::Enter => app.toggle_expand_or_read(rest),
+            KeyCode::Char('t') => app.toggle_view(),
+            KeyCode::Char('f') => app.toggle_focus(),
+            KeyCode::Char('o') => {
+                if let Some(url) = app.permalink_of_selected(rest)
+                    && let Err(error) = browser::open(&url)
+                {
+                    app.status = format!("open failed: {error}");
+                }
+            }
+            KeyCode::Char('r') => app.poll_tick(rest),
+            _ => {}
         }
     }
+}
+
+/// Whole UTC days since the epoch, for the event loop's redraw-on-day-flip check: row
+/// timestamps render dated once their UTC calendar day is no longer "today" (`app::format_ts`),
+/// so a frame drawn before UTC midnight goes stale at midnight even with no state change —
+/// the only time-driven reason to redraw now that drawing is otherwise event-driven.
+fn utc_day(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) / 86_400
 }
 
 /// The one-line status to show when `theme_name` doesn't resolve to a known palette, or
@@ -228,7 +308,15 @@ fn theme_warning(theme_name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::theme_warning;
+    use super::{theme_warning, utc_day};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn utc_day_counts_whole_days_since_the_epoch() {
+        assert_eq!(utc_day(UNIX_EPOCH), 0);
+        assert_eq!(utc_day(UNIX_EPOCH + Duration::from_secs(86_399)), 0);
+        assert_eq!(utc_day(UNIX_EPOCH + Duration::from_secs(86_400)), 1);
+    }
 
     #[test]
     fn known_theme_has_no_warning() {

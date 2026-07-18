@@ -90,16 +90,28 @@ pub fn connections_open(app_token: &str, cancelled: &AtomicBool) -> Result<Strin
     v["url"].as_str().map(str::to_string).ok_or_else(|| RestError::Other("missing url".to_string()))
 }
 
-/// All subscribed conversations (channels, groups, IMs, MPIMs), paginated to completion.
+/// All subscribed conversations (channels, groups, IMs, MPIMs), paginated to completion. Used
+/// by `App::build`'s one-time channel-name resolution, which genuinely needs every kind.
 pub fn list_conversations(rest: &Rest) -> Result<Vec<Conversation>, RestError> {
+    list_conversations_of("public_channel,private_channel,im,mpim", rest)
+}
+
+/// Only the workspace's IMs and MPIMs, paginated to completion. The recurring out-of-cap DM
+/// activity scan (`App::maybe_scan_out_of_cap_dms`) calls this instead of
+/// [`list_conversations`]: the scan only ever selects `Im`/`Mpim` candidates, and the full
+/// list pages through *every public channel in the workspace* — on a large workspace that is
+/// dozens of Tier-2 requests every scan interval, spent on rows the scan then filters out.
+pub fn list_dm_conversations(rest: &Rest) -> Result<Vec<Conversation>, RestError> {
+    list_conversations_of("im,mpim", rest)
+}
+
+/// The shared `conversations.list` pagination loop behind [`list_conversations`] /
+/// [`list_dm_conversations`], parameterized by the `types` filter.
+fn list_conversations_of(types: &str, rest: &Rest) -> Result<Vec<Conversation>, RestError> {
     let mut cursor = String::new();
     let mut out = Vec::new();
     loop {
-        let params = [
-            ("types", "public_channel,private_channel,im,mpim"),
-            ("limit", "200"),
-            ("cursor", cursor.as_str()),
-        ];
+        let params = conversation_list_params(types, &cursor);
         let v = rest.get("conversations.list", &params)?;
         out.extend(parse_conversations(&v));
         match next_cursor(&v) {
@@ -110,12 +122,33 @@ pub fn list_conversations(rest: &Rest) -> Result<Vec<Conversation>, RestError> {
     Ok(out)
 }
 
-/// The most recent `limit` messages in `conv`, or — when `oldest` names a `ts` — only messages
+/// Pure param-list construction for [`list_conversations_of`], split out (like
+/// [`history_params`]) so the `types` threading is unit-tested without a real REST call.
+fn conversation_list_params<'a>(types: &'a str, cursor: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![("types", types), ("limit", "200"), ("cursor", cursor)]
+}
+
+/// How many pages an incremental [`history`] fetch may follow at most — a defensive bound so a
+/// firehose channel (or a bad cursor loop) can't turn one poll slot into an unbounded request
+/// storm. At `limit` 50 this covers a 500-message burst per conversation per poll; a burst
+/// beyond that loses its *oldest* remainder (pages run newest → older), which is logged rather
+/// than silent.
+const HISTORY_PAGE_CAP: usize = 10;
+
+/// The most recent `limit` messages in `conv`, or — when `oldest` names a `ts` — every message
 /// newer than it (Slack's `oldest` is exclusive by default, which is exactly what incremental
 /// polling wants: the tracked newest-seen `ts` is passed back in, so the common tick's response
-/// body is empty rather than re-shipping the same 50 messages every time). `None` fetches the
-/// plain last-`limit` page, used for the initial backfill and the CLI (both want the freshest
-/// window regardless of anything previously seen).
+/// body is empty rather than re-shipping the same 50 messages every time). An incremental fetch
+/// follows `response_metadata.next_cursor` up to [`HISTORY_PAGE_CAP`] pages (Slack answers with
+/// the newest `limit` first and pages older): without pagination, a burst of more than `limit`
+/// messages between polls would silently lose its middle — the caller's newest-seen watermark
+/// advances past the gap and no later fetch ever asks for it again. `None` fetches the plain
+/// last-`limit` page, one page by design, used for the initial backfill and the CLI (both want
+/// the freshest window regardless of anything previously seen).
+///
+/// A mid-pagination failure (including `RateLimited`) discards the pages already fetched and
+/// returns the error: nothing was folded in, so the caller's watermark is untouched and the
+/// whole span is re-fetched cleanly after the cooldown.
 pub fn history(
     rest: &Rest,
     conv: &str,
@@ -123,23 +156,62 @@ pub fn history(
     oldest: Option<&str>,
 ) -> Result<Vec<Message>, RestError> {
     let limit = limit.to_string();
-    let params = history_params(conv, &limit, oldest);
-    let v = rest.get("conversations.history", &params)?;
-    Ok(parse_messages(&v, conv))
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    let mut pages = 0;
+    loop {
+        let params = history_params(conv, &limit, oldest, &cursor);
+        let v = rest.get("conversations.history", &params)?;
+        out.extend(parse_messages(&v, conv));
+        pages += 1;
+        let more = next_cursor(&v);
+        let capped = more.is_some();
+        let Some(c) = next_history_page(oldest.is_some(), more, pages) else {
+            if oldest.is_some() && capped && pages >= HISTORY_PAGE_CAP {
+                crate::logln!(
+                    "history: page cap ({HISTORY_PAGE_CAP}) reached for {conv}; \
+                     the burst's oldest messages were skipped"
+                );
+            }
+            break;
+        };
+        cursor = c;
+    }
+    Ok(out)
+}
+
+/// Pure page-continuation decision for [`history`]: follow `cursor` for another page only when
+/// the fetch is incremental (`oldest` was given — the plain freshest-window fetch is one page
+/// by design), Slack reported a next page at all, and fewer than [`HISTORY_PAGE_CAP`] pages
+/// have been fetched. Split out so the gate is unit-tested without a real REST call.
+fn next_history_page(
+    incremental: bool,
+    cursor: Option<String>,
+    pages_fetched: usize,
+) -> Option<String> {
+    if !incremental || pages_fetched >= HISTORY_PAGE_CAP {
+        return None;
+    }
+    cursor
 }
 
 /// Pure param-list construction for [`history`], split out so `oldest`'s presence/absence is
 /// unit-tested without a real REST call. `channel`/`limit` are always sent; `oldest` is appended
 /// only when given — omitting the key entirely rather than sending an empty value, matching how
-/// `list_conversations`/`users` treat their own optional-cursor case.
+/// `list_conversations`/`users` treat their own optional-cursor case — and `cursor` only when
+/// non-empty (the first page has none).
 fn history_params<'a>(
     conv: &'a str,
     limit: &'a str,
     oldest: Option<&'a str>,
+    cursor: &'a str,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params = vec![("channel", conv), ("limit", limit)];
     if let Some(oldest) = oldest {
         params.push(("oldest", oldest));
+    }
+    if !cursor.is_empty() {
+        params.push(("cursor", cursor));
     }
     params
 }
@@ -495,6 +567,29 @@ mod tests {
         assert_eq!(build_query(&[]), "");
     }
 
+    // ---- conversation_list_params (types threading: the DM scan must not page every public
+    // channel in the workspace every five minutes) --------------------------------------------
+
+    #[test]
+    fn conversation_list_params_threads_the_requested_types() {
+        assert_eq!(
+            conversation_list_params("im,mpim", ""),
+            vec![("types", "im,mpim"), ("limit", "200"), ("cursor", "")]
+        );
+    }
+
+    #[test]
+    fn conversation_list_params_carries_the_page_cursor() {
+        assert_eq!(
+            conversation_list_params("public_channel,private_channel,im,mpim", "abc"),
+            vec![
+                ("types", "public_channel,private_channel,im,mpim"),
+                ("limit", "200"),
+                ("cursor", "abc")
+            ]
+        );
+    }
+
     // ---- ok / error envelope -------------------------------------------------------------------
 
     #[test]
@@ -686,15 +781,55 @@ mod tests {
 
     #[test]
     fn history_params_omits_oldest_when_none() {
-        assert_eq!(history_params("C1", "50", None), vec![("channel", "C1"), ("limit", "50")]);
+        assert_eq!(history_params("C1", "50", None, ""), vec![("channel", "C1"), ("limit", "50")]);
     }
 
     #[test]
     fn history_params_includes_oldest_when_given() {
         assert_eq!(
-            history_params("C1", "50", Some("1752300000.000100")),
+            history_params("C1", "50", Some("1752300000.000100"), ""),
             vec![("channel", "C1"), ("limit", "50"), ("oldest", "1752300000.000100")]
         );
+    }
+
+    #[test]
+    fn history_params_includes_the_page_cursor_when_given() {
+        assert_eq!(
+            history_params("C1", "50", Some("1752300000.000100"), "cur123"),
+            vec![
+                ("channel", "C1"),
+                ("limit", "50"),
+                ("oldest", "1752300000.000100"),
+                ("cursor", "cur123")
+            ]
+        );
+    }
+
+    // ---- next_history_page (incremental pagination, so a >limit burst leaves no gap) --------
+
+    #[test]
+    fn next_history_page_follows_the_cursor_on_an_incremental_fetch() {
+        assert_eq!(next_history_page(true, Some("cur".to_string()), 1), Some("cur".to_string()));
+    }
+
+    #[test]
+    fn next_history_page_never_paginates_the_plain_freshest_window_fetch() {
+        // `oldest: None` (backfill / CLI) wants exactly the last-`limit` window, one page.
+        assert_eq!(next_history_page(false, Some("cur".to_string()), 1), None);
+    }
+
+    #[test]
+    fn next_history_page_stops_at_the_defensive_page_cap() {
+        assert_eq!(next_history_page(true, Some("cur".to_string()), HISTORY_PAGE_CAP), None);
+        assert_eq!(
+            next_history_page(true, Some("cur".to_string()), HISTORY_PAGE_CAP - 1),
+            Some("cur".to_string())
+        );
+    }
+
+    #[test]
+    fn next_history_page_stops_when_slack_reports_no_more_pages() {
+        assert_eq!(next_history_page(true, None, 1), None);
     }
 
     // ---- replies_params (oldest threading, Task 1) -----------------------------------------
