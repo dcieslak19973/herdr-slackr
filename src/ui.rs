@@ -163,6 +163,23 @@ fn row_line(palette: &Palette, row: &Row, width: usize, selected: bool) -> Line<
             spans.extend(header_spans(palette, row, bg));
             spans
         }
+        // A reply rail row: the ordinary message header, but its leading span is the muted
+        // tree connector (`├─`/`└─`, already padded by `app::reply_rail`) rather than a
+        // channel label — the rail recedes so the thread reads as one indented block.
+        RowKind::Reply { .. } => {
+            let mut spans = header_spans(palette, row, bg);
+            spans[0] = Span::styled(row.conv_label.clone(), cell_style(palette.overlay1, bg));
+            spans
+        }
+        // The Threads digest's per-thread header: the ordinary header spans, bold across the
+        // board so each thread block starts with a visually distinct anchor row.
+        RowKind::ThreadHeader => header_spans(palette, row, bg)
+            .into_iter()
+            .map(|s| {
+                let style = s.style.add_modifier(Modifier::BOLD);
+                Span::styled(s.content, style)
+            })
+            .collect(),
         RowKind::Message => header_spans(palette, row, bg),
     };
     Line::from(spans)

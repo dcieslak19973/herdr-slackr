@@ -101,7 +101,7 @@ fn feed_row_shows_channel_author_time_and_text() {
 }
 
 #[test]
-fn a_collapsed_threads_reply_renders_as_an_activity_row_at_its_own_position() {
+fn a_collapsed_threads_marker_carries_the_count_and_latest_reply_snippet() {
     let mut app = App::empty("SELF");
     app.add_conversation("C1", "eng", ConvKind::Channel);
     app.add_user("U1", "dan");
@@ -110,9 +110,9 @@ fn a_collapsed_threads_reply_renders_as_an_activity_row_at_its_own_position() {
     app.touch();
 
     let out = render_ready(&app);
-    assert!(out.contains("\u{21b3} @dan replied: reply one"), "{out}");
-    // The marker must still show too — the activity row is additional, not a replacement.
-    assert!(out.contains("\u{21b3} 1 replies"), "{out}");
+    // One enriched marker row, no scattered per-reply activity rows.
+    assert!(out.contains("\u{21b3} 1 reply · @dan: reply one"), "{out}");
+    assert!(!out.contains("replied:"), "{out}");
 }
 
 #[test]
@@ -494,16 +494,49 @@ fn footer_hints_enter_to_expand_when_the_cursor_is_on_the_marker_row() {
 }
 
 #[test]
-fn footer_hints_enter_to_expand_when_the_cursor_is_on_an_activity_row() {
+fn footer_hints_enter_to_collapse_when_the_cursor_is_on_an_expanded_reply_rail_row() {
     let mut app = App::empty("SELF");
     app.add_conversation("C1", "eng", ConvKind::Channel);
     app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
     app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
     app.touch();
-    app.move_cursor(2); // the reply's activity row
+    // Expand via Enter on the root, then select the reply's rail row.
+    let cancelled = AtomicBool::new(false);
+    app.toggle_expand_or_read(&rest(&cancelled));
+    app.move_cursor(1);
+    // The cancelled fetch leaves a "replies failed" status that would push the hint past the
+    // test terminal's 100-column clip; only the hint is under test here.
+    app.status.clear();
 
     let out = render_ready(&app);
     assert!(out.to_lowercase().contains("enter expand/collapse thread"), "{out}");
+}
+
+#[test]
+fn expanded_replies_render_a_muted_connector_rail_in_place_of_the_channel_label() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1.000001", None, "U1", "root")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000002", Some("1.000001"), "U1", "reply one")));
+    app.apply(SocketEvent::Message(msg("C1", "1.000003", Some("1.000001"), "U1", "reply two")));
+    app.touch();
+    let cancelled = AtomicBool::new(false);
+    app.toggle_expand_or_read(&rest(&cancelled)); // expand via the root row
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(&app))).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let out = render_ready(&app);
+    assert!(out.contains("\u{251c}\u{2500}"), "mid-thread reply shows the ├─ rail:\n{out}");
+    assert!(out.contains("\u{2514}\u{2500}"), "the last reply closes with the └─ rail:\n{out}");
+    assert_eq!(
+        fg_at(buffer, "\u{251c}\u{2500}"),
+        palette.overlay1,
+        "the rail is muted, not channel-colored"
+    );
 }
 
 #[test]
