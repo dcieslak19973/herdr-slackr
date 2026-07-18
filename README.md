@@ -148,14 +148,29 @@ herdr-slackr is deliberately conservative about how hard it hits Slack's Web API
 fallback (while the socket is down) fetches only 8 conversations per tick, round-robin across
 every subscribed conversation, and asks Slack only for messages newer than the last one already
 seen — a caught-up tick's response is typically empty rather than re-shipping the last 50 messages
-every time. If Slack answers with a real rate limit, the pane reads its actual `Retry-After` value
-and pauses all polling until that deadline passes, rather than guessing at a fixed backoff; a
-socket reconnect always clears a pending cooldown immediately, since a healthy socket means Slack
-has already accepted the connection. The workspace's `users.list` directory (used for display
-names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so a pane restart or a CLI
-invocation doesn't refetch the whole member list every time. Startup backfill retries a
-rate-limited conversation exactly once (sleeping the real `Retry-After` first) before giving up on
-the rest of the list for that session — the socket/poll paths fill in what backfill couldn't.
+every time (and when a burst *is* larger than one page, the fetch follows Slack's cursor for up to
+10 pages so the middle of the burst isn't silently lost). If Slack answers with a real rate limit,
+the pane reads its actual `Retry-After` value and pauses all polling until that deadline passes,
+rather than guessing at a fixed backoff, and resumes the round-robin at the conversation the limit
+interrupted rather than skipping past it; a socket reconnect always clears a pending cooldown
+immediately, since a healthy socket means Slack has already accepted the connection. Because
+Socket Mode never redelivers events that fired while the connection was down, every reconnect also
+arms a one-time catch-up sweep: each subscribed conversation gets one watermarked history fetch,
+paced out in 8-conversation batches every 10 seconds — a conversation that missed nothing answers
+with an empty body, so a sweep after a brief blip is close to free. The workspace's `users.list`
+directory (used for display names) is cached on disk for 24 hours in `$HERDR_PLUGIN_STATE_DIR`, so
+a pane restart or a CLI invocation doesn't refetch the whole member list every time. Startup
+backfill retries a rate-limited conversation exactly once (sleeping the real `Retry-After` first)
+before giving up on the rest of the list for that session — the socket/poll paths fill in what
+backfill couldn't.
+
+> **Newer Slack apps have far tighter history limits.** Slack restricts non-Marketplace apps
+> created after May 2025 to roughly one `conversations.history`/`conversations.replies` request
+> per minute, with `limit` capped at 15. herdr-slackr's backfill and polling budgets assume the
+> classic tiers (tens of requests per minute); on a new restricted app the pane will spend most of
+> its polling-fallback life in `Retry-After` cooldowns and backfill will cover only a conversation
+> or two. The live Socket Mode path is unaffected. If you can, register the Slack app before that
+> cutoff's terms apply to you, or accept that polling mode will be slow to catch up.
 
 `dm_limit` (default 20, valid `0..=200`) caps how many of your DMs/MPIMs are *actively subscribed*
 — polled and backfilled on every regular tick — when `dms = true`, ranked by most-recently-active;
@@ -167,7 +182,8 @@ mode.** Over the live Socket Mode connection this is automatic: the socket subsc
 the whole workspace regardless of which conversations the pane chose to actively track, so a
 message on an out-of-cap DM shows up in the Feed/Mentions tabs immediately, same as any subscribed
 one. In polling mode there is a dedicated detection path for it: every 5 minutes, a scan re-fetches
-the full conversation list and checks every out-of-cap DM/MPIM's Slack-reported activity stamp
+the conversation list — DMs and MPIMs only, so the scan never pages through the workspace's public
+channels — and checks every out-of-cap DM/MPIM's Slack-reported activity stamp
 against what was last seen. If none moved, the scan costs nothing beyond that one list call. If one
 or more did move, exactly one of them — the single most-recently-active, if several changed at once
 — gets fetched with one extra `conversations.history` call that tick; the rest simply wait for the

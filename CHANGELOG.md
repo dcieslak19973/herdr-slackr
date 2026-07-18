@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Messages arriving during a socket outage could be lost for good.** Slack Socket Mode never
+  redelivers events that fired while the connection was down, and the polling fallback both waits
+  out a grace period and round-robins only 8 conversations per tick — so a brief disconnect (or one
+  shorter than a full round-robin sweep) silently dropped whatever landed in the gap. Every
+  reconnect now arms a one-time catch-up sweep: each subscribed conversation gets one watermarked
+  `conversations.history` fetch, paced in 8-conversation batches every 10 seconds. A conversation
+  that missed nothing answers with an empty body, so the common post-blip sweep is nearly free.
+- **A burst of more than 50 messages between polls left a permanent gap.** The incremental history
+  fetch took only Slack's newest-first first page and then advanced its newest-seen watermark past
+  everything else, so the older part of a large burst was never fetched again. Incremental fetches
+  now follow Slack's pagination cursor (bounded at 10 pages per conversation per poll; hitting the
+  bound is logged, not silent).
+- **A rate limit mid-batch skipped the rest of that batch until the round-robin wrapped.** The poll
+  cursor now rewinds to the conversation the 429 interrupted, so it and the batch's remainder are
+  retried right after the cooldown instead of waiting a full cycle.
+- **Unbounded memory and CPU growth over long sessions.** The message store never pruned, and every
+  frame rebuilt row projections with a full store scan *per thread root* — quadratic work that grew
+  for as long as the pane ran. Each conversation now retains its newest 300 messages (unread
+  mentions are exempt from pruning until read), thread replies are resolved through a single-pass
+  index instead of per-root scans, and the terminal only redraws when something actually changed (a
+  socket event, poll result, keypress, resize, or the UTC day flipping under dated timestamps)
+  rather than unconditionally every 250ms.
+- **The 5-minute out-of-cap DM scan listed every conversation in the workspace.** It now requests
+  `types=im,mpim` only, so it no longer pages through every public channel each interval — on a
+  large workspace that was dozens of Tier-2 requests spent on rows the scan filtered out anyway.
+- **Blank pane during a slow startup.** A rate-limited backfill can legitimately sleep up to 60
+  seconds before its one retry; the pane now draws a "connecting to slack" frame before backfill
+  starts instead of sitting empty, indistinguishable from a hang.
+
+### Added
+- **README: rate-limits note for newer Slack apps.** Non-Marketplace apps created after May 2025
+  get roughly one `conversations.history`/`conversations.replies` request per minute with `limit`
+  capped at 15; the note explains what that does to backfill and polling mode (Socket Mode is
+  unaffected).
+
 ## [0.1.5] — 2026-07-13
 
 ### Fixed
