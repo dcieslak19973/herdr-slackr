@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.12] — 2026-07-19
+
 ### Added
 - **Reactions.** Messages now show their reactions as a trailing muted suffix — `👍3
   :party-parrot:` — on Feed, thread, mention, and digest rows alike. Common shortcodes render
