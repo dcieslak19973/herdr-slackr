@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Poll-only mode: the `xapp-` app token is now optional.** Omitting it (no env var, no
+  `app_token` key) starts the pane with no Socket Mode connection: the request-budgeted polling
+  fallback becomes the permanent delivery path, `r` still forces a full sweep, and the status
+  line says `poll-only mode`. This exists because sharing a Socket Mode app between two
+  consumers is structurally broken — Slack load-balances each event to exactly one open
+  connection and the pane acks what it receives, so a pane pointed at another service's app
+  (e.g. a corporate relay bot) both misses most events *and* silently steals the ones it gets
+  from that service. A malformed app token is still a loud error; only genuine absence selects
+  poll-only mode. Bonus: the agent CLI (which never needed the app token) now works without one.
+
 ### Changed
 - **A confirmed-lossy socket now escalates to fallback-cadence polling** (spec F17). The 0.1.9
   safety poll diagnosed a connected-but-undelivering socket but kept its 5-minute cadence —

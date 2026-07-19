@@ -38,10 +38,10 @@ lookback_days = 14                       # default 7
 
 Tokens live in a separate file, `tokens.toml` in the same directory, or the environment:
 
-| token       | env var             | `tokens.toml` key | required prefix |
-| ------------ | -------------------- | ------------------ | ----------------- |
-| app-level   | `SLACK_APP_TOKEN`    | `app_token`         | `xapp-`           |
-| user OAuth  | `SLACK_USER_TOKEN`   | `user_token`        | `xoxp-`           |
+| token       | env var             | `tokens.toml` key | required prefix | required? |
+| ------------ | -------------------- | ------------------ | ----------------- | ---------- |
+| app-level   | `SLACK_APP_TOKEN`    | `app_token`         | `xapp-`           | optional — genuine absence (no env, no key) selects **poll-only mode**: no socket worker, `polling` latched true, the fallback cadence is the permanent delivery path; a present-but-malformed value is still a loud error (absence is an opt-out, a typo is a mistake) |
+| user OAuth  | `SLACK_USER_TOKEN`   | `user_token`        | `xoxp-`           | always     |
 
 ## Behavior
 

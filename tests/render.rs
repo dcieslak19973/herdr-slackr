@@ -235,11 +235,13 @@ fn a_new_arrival_while_the_cursor_sits_at_the_bottom_stays_visible() {
 
 #[test]
 fn degraded_screen_names_the_tokens_and_the_tokens_toml_path() {
+    // With no tokens at all, the *user* token is what fails resolution — the app token's
+    // absence is a valid state now (poll-only mode), never an error.
     let dir = tempfile::tempdir().unwrap();
     let err = herdr_slackr::tokens::resolve(dir.path(), |_| None).unwrap_err();
 
     let out = render_blocked(&err.to_string());
-    assert!(out.contains("SLACK_APP_TOKEN"), "{out}");
+    assert!(out.contains("SLACK_USER_TOKEN"), "{out}");
     assert!(out.contains("tokens.toml"), "{out}");
 }
 

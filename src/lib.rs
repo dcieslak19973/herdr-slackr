@@ -97,12 +97,30 @@ pub fn run() -> Result<()> {
 
     let result = match App::build(config, &tokens, &rest) {
         Ok(mut app) => {
+            // Poll-only mode (no app token — see `tokens::Tokens`): no socket worker at all.
+            // The pane runs on the polling fallback permanently; `polling` is latched true so
+            // the status line carries the marker and the socket-dependent branches
+            // (catch-up-after-reconnect gating aside — see `event_loop`) stay quiescent.
+            let poll_only = tokens.app.is_none();
+            if poll_only {
+                app.polling = true;
+                app.status = "poll-only mode — no app token, live socket disabled".to_string();
+                crate::logln!("poll-only mode: no app token; socket worker not started");
+            }
             let (tx, rx) = mpsc::channel::<SocketEvent>();
-            let worker_cancelled = cancelled.clone();
-            let app_token = tokens.app.clone();
-            let worker = thread::spawn(move || socket::run(app_token, tx, worker_cancelled));
-            let result =
-                event_loop(&mut terminal, &mut app, &rx, &rest, poll_fallback_secs, &theme_name);
+            let worker = tokens.app.clone().map(|app_token| {
+                let worker_cancelled = cancelled.clone();
+                thread::spawn(move || socket::run(app_token, tx, worker_cancelled))
+            });
+            let result = event_loop(
+                &mut terminal,
+                &mut app,
+                &rx,
+                &rest,
+                poll_fallback_secs,
+                &theme_name,
+                poll_only,
+            );
             // Signal the worker and detach rather than join: `socket::run`'s read loop blocks
             // on a 30s read timeout with no state here that needs flushing, so joining it would
             // make `q` hang the terminal restore for up to 30s. The thread exits on its own
@@ -155,6 +173,7 @@ fn blocked_loop(terminal: &mut DefaultTerminal, msg: &str) -> Result<()> {
 /// lasted and only starts calling `poll_tick` once it has outlived one full backoff cycle
 /// (`socket::backoff_secs(0, ...)`, the worker's first retry interval), thereafter every
 /// `poll_fallback_secs` until a `Connected` event clears the streak.
+#[allow(clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
@@ -162,6 +181,7 @@ fn event_loop(
     rest: &Rest,
     poll_fallback_secs: u64,
     theme_name: &str,
+    poll_only: bool,
 ) -> Result<()> {
     let palette = theme::resolve(Some(theme_name));
     if let Some(warning) = theme_warning(theme_name) {
@@ -269,8 +289,11 @@ fn event_loop(
         // firing (see `jittered`): panes sharing one app key all enter polling mode anchored
         // to the same Slack outage, and fixed intervals would keep their request batches in
         // lockstep against the shared rate-limit pool indefinitely.
+        // In poll-only mode there is no worker to emit `Down`, so the down-streak grace gate
+        // is meaningless — `polling` was latched true at startup and the fallback cadence is
+        // simply the pane's only delivery path.
         if app.polling
-            && down_since.is_some_and(|since| since.elapsed() >= backoff_cycle)
+            && (poll_only || down_since.is_some_and(|since| since.elapsed() >= backoff_cycle))
             && last_poll_tick.elapsed() >= next_poll_gap
         {
             app.poll_tick(rest);
@@ -284,7 +307,9 @@ fn event_loop(
         // subscribed conversation from its watermark, one paced batch at a time. Only while the
         // socket is up — during a renewed outage the ordinary poll fallback above covers
         // freshness, and the next `Connected` re-arms the sweep in full anyway.
-        if !app.polling
+        // (Poll-only mode has no reconnects to catch up after, but `r`'s manual refresh arms
+        // this same sweep — so the branch runs there too, gated only by its own pacing.)
+        if (!app.polling || poll_only)
             && app.catchup_due()
             && last_catchup.is_none_or(|at: Instant| at.elapsed() >= next_catchup_gap)
         {
