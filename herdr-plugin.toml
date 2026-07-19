@@ -1,6 +1,6 @@
 id = "dcieslak19973.slackr"
 name = "slackr"
-version = "0.1.6"
+version = "0.1.7"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
 description = "Real-time Slack feed and mentions pane for herdr."

@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-07-19
+
 ### Fixed
 - **Out-of-cap DMs were invisible in the two places a user looks for a DM.** A live message on
   a DM outside the `dm_limit`-subscribed set reached the Feed, but rendered as `#<raw id>` and
