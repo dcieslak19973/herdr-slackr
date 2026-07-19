@@ -797,6 +797,15 @@ impl App {
         self.catchup_remaining > 0
     }
 
+    /// Total messages ever applied this session (`arrival_seq` — post-incremented once per
+    /// newly-seen message, never for dedups/edits/deletes). The event loop's silent-socket
+    /// safety poll compares this around a poll tick: growth during a poll while the socket
+    /// claims to be healthy means the socket is connected but not delivering — the signature
+    /// of a Slack app missing its `message.*` event subscriptions.
+    pub fn arrival_count(&self) -> u64 {
+        self.arrival_seq
+    }
+
     /// Arm a full manual refresh (the `r` key): every subscribed conversation gets one
     /// watermarked fetch, worked off by the same paced, request-budgeted sweep machinery the
     /// post-reconnect catch-up uses (`catchup_tick`) — so "pull everything now" cannot burst
@@ -3113,6 +3122,22 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- silent-socket safety poll support: the event loop compares arrival counts around a
+    // safety poll to tell "quiet workspace" from "connected socket that delivers nothing"
+    // (e.g. a shared Slack app missing the message.* event subscriptions). ---------------------
+
+    #[test]
+    fn arrival_count_reflects_applied_messages() {
+        let mut app = empty_app();
+        assert_eq!(app.arrival_count(), 0);
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "one")));
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "two")));
+        assert_eq!(app.arrival_count(), 2);
+        // A duplicate upsert is not a new arrival.
+        app.apply(SocketEvent::Message(msg("C1", "2.0", None, "U1", "two")));
+        assert_eq!(app.arrival_count(), 2);
     }
 
     // ---- manual refresh (`r`): arms the same paced, request-budgeted sweep the reconnect
