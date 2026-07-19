@@ -11,11 +11,17 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
-/// The resolved token pair. `app` is the `xapp-…` app-level token (Socket Mode); `user` is
-/// the `xoxp-…` user OAuth token (Web API).
+/// The resolved tokens. `user` is the `xoxp-…` user OAuth token (Web API) — always required,
+/// every read goes through it. `app` is the `xapp-…` app-level token (Socket Mode) — optional:
+/// its absence selects **poll-only mode** (no socket worker, permanent polling fallback).
+/// That opt-out exists because opening a socket is sometimes actively wrong, not just
+/// unnecessary: Socket Mode load-balances events across every open connection *and the pane
+/// acks what it receives*, so pointing a second consumer at another service's app makes both
+/// silently steal each other's events. A *malformed* app token still fails loud
+/// ([`resolve`]'s prefix check) — absence is an opt-out, a typo is a mistake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tokens {
-    pub app: String,
+    pub app: Option<String>,
     pub user: String,
 }
 
@@ -35,39 +41,45 @@ impl std::error::Error for TokenError {}
 
 const TOKENS_FILE: &str = "tokens.toml";
 
-/// Resolve both tokens from `env` first, falling back to `<dir>/tokens.toml`. `env` is an
+/// Resolve the tokens from `env` first, falling back to `<dir>/tokens.toml`. `env` is an
 /// injected lookup (real code passes `std::env::var(name).ok()`; tests pass a closure over a
-/// fixture map) so tests never mutate real process environment state.
+/// fixture map) so tests never mutate real process environment state. The user token is
+/// required; the app token's absence resolves to `None` (poll-only mode — see [`Tokens`]).
 pub fn resolve(dir: &Path, env: impl Fn(&str) -> Option<String>) -> Result<Tokens, TokenError> {
-    let app = resolve_token(&env, "SLACK_APP_TOKEN", dir, "app_token", "xapp-")?;
-    let user = resolve_token(&env, "SLACK_USER_TOKEN", dir, "user_token", "xoxp-")?;
+    let app = lookup_token(&env, "SLACK_APP_TOKEN", dir, "app_token", "xapp-")?;
+    let user =
+        lookup_token(&env, "SLACK_USER_TOKEN", dir, "user_token", "xoxp-")?.ok_or_else(|| {
+            TokenError(format!(
+                "SLACK_USER_TOKEN is not set and {} has no `user_token`; set SLACK_USER_TOKEN \
+                 or add `user_token = \"xoxp-...\"` to that file",
+                dir.join(TOKENS_FILE).display()
+            ))
+        })?;
     Ok(Tokens { app, user })
 }
 
-fn resolve_token(
+/// One token's resolution: `Ok(None)` only for genuine *absence* (env unset/empty, and the
+/// file missing or lacking the key). Everything a user could plausibly have gotten wrong —
+/// unreadable or over-permissioned file, syntax error, non-string value, wrong prefix — is
+/// still a loud error, never a silent `None`.
+fn lookup_token(
     env: &impl Fn(&str) -> Option<String>,
     env_var: &str,
     dir: &Path,
     toml_key: &str,
     prefix: &str,
-) -> Result<String, TokenError> {
+) -> Result<Option<String>, TokenError> {
     if let Some(value) = env(env_var)
         && !value.is_empty()
     {
         check_prefix(&value, prefix, env_var)?;
-        return Ok(value);
+        return Ok(Some(value));
     }
 
     let path = dir.join(TOKENS_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(TokenError(format!(
-                "{env_var} is not set and {} does not exist; set {env_var} or create it with \
-                 `{toml_key} = \"{prefix}...\"`",
-                path.display()
-            )));
-        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(TokenError(format!("failed to read {}: {error}", path.display())));
         }
@@ -80,18 +92,13 @@ fn resolve_token(
     })?;
 
     let Some(value) = table.get(toml_key) else {
-        return Err(TokenError(format!(
-            "{env_var} is not set and {} has no `{toml_key}`; set {env_var} or add \
-             `{toml_key} = \"{prefix}...\"` to {}",
-            path.display(),
-            path.display()
-        )));
+        return Ok(None);
     };
     let Some(token) = value.as_str() else {
         return Err(TokenError(format!("{}: `{toml_key}` must be a string", path.display())));
     };
     check_prefix(token, prefix, toml_key)?;
-    Ok(token.to_owned())
+    Ok(Some(token.to_owned()))
 }
 
 /// Confirms `token` carries the expected Slack prefix without ever putting `token` itself
@@ -150,7 +157,7 @@ mod tests {
         .unwrap();
         let env = env_from(&[("SLACK_APP_TOKEN", "xapp-env"), ("SLACK_USER_TOKEN", "xoxp-env")]);
         let tokens = resolve(dir.path(), env).unwrap();
-        assert_eq!(tokens.app, "xapp-env");
+        assert_eq!(tokens.app.as_deref(), Some("xapp-env"));
         assert_eq!(tokens.user, "xoxp-env");
     }
 
@@ -165,16 +172,55 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let tokens = resolve(dir.path(), env_from(&[])).unwrap();
-        assert_eq!(tokens.app, "xapp-file");
+        assert_eq!(tokens.app.as_deref(), Some("xapp-file"));
         assert_eq!(tokens.user, "xoxp-file");
     }
 
     #[test]
-    fn missing_both_names_both_sources() {
+    fn missing_user_token_names_both_sources() {
         let dir = tempfile::tempdir().unwrap();
         let error = resolve(dir.path(), env_from(&[])).unwrap_err().0;
-        assert!(error.contains("SLACK_APP_TOKEN"), "{error}");
+        assert!(error.contains("SLACK_USER_TOKEN"), "{error}");
         assert!(error.contains("tokens.toml"), "{error}");
+    }
+
+    // ---- optional app token (poll-only mode): the xapp token exists only for Socket Mode, and
+    // there are real deployments where opening a socket is wrong — e.g. the only approvable app
+    // is another service's, and Socket Mode load-balances (and acks!) events across every open
+    // connection, so a second consumer silently steals the first one's events. ------------------
+
+    #[test]
+    fn absent_app_token_resolves_to_none_when_the_user_token_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_from(&[("SLACK_USER_TOKEN", "xoxp-env")]);
+        let tokens = resolve(dir.path(), env).unwrap();
+        assert_eq!(tokens.app, None, "no app token means poll-only mode, not an error");
+        assert_eq!(tokens.user, "xoxp-env");
+    }
+
+    #[test]
+    fn file_with_only_a_user_token_resolves_to_poll_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.toml");
+        std::fs::write(&path, "user_token = \"xoxp-file\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let tokens = resolve(dir.path(), env_from(&[])).unwrap();
+        assert_eq!(tokens.app, None);
+        assert_eq!(tokens.user, "xoxp-file");
+    }
+
+    #[test]
+    fn a_present_but_wrong_prefix_app_token_still_fails_loud() {
+        // A typo'd xapp token must never silently degrade to poll-only mode — absence is an
+        // opt-out, malformation is a mistake.
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_from(&[("SLACK_APP_TOKEN", "xoxb-wrong"), ("SLACK_USER_TOKEN", "xoxp-env")]);
+        let error = resolve(dir.path(), env).unwrap_err().0;
+        assert!(error.contains("xapp-"), "{error}");
     }
 
     #[test]
