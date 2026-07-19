@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Silent-socket safety poll.** A Slack app with Socket Mode enabled but no `message.*` event
+  subscriptions (easy to hit on a shared corporate app) connects successfully and then delivers
+  nothing — and a healthy-looking socket suppressed all polling, freezing the feed forever after
+  backfill. After 5 minutes with zero live events, the pane now spends one ordinary
+  request-budgeted poll batch as a safety net; if that poll finds messages the socket should
+  have delivered, the status line names the likely cause (`check the Slack app's event
+  subscriptions`) and `slackr.log` records the count. Costs at most ~8 requests per 5 minutes,
+  and only while the silence lasts. README documents the symptom under §Slack app setup.
+
 ## [0.1.8] — 2026-07-19
 
 ### Added

@@ -50,6 +50,13 @@ const TICK: Duration = Duration::from_millis(250);
 /// this pane is never the only thing spending from it.
 const CATCHUP_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How long a healthy-looking socket may stay completely silent before the event loop spends
+/// one ordinary poll batch as a safety net (see the safety-poll block in `event_loop`). Five
+/// minutes of zero events across every subscribed conversation is already suspicious in a busy
+/// workspace and unremarkable in a quiet one — and the safety poll is cheap either way: at most
+/// ~8 requests per 5 minutes, only while the silence lasts, nothing when events flow.
+const SILENT_SOCKET_POLL: Duration = Duration::from_secs(300);
+
 /// Entry point: resolve config/tokens, build the pane, run the loop, restore the terminal.
 /// A config or token failure (or `App::build`'s own REST failure) never crashes — it renders
 /// the full-pane remedy screen instead (spec §Error handling).
@@ -175,19 +182,59 @@ fn event_loop(
     // CPU that grew with the store for frames identical to the last one.
     let mut dirty = true;
     let mut drawn_day: Option<u64> = None;
+    // Seeded to "now" rather than an already-elapsed instant: startup backfill just covered
+    // everything, so the first safety poll is earned only after a genuinely silent interval.
+    let mut last_live_event = Instant::now();
 
     loop {
         while let Ok(ev) = rx.try_recv() {
             let went_down = matches!(ev, SocketEvent::Down(_));
             let reconnected = matches!(ev, SocketEvent::Connected);
+            let is_live_message = matches!(
+                ev,
+                SocketEvent::Message(_) | SocketEvent::Changed(_) | SocketEvent::Deleted { .. }
+            );
             app.apply(ev);
             dirty = true;
+            if is_live_message {
+                last_live_event = Instant::now();
+            }
             if went_down {
                 down_since.get_or_insert_with(Instant::now);
             }
             if reconnected {
                 down_since = None;
             }
+        }
+
+        // Silent-socket safety poll: a socket that connects but never delivers (the signature
+        // of a Slack app missing its `message.*` event subscriptions — plausible on a shared
+        // corporate app someone else configured) would otherwise freeze the feed forever,
+        // because a "healthy" socket suppresses all polling. After SILENT_SOCKET_POLL with no
+        // live event, spend one ordinary poll batch as a safety net; if it finds messages the
+        // socket should have delivered, say so — that one status line is the difference
+        // between "quiet afternoon" and "misconfigured app" from the user's chair.
+        if !app.polling
+            && last_live_event.elapsed() >= SILENT_SOCKET_POLL
+            && last_poll_tick.elapsed() >= SILENT_SOCKET_POLL
+        {
+            crate::logln!(
+                "safety poll: socket connected but no live events for {}s",
+                SILENT_SOCKET_POLL.as_secs()
+            );
+            let before = app.arrival_count();
+            app.poll_tick(rest);
+            if app.arrival_count() > before {
+                app.status = "live events silent but polling found new messages — check the \
+                              Slack app's event subscriptions (README §Slack app setup)"
+                    .to_string();
+                crate::logln!(
+                    "safety poll: found {} messages the socket never delivered",
+                    app.arrival_count() - before
+                );
+            }
+            last_poll_tick = Instant::now();
+            dirty = true;
         }
 
         // Both recurring request cadences below re-jitter their next interval after every

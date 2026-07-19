@@ -66,6 +66,15 @@ requests, and nothing else.
 No bot token, no `chat:write`, no admin scopes. The app only ever reads what the installing user
 can already see and opens one Socket Mode connection.
 
+> **Symptom of skipping step 5:** the pane connects, backfills history — and then never shows
+> another message, because Socket Mode connects fine without any event subscriptions and a
+> healthy-looking socket suppresses polling. The pane defends itself: after 5 minutes of total
+> socket silence it runs a safety poll, and if that poll finds messages the socket should have
+> delivered, the status line says `live events silent but polling found new messages — check the
+> Slack app's event subscriptions` (with matching `safety poll:` lines in `slackr.log`). If you
+> see that message, this checklist's step 5 — on the app whose `xapp-` token you're using — is
+> the place to look.
+
 ## Install
 
 From the herdr marketplace. You get a prebuilt binary, no Rust toolchain:
