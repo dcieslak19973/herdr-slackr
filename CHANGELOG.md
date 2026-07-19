@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Compact footer.** Poll-only mode announced itself with a permanent status sentence
+  (`poll-only mode — no app token, live socket disabled · polling · …`) that crowded the key
+  hints off a narrow split; it is now a single `poll-only` marker that replaces (never doubles
+  with) the generic `polling` one. The Feed hints also tightened to name their destinations —
+  `t: threads · f: focus` instead of `t: toggle view · f: toggle focus`.
+
 ## [0.1.10] — 2026-07-19
 
 ### Added
