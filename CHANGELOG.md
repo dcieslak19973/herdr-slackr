@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Delivery-diagnostic log trail** (`slackr.log`, complementing 0.1.7's gated-drop lines): a
+  line per socket `connected`/`down` transition — a healthy socket was otherwise completely
+  silent, so "was the connection even up when that message was sent?" was unanswerable — and a
+  line per applied live DM/MPIM message (conversation id and `ts` only, never message text).
+  Together with the drop trail, a "didn't see a DM" report now resolves from the log alone:
+  arrived-and-applied, arrived-and-gated, or never arrived.
+
 ## [0.1.7] — 2026-07-19
 
 ### Fixed

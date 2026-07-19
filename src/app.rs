@@ -544,6 +544,13 @@ impl App {
                 // `catchup_remaining`'s field doc).
                 self.catchup_remaining =
                     catchup_after_reconnect(self.polling, self.conversations.len());
+                // Rare transition, permanent trail: "was the socket even up when that message
+                // was sent?" is the first question of every missed-delivery report, and a
+                // healthy socket is otherwise completely silent in the log.
+                crate::logln!(
+                    "socket: connected (catch-up armed for {} conversations)",
+                    self.catchup_remaining
+                );
                 self.polling = false;
                 self.status.clear();
                 // A cooldown set from a `RateLimited` hit before this reconnect must not
@@ -553,6 +560,7 @@ impl App {
                 self.cooldown_until = None;
             }
             SocketEvent::Down(reason) => {
+                crate::logln!("socket: down ({reason}) — polling fallback armed");
                 self.polling = true;
                 self.status = format!("socket unavailable ({reason}) — polling");
             }
@@ -563,6 +571,12 @@ impl App {
             // `Deleted` needs no gate: removing a message that was never admitted is a no-op.
             SocketEvent::Message(msg) => {
                 if self.admits_live(&msg.conv) {
+                    // A one-line arrival trail for DM-family messages only (low volume, high
+                    // diagnostic value — "did my DM ever reach the pane?"). Conversation id
+                    // and ts only, never the text: slackr.log is a plaintext file on disk.
+                    if matches!(self.conv_kind_of(&msg.conv), ConvKind::Im | ConvKind::Mpim) {
+                        crate::logln!("apply: live dm message on {} ts={}", msg.conv, msg.ts);
+                    }
                     self.upsert_new(msg);
                 } else {
                     self.log_dropped_live("message", &msg.conv);
