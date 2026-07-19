@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-07-19
+
 ### Added
 - **Delivery-diagnostic log trail** (`slackr.log`, complementing 0.1.7's gated-drop lines): a
   line per socket `connected`/`down` transition — a healthy socket was otherwise completely
