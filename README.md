@@ -71,9 +71,11 @@ can already see and opens one Socket Mode connection.
 > healthy-looking socket suppresses polling. The pane defends itself: after 5 minutes of total
 > socket silence it runs a safety poll, and if that poll finds messages the socket should have
 > delivered, the status line says `live events silent but polling found new messages — check the
-> Slack app's event subscriptions` (with matching `safety poll:` lines in `slackr.log`). If you
-> see that message, this checklist's step 5 — on the app whose `xapp-` token you're using — is
-> the place to look.
+> Slack app's event subscriptions` (with matching `safety poll:` lines in `slackr.log`). From
+> that moment the pane also stops trusting the socket and polls at the normal
+> `poll_fallback_secs` cadence (default 30s) until live events actually resume — so a
+> misconfigured app degrades to a working, slightly-delayed feed rather than a frozen one. But
+> the real fix is this checklist's step 5, on the app whose `xapp-` token you're using.
 
 ## Install
 
