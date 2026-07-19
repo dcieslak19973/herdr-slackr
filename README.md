@@ -112,7 +112,7 @@ herdr-slackr resolves each token independently, environment first:
 **Poll-only mode.** Omitting the app token entirely (no env var, no `app_token` key) starts the
 pane with no Socket Mode connection at all: the polling fallback becomes the permanent delivery
 path (default every 30 seconds, request-budgeted, `r` still forces a full sweep), and the status
-line says `poll-only mode`. Use this when you can't get a dedicated Slack app approved and the
+line carries a compact `poll-only` marker. Use this when you can't get a dedicated Slack app approved and the
 only available `xapp-` token belongs to *another service's* app — **never share a Socket Mode app
 between two consumers**: Slack load-balances each event to exactly one open connection, and this
 pane acks what it receives, so a shared app means both consumers silently steal each other's

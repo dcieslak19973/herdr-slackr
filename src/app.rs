@@ -168,6 +168,12 @@ pub struct App {
     /// True while in fallback polling mode (renders in `status` by convention, not enforced
     /// here — Task 7 decides exact wording).
     pub polling: bool,
+    /// True when the pane runs with no app token at all (`tokens::Tokens::app == None`): no
+    /// socket worker exists and `polling` is latched true for the pane's whole life. Set once
+    /// by `lib::run` before the event loop starts; the renderer shows it as a compact
+    /// `poll-only` footer marker in place of the generic `polling` one — a permanent mode is
+    /// a marker, not a status sentence that crowds the key hints off a narrow pane.
+    pub poll_only: bool,
 
     conversations: Vec<Conversation>,
     conv_names: HashMap<String, String>,
@@ -398,6 +404,7 @@ impl App {
             cursor: 0,
             status: String::new(),
             polling: false,
+            poll_only: false,
             conversations: selected,
             conv_names,
             conv_kinds,
@@ -463,6 +470,7 @@ impl App {
             cursor: 0,
             status: String::new(),
             polling: false,
+            poll_only: false,
             conversations: Vec::new(),
             conv_names: HashMap::new(),
             conv_kinds: HashMap::new(),
@@ -2501,6 +2509,7 @@ mod tests {
             cursor: 0,
             status: String::new(),
             polling: false,
+            poll_only: false,
             conversations: vec![
                 conv("C1", "eng", ConvKind::Channel),
                 conv("C2", "ops", ConvKind::Channel),

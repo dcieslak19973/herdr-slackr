@@ -104,7 +104,10 @@ pub fn run() -> Result<()> {
             let poll_only = tokens.app.is_none();
             if poll_only {
                 app.polling = true;
-                app.status = "poll-only mode — no app token, live socket disabled".to_string();
+                // A compact footer marker (`ui::render_status`), deliberately not a status
+                // sentence: this state lasts the pane's whole life, and a permanent sentence
+                // crowds the key hints off a narrow split.
+                app.poll_only = true;
                 crate::logln!("poll-only mode: no app token; socket worker not started");
             }
             let (tx, rx) = mpsc::channel::<SocketEvent>();

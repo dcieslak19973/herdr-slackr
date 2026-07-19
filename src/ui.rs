@@ -209,7 +209,9 @@ fn cell_style(fg: Color, bg: Option<Color>) -> Style {
 }
 
 /// `app.status`, with a `polling` marker appended when in fallback mode and not already named
-/// in the status text, `t: toggle view` and `f: toggle focus` key hints on the Feed tab (spec
+/// in the status text (or a compact `poll-only` marker replacing it when the pane runs with no
+/// app token at all — a permanent mode must not crowd the hints off a narrow split the way a
+/// full status sentence would), `t: threads` and `f: focus` key hints on the Feed tab (spec
 /// §3: "`t` appears in the footer" — `f` rides alongside it, since Focus and Threads are both
 /// Feed-tab view-mode toggles), a context-aware `enter expand/collapse thread` hint (spec §5) whenever
 /// `App::selected_is_thread_related` says Enter would actually do something thread-related, and
@@ -219,7 +221,15 @@ fn cell_style(fg: Color, bg: Option<Color>) -> Style {
 /// regardless.
 fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
     let mut text = app.status.clone();
-    if app.polling && !text.contains("polling") {
+    if app.poll_only {
+        // The permanent no-app-token mode gets one compact marker, replacing the generic
+        // `polling` one (`poll_only` implies `polling` for the pane's whole life, and a
+        // doubled `poll-only · polling` would say the same thing twice).
+        if !text.is_empty() {
+            text.push_str(" · ");
+        }
+        text.push_str("poll-only");
+    } else if app.polling && !text.contains("polling") {
         if !text.is_empty() {
             text.push_str(" · ");
         }
@@ -229,9 +239,9 @@ fn render_status(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
         if !text.is_empty() {
             text.push_str(" · ");
         }
-        text.push_str("t: toggle view");
+        text.push_str("t: threads");
         text.push_str(" · ");
-        text.push_str("f: toggle focus");
+        text.push_str("f: focus");
     }
     if app.selected_is_thread_related() {
         if !text.is_empty() {

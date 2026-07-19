@@ -397,7 +397,7 @@ fn f_key_toggle_is_mutually_exclusive_with_threads() {
 fn feed_tab_status_hints_the_f_toggle_focus_key() {
     let app = App::empty("SELF");
     let out = render_ready(&app);
-    assert!(out.to_lowercase().contains("toggle focus"), "{out}");
+    assert!(out.to_lowercase().contains("f: focus"), "{out}");
 }
 
 #[test]
@@ -405,7 +405,7 @@ fn mentions_tab_status_has_no_f_hint() {
     let mut app = App::empty("SELF");
     app.set_tab(Tab::Mentions);
     let out = render_ready(&app);
-    assert!(!out.to_lowercase().contains("toggle focus"), "{out}");
+    assert!(!out.to_lowercase().contains("f: focus"), "{out}");
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn feed_tab_status_hints_the_t_toggle_key() {
     let app = App::empty("SELF");
     let out = render_ready(&app);
     assert!(out.contains('t'), "{out}"); // loose smoke check before the exact-text assertion below
-    assert!(out.to_lowercase().contains("toggle view"), "{out}");
+    assert!(out.to_lowercase().contains("t: threads"), "{out}");
 }
 
 #[test]
@@ -445,7 +445,22 @@ fn mentions_tab_status_has_no_t_hint() {
     let mut app = App::empty("SELF");
     app.set_tab(Tab::Mentions);
     let out = render_ready(&app);
-    assert!(!out.to_lowercase().contains("toggle view"), "{out}");
+    assert!(!out.to_lowercase().contains("t: threads"), "{out}");
+}
+
+// ---- poll-only footer marker: a permanent mode is a compact marker, not a status sentence ----
+
+#[test]
+fn poll_only_mode_renders_as_a_compact_marker_leaving_room_for_the_hints() {
+    let mut app = App::empty("SELF");
+    app.poll_only = true;
+    app.polling = true;
+    let out = render_ready(&app);
+    assert!(out.contains("poll-only"), "{out}");
+    // The marker replaces (never doubles with) the generic `polling` marker...
+    assert!(!out.contains("poll-only · polling"), "{out}");
+    // ...and the whole footer still fits: the last hint survives on a 100-column frame.
+    assert!(out.to_lowercase().contains("g/g: top/bottom"), "{out}");
 }
 
 // ---- thread expand/collapse completion feedback (Task 2, spec §5) ---------------------------
