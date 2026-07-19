@@ -388,7 +388,7 @@ Timeline.
 | `t`           | Feed tab only: toggle the Feed between the Timeline and the Threads-only view |
 | `f`           | Feed tab only: toggle the Feed into/out of the Focus view (see [Focus mode](#focus-mode)) |
 | `o`           | Open the selected message's permalink in the browser             |
-| `r`           | Manual refresh (re-pull the last 50 messages of every conversation) |
+| `r`           | Manual refresh: polls one batch immediately, then sweeps every subscribed conversation from its watermark in paced, rate-budgeted batches (status shows `refreshing n conversations`) |
 | `q`           | Quit the pane                                                     |
 
 Any keypress moves the unread divider to "now" — the pane has no other way to detect that you've

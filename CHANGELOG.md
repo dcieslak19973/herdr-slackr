@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Out-of-cap DMs were invisible in the two places a user looks for a DM.** A live message on
+  a DM outside the `dm_limit`-subscribed set reached the Feed, but rendered as `#<raw id>` and
+  never tripped the Mentions tab's every-DM-is-a-mention rule — mention detection and labeling
+  consulted only the subscribed-conversation tables and defaulted to "channel". Conversation
+  kind now resolves through the workspace snapshot (and Slack's `D` id prefix for a DM opened
+  mid-session), so an unsubscribed DM badges in Mentions and reads as `@person`.
+- **Live events dropped by the allow-list gate are now logged.** A gated-out message was
+  indistinguishable from a delivery bug; `slackr.log` (when `HERDR_PLUGIN_STATE_DIR` is set,
+  which herdr always does) now records each drop with the conversation id, its snapshot kind,
+  and the `dms` flag.
+
+### Changed
+- **`r` now actually refreshes everything.** It previously polled a single 8-request round-robin
+  batch (while the docs claimed a full re-pull); it now polls one batch immediately *and* arms
+  the same paced, request-budgeted sweep the reconnect catch-up uses, so every subscribed
+  conversation gets one watermarked fetch without bursting past the rate budget. The status line
+  shows `refreshing n conversations`.
+
 ## [0.1.6] — 2026-07-18
 
 ### Changed

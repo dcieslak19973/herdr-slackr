@@ -291,7 +291,15 @@ fn event_loop(
                     app.status = format!("open failed: {error}");
                 }
             }
-            KeyCode::Char('r') => app.poll_tick(rest),
+            KeyCode::Char('r') => {
+                // Manual refresh: spend one poll batch right now for immediacy, and arm the
+                // paced catch-up sweep so the rest of the subscription list follows under the
+                // usual request budget (a lone poll_tick only covered the next 8-request
+                // round-robin slice, which on a large subscription list refreshed almost
+                // nothing of what the user was actually asking for).
+                app.request_refresh();
+                app.poll_tick(rest);
+            }
             _ => {}
         }
     }

@@ -564,11 +564,15 @@ impl App {
             SocketEvent::Message(msg) => {
                 if self.admits_live(&msg.conv) {
                     self.upsert_new(msg);
+                } else {
+                    self.log_dropped_live("message", &msg.conv);
                 }
             }
             SocketEvent::Changed(msg) => {
                 if self.admits_live(&msg.conv) {
                     self.upsert_edit(msg);
+                } else {
+                    self.log_dropped_live("edit", &msg.conv);
                 }
             }
             SocketEvent::Deleted { conv, ts } => self.remove(&conv, &ts),
@@ -605,6 +609,20 @@ impl App {
                 .expect("arrival_seq delta always fits usize on any platform this runs on");
             self.pending_new += delta;
         }
+    }
+
+    /// One log line per live event the admission gate rejects (`crate::logln!`, a no-op unless
+    /// `HERDR_PLUGIN_STATE_DIR` is set): the gate is deliberate allow-list behavior, but from
+    /// the outside a gated-out message is indistinguishable from a delivery bug — "I didn't
+    /// see a DM come in" — and this trail is what turns that report into a one-line diagnosis
+    /// (which conversation, what the snapshot thought it was, whether `dms` was on).
+    fn log_dropped_live(&self, what: &str, conv: &str) {
+        let snapshot_kind = self.all_conversations.iter().find(|c| c.id == conv).map(|c| c.kind);
+        crate::logln!(
+            "apply: dropped live {what} on {conv} \
+             (unsubscribed; dms={}, snapshot kind={snapshot_kind:?})",
+            self.dms
+        );
     }
 
     /// Whether a live socket event for `conv` should be applied (see `apply`'s gate and
@@ -763,6 +781,19 @@ impl App {
     /// `catchup_tick` calls while it holds.
     pub fn catchup_due(&self) -> bool {
         self.catchup_remaining > 0
+    }
+
+    /// Arm a full manual refresh (the `r` key): every subscribed conversation gets one
+    /// watermarked fetch, worked off by the same paced, request-budgeted sweep machinery the
+    /// post-reconnect catch-up uses (`catchup_tick`) — so "pull everything now" cannot burst
+    /// past the rate budget no matter how many conversations are subscribed. Never *shrinks*
+    /// an already-armed sweep: re-pressing `r` mid-sweep (or right after a reconnect armed
+    /// one) keeps the larger remaining count rather than restarting the accounting.
+    pub fn request_refresh(&mut self) {
+        self.catchup_remaining = self.catchup_remaining.max(self.conversations.len());
+        // Immediate feedback on the keypress: with everything caught up a refresh produces no
+        // visible row changes at all, which reads as a dead key without this.
+        self.status = format!("refreshing {} conversations", self.catchup_remaining);
     }
 
     /// Work off one `POLL_BATCH`-request batch of the post-reconnect catch-up sweep (see
@@ -1857,9 +1888,25 @@ impl App {
 
     // ---- Row/label rendering helpers ------------------------------------------------------
 
+    /// The conversation kind for rendering and mention decisions: the subscribed table first,
+    /// then the workspace snapshot (an out-of-cap DM lives only there — `admits_live` lets its
+    /// messages in, so downstream must classify them as the DMs they are), then Slack's `D` id
+    /// prefix (a DM opened mid-session, present in no table at all), defaulting to `Channel`.
+    /// Without the fallbacks, an out-of-cap DM's messages rendered as `#<raw id>` and never
+    /// tripped the Mentions tab's every-DM-is-a-mention rule — invisible in exactly the two
+    /// places a user looks for a DM.
+    fn conv_kind_of(&self, conv: &str) -> ConvKind {
+        if let Some(kind) = self.conv_kinds.get(conv) {
+            return *kind;
+        }
+        if let Some(c) = self.all_conversations.iter().find(|c| c.id == conv) {
+            return c.kind;
+        }
+        if conv.starts_with('D') { ConvKind::Im } else { ConvKind::Channel }
+    }
+
     fn is_mention_stored(&self, s: &Stored) -> bool {
-        let kind = self.conv_kinds.get(&s.msg.conv).copied().unwrap_or(ConvKind::Channel);
-        is_mention(&s.msg, kind, &self.self_id, &self.keywords)
+        is_mention(&s.msg, self.conv_kind_of(&s.msg.conv), &self.self_id, &self.keywords)
     }
 
     fn message_row(&self, msg: &Message) -> Row {
@@ -1920,8 +1967,16 @@ impl App {
     }
 
     fn conv_label(&self, conv_id: &str) -> String {
-        let kind = self.conv_kinds.get(conv_id).copied().unwrap_or(ConvKind::Channel);
-        let name = self.conv_names.get(conv_id).cloned().unwrap_or_else(|| conv_id.to_string());
+        let kind = self.conv_kind_of(conv_id);
+        let name = self.conv_names.get(conv_id).cloned().unwrap_or_else(|| {
+            // Not subscribed, so no resolved name; the snapshot's own `name` is the next-best
+            // source — for an IM that's the counterpart's user id (`rest::parse_conversations`),
+            // resolved through the user directory so an out-of-cap DM reads as the person.
+            self.all_conversations.iter().find(|c| c.id == conv_id).map_or_else(
+                || conv_id.to_string(),
+                |c| self.user_names.get(&c.name).cloned().unwrap_or_else(|| c.name.clone()),
+            )
+        });
         match kind {
             ConvKind::Im => format!("@{name}"),
             ConvKind::Channel | ConvKind::Group | ConvKind::Mpim => format!("#{name}"),
@@ -3044,6 +3099,74 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- manual refresh (`r`): arms the same paced, request-budgeted sweep the reconnect
+    // catch-up uses, so "pull everything now" is rate-limit-safe by construction. ------------
+
+    #[test]
+    fn request_refresh_arms_a_full_sweep_over_every_subscribed_conversation() {
+        let mut app = empty_app();
+        app.request_refresh();
+        assert!(app.catchup_due());
+        assert_eq!(app.catchup_remaining, 2, "one sweep slot per subscribed conversation");
+        assert_eq!(app.status, "refreshing 2 conversations", "the keypress must be visible");
+    }
+
+    #[test]
+    fn request_refresh_never_shrinks_an_already_armed_sweep() {
+        let mut app = empty_app();
+        app.catchup_remaining = 5; // mid-sweep (e.g. right after a reconnect)
+        app.request_refresh();
+        assert_eq!(app.catchup_remaining, 5, "re-arming must not lose in-flight sweep progress");
+    }
+
+    // ---- out-of-cap DM visibility: a live message on a DM outside the subscribed set is
+    // admitted to the Feed (`admits_live`), so everything downstream must treat it as the DM
+    // it is — the Mentions tab's every-DM-is-a-mention rule and the `@name` label both used to
+    // consult only the subscribed-conversation tables, defaulting to "channel"/raw-id and
+    // silently breaking the README's "shows up in the Feed/Mentions tabs immediately" promise.
+
+    #[test]
+    fn an_out_of_cap_dm_message_still_counts_as_an_unread_mention() {
+        let mut app = empty_app();
+        // D9 is in the workspace snapshot as an IM but NOT subscribed (not in conv_kinds).
+        app.all_conversations.push(conv("D9", "U77", ConvKind::Im));
+        app.apply(SocketEvent::Message(msg("D9", "1.0", None, "U77", "hey, got a minute?")));
+        assert_eq!(
+            app.unread_mentions(),
+            1,
+            "a DM is a mention by kind, subscribed or not — the tab badge must show it"
+        );
+    }
+
+    #[test]
+    fn an_out_of_cap_dm_row_is_labeled_with_the_counterparts_name_not_a_raw_id() {
+        let mut app = empty_app();
+        app.all_conversations.push(conv("D9", "U1", ConvKind::Im));
+        app.add_user("U1", "dan");
+        app.apply(SocketEvent::Message(msg("D9", "1.0", None, "U1", "hello")));
+        app.touch();
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].conv_label, "@dan",
+            "an unsubscribed DM must read as the person, not as `#D9`"
+        );
+    }
+
+    #[test]
+    fn a_never_seen_dm_with_no_snapshot_entry_still_gets_the_dm_label_prefix() {
+        // A DM opened mid-session: admitted by the `D` id prefix, absent from every table —
+        // the label can only be the raw id, but it must at least carry the `@` DM prefix
+        // rather than masquerading as a channel.
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("D0NEW", "1.0", None, "U9", "first contact")));
+        app.touch();
+        let rows = app.feed_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conv_label, "@D0NEW");
+        assert_eq!(app.unread_mentions(), 1, "the D prefix marks it a DM for mentions too");
     }
 
     // ---- threading display (2026-07-18 redesign): quiet enriched markers instead of scattered
