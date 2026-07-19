@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-07-19
+
 ### Added
 - **Silent-socket safety poll.** A Slack app with Socket Mode enabled but no `message.*` event
   subscriptions (easy to hit on a shared corporate app) connects successfully and then delivers
