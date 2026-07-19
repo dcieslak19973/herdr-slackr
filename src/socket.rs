@@ -120,6 +120,17 @@ fn message_from(v: &Value, conv: &str) -> Message {
     let bot_id = v["bot_id"].as_str().filter(|s| !s.is_empty());
     let author = user.or(bot_id).unwrap_or_default().to_string();
     let reply_count = v["reply_count"].as_u64().and_then(|n| u32::try_from(n).ok());
+    // A live message event usually carries no `reactions` (a just-posted message has none, and
+    // Slack doesn't attach them to `message_changed` reliably) — an empty vec here means "not
+    // reported", which `app`'s live upsert rules treat as inherit, never as clear.
+    let reactions = v["reactions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            Some((r["name"].as_str()?.to_string(), u32::try_from(r["count"].as_u64()?).ok()?))
+        })
+        .collect();
     Message {
         conv: conv.to_string(),
         ts: v["ts"].as_str().unwrap_or_default().to_string(),
@@ -128,6 +139,7 @@ fn message_from(v: &Value, conv: &str) -> Message {
         text: v["text"].as_str().unwrap_or_default().to_string(),
         edited: !v["edited"].is_null(),
         reply_count,
+        reactions,
     }
 }
 
@@ -414,6 +426,7 @@ mod tests {
                 text: "hi".into(),
                 edited: false,
                 reply_count: None,
+                reactions: Vec::new(),
             })]
         );
         assert_eq!(ack, Some("x".to_string()));
@@ -484,6 +497,7 @@ mod tests {
                 text: "edited".into(),
                 edited: true,
                 reply_count: None,
+                reactions: Vec::new(),
             })]
         );
         assert_eq!(ack, Some("z".to_string()));

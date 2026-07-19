@@ -45,6 +45,13 @@ pub struct Message {
     /// backfilled/polled thread shows its true count immediately, before any reply has actually
     /// been fetched.
     pub reply_count: Option<u32>,
+    /// The message's reactions as `(shortcode name, count)`, in Slack's own order, from the
+    /// `reactions` array `conversations.history`/`conversations.replies` attach to message
+    /// objects. Empty when the payload carries none — which on a *history-authoritative*
+    /// re-fetch genuinely means "no reactions (anymore)", while on a live socket event it
+    /// means only "this event kind doesn't carry reactions"; see `crate::app`'s upsert merge
+    /// rules for how the two are kept from clobbering each other.
+    pub reactions: Vec<(String, u32)>,
 }
 
 /// Compare two Slack `ts` strings (e.g. `"1752300000.000100"`) numerically, not lexically.

@@ -64,6 +64,11 @@ pub struct Row {
     pub author: String,
     pub time_hhmm: String,
     pub text: String,
+    /// The message's reactions rendered compactly (`👍3 :party-parrot:`, [`reaction_suffix`]),
+    /// empty when there are none. Its own field rather than a text suffix so the renderer can
+    /// mute it — and so a flaky emoji glyph width can only ever misalign what follows it,
+    /// which is nothing.
+    pub reactions: String,
     pub kind: RowKind,
 }
 
@@ -292,6 +297,11 @@ pub struct App {
     /// one global `BTreeMap` with no per-conversation index, the same reason `newest_ts` is
     /// maintained incrementally — see its doc).
     conv_msg_counts: HashMap<String, usize>,
+    /// When each conversation's poll last widened its fetch to the 24h reaction window
+    /// ([`widen_for_reactions`]/[`REACTION_REFRESH_INTERVAL`]) — reactions land on
+    /// already-fetched messages, which the watermark fetch never re-ships, so without a
+    /// periodic widened pass poll-mode reaction counts would freeze at first sight.
+    reaction_refreshed: HashMap<String, Instant>,
     /// Conversations still to visit in the post-reconnect catch-up sweep: Slack Socket Mode
     /// never replays events missed while the connection was down, so `apply`'s `Connected` arm
     /// arms one full sweep (`catchup_after_reconnect`) over every subscribed conversation, each
@@ -431,6 +441,7 @@ impl App {
             dms: config.dms(),
             lookback_days: config.lookback_days(),
             conv_msg_counts: HashMap::new(),
+            reaction_refreshed: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs,
         };
@@ -500,6 +511,7 @@ impl App {
             // the actual clock) would silently exclude.
             lookback_days: 0,
             conv_msg_counts: HashMap::new(),
+            reaction_refreshed: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
         }
@@ -585,7 +597,7 @@ impl App {
                     if matches!(self.conv_kind_of(&msg.conv), ConvKind::Im | ConvKind::Mpim) {
                         crate::logln!("apply: live dm message on {} ts={}", msg.conv, msg.ts);
                     }
-                    self.upsert_new(msg);
+                    self.upsert_live(msg);
                 } else {
                     self.log_dropped_live("message", &msg.conv);
                 }
@@ -1010,7 +1022,8 @@ impl App {
         // Each conversation costs at least one request, so the budget also bounds how many
         // conversations this batch could possibly visit — plan exactly that many.
         let (indices, planned_next) = next_batch(self.poll_cursor, n, request_budget);
-        let cutoff = lookback_cutoff_ts(crate::users_cache::now_secs(), self.lookback_days);
+        let now_secs = crate::users_cache::now_secs();
+        let cutoff = lookback_cutoff_ts(now_secs, self.lookback_days);
 
         let mut spent = 0;
         let mut rate_limited = false;
@@ -1022,10 +1035,27 @@ impl App {
             }
             let conv_id = self.conversations[i].id.clone();
             let conv_name = self.conversations[i].name.clone();
-            let oldest = clamp_oldest(self.newest_ts.get(&conv_id).cloned(), cutoff.clone());
+            // At most once per REACTION_REFRESH_INTERVAL, a conversation's fetch widens from
+            // its watermark to the 24h reaction window (never *narrower* than the watermark —
+            // `older_of`), so reactions landing on already-seen messages get picked up by the
+            // authoritative merge in `upsert_new`. The extra pages a widened fetch costs are
+            // charged to this batch's request budget like any others.
+            let widen = widen_for_reactions(self.reaction_refreshed.get(&conv_id).copied(), now);
+            let watermark = self.newest_ts.get(&conv_id).cloned();
+            let oldest = if widen {
+                clamp_oldest(
+                    Some(older_of(watermark, reaction_window_ts(now_secs))),
+                    cutoff.clone(),
+                )
+            } else {
+                clamp_oldest(watermark, cutoff.clone())
+            };
             match crate::rest::history_counted(rest, &conv_id, 50, oldest.as_deref()) {
                 Ok((msgs, requests)) => {
                     spent += requests;
+                    if widen {
+                        self.reaction_refreshed.insert(conv_id.clone(), now);
+                    }
                     for msg in msgs {
                         self.upsert_new(msg);
                     }
@@ -1309,6 +1339,7 @@ impl App {
                                 latest.as_ref().map(|(a, t)| (a.as_str(), t.as_str())),
                             )
                         },
+                        reactions: String::new(),
                         kind: RowKind::ThreadMarker { replies: count, expanded: false },
                     },
                 ));
@@ -1332,6 +1363,7 @@ impl App {
                         author: String::new(),
                         time_hhmm: String::new(),
                         text: String::new(),
+                        reactions: String::new(),
                         kind: RowKind::Divider,
                     },
                 ));
@@ -1453,6 +1485,7 @@ impl App {
                     author: String::new(),
                     time_hhmm: format_ts(&activity_ts, SystemTime::now()),
                     text: digest_header_text(count, "(thread — root not loaded)"),
+                    reactions: String::new(),
                     kind: RowKind::ThreadHeader,
                 },
             };
@@ -1470,6 +1503,7 @@ impl App {
                         author: String::new(),
                         time_hhmm: String::new(),
                         text: format!("… {shown_from} earlier replies"),
+                        reactions: String::new(),
                         kind: RowKind::ThreadMarker { replies: shown_from, expanded: true },
                     },
                 ));
@@ -1820,11 +1854,20 @@ impl App {
     /// without this guard the poll's `edited: false` copy would silently overwrite the edit.
     /// The original `arrival` is preserved on an edit-through-poll so the unread divider doesn't
     /// jump for a message that isn't actually new.
+    ///
+    /// **Reaction authority:** every caller of this method got its `Message` from a
+    /// `conversations.history`/`conversations.replies` payload (backfill, poll, DM scan,
+    /// thread fetch), where the `reactions` field is the complete current truth — including an
+    /// empty set meaning "no reactions (anymore)". So a re-seen message's stored reactions are
+    /// replaced whenever they differ, in both directions. The *live* socket path routes
+    /// through [`Self::upsert_live`] instead, where an empty set means only "not reported".
     fn upsert_new(&mut self, msg: Message) {
         let key = key_for(&msg.conv, &msg.ts);
         if let Some(stored) = self.messages.get_mut(&key) {
             if msg.edited && msg != stored.msg {
                 stored.msg = msg;
+            } else if msg.reactions != stored.msg.reactions {
+                stored.msg.reactions = msg.reactions;
             }
             return;
         }
@@ -1837,6 +1880,20 @@ impl App {
         self.prune_conv(&conv);
     }
 
+    /// [`Self::upsert_new`] for the live socket path (`apply`'s `Message` arm): identical for
+    /// a genuinely new message, but on a duplicate an *empty* incoming reaction set is treated
+    /// as "not reported" (live message events don't carry reactions) rather than authoritative
+    /// removal — a redelivered event must never strip counts a history fetch established.
+    fn upsert_live(&mut self, mut msg: Message) {
+        let key = key_for(&msg.conv, &msg.ts);
+        if msg.reactions.is_empty()
+            && let Some(stored) = self.messages.get(&key)
+        {
+            msg.reactions.clone_from(&stored.msg.reactions);
+        }
+        self.upsert_new(msg);
+    }
+
     /// Replace an edited message's fields in place; if it was never seen before (e.g. its
     /// original arrival predates this session), insert it fresh instead of dropping the edit.
     /// That insert-fresh path deliberately assigns a brand-new `arrival_seq` (rather than, say,
@@ -1847,7 +1904,12 @@ impl App {
             // A live `message_changed` event's payload never carries `reply_count` (see
             // `socket::message_from`), so an incoming `None` here means "field not reported",
             // not "no replies" — inherit whatever was already known rather than clobbering it.
+            // Reactions get the same treatment: an edit event without them must not strip the
+            // counts a history fetch established.
             msg.reply_count = msg.reply_count.or(stored.msg.reply_count);
+            if msg.reactions.is_empty() {
+                msg.reactions.clone_from(&stored.msg.reactions);
+            }
             stored.msg = msg;
         } else {
             self.arrival_seq += 1;
@@ -1953,6 +2015,7 @@ impl App {
             author,
             time_hhmm: format_ts(&msg.ts, SystemTime::now()),
             text,
+            reactions: reaction_suffix(&msg.reactions),
             kind: RowKind::Message,
         }
     }
@@ -2202,6 +2265,57 @@ fn live_event_admitted(
         Some(ConvKind::Channel | ConvKind::Group) => false,
         None => conv.starts_with('D'),
     }
+}
+
+/// How often one conversation's poll may widen its fetch window to the reaction-refresh
+/// horizon ([`reaction_window_ts`]): reactions land on *already-fetched* messages, which an
+/// incremental watermark fetch never re-ships — so without a periodic widened fetch, poll-mode
+/// reaction counts freeze at whatever they were at first sight. Per conversation, at most one
+/// widened fetch per this interval; the extra pages it costs are charged to the same request
+/// budget as everything else, so a busy conversation's widened fetch just makes that batch
+/// cover fewer conversations rather than exceeding the budget.
+const REACTION_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// How far back a widened reaction-refresh fetch reaches: messages older than a day keep
+/// whatever reaction counts they last showed (reacting to day-old messages is rare, and
+/// re-shipping unbounded history to catch it would cost more than it informs).
+const REACTION_WINDOW_SECS: u64 = 86_400;
+
+/// The reaction-refresh horizon as a synthetic Slack `ts`, `now - REACTION_WINDOW_SECS`
+/// (same shape trick as [`lookback_cutoff_ts`]; saturates at the epoch).
+fn reaction_window_ts(now_epoch_secs: u64) -> String {
+    format!("{}.000000", now_epoch_secs.saturating_sub(REACTION_WINDOW_SECS))
+}
+
+/// Whether this visit of a conversation should widen its fetch to the reaction window:
+/// never refreshed, or last refreshed at least [`REACTION_REFRESH_INTERVAL`] ago.
+fn widen_for_reactions(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= REACTION_REFRESH_INTERVAL)
+}
+
+/// The chronologically *older* of the conversation's watermark and the reaction window — a
+/// widened fetch's `oldest` must reach back to the window for reaction updates, but never
+/// past-skip a quiet conversation whose watermark predates the window (its unseen messages
+/// live between the watermark and the window edge).
+fn older_of(watermark: Option<String>, window: String) -> String {
+    match watermark {
+        Some(w) if ts_cmp(&w, &window) == std::cmp::Ordering::Less => w,
+        _ => window,
+    }
+}
+
+/// Render `(name, count)` reactions compactly: the emoji (or `:name:` fallback —
+/// [`crate::emoji::render_name`]) with its count appended when above one, space-separated in
+/// Slack's own order. Empty input renders empty.
+fn reaction_suffix(reactions: &[(String, u32)]) -> String {
+    reactions
+        .iter()
+        .map(|(name, count)| {
+            let glyph = crate::emoji::render_name(name);
+            if *count > 1 { format!("{glyph}{count}") } else { glyph }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The look-back horizon as a synthetic Slack `ts` (`<secs>.000000`, same shape trick as
@@ -2472,12 +2586,13 @@ fn resolve_im_names(
 mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
-        RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision, budget_exhausted,
-        capped_sleep_secs, catchup_after_reconnect, clamp_oldest, cooldown_active,
-        digest_header_text, dm_scan_due, expand_status, format_ts, key_for, live_event_admitted,
-        lookback_cutoff_ts, marker_count, marker_text, next_batch, pick_changed_dm,
-        poll_error_status, reply_rail, resolve_im_names, resume_cursor, thread_slot_count,
-        track_newest, updated_ms_to_ts,
+        REACTION_REFRESH_INTERVAL, RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision,
+        budget_exhausted, capped_sleep_secs, catchup_after_reconnect, clamp_oldest,
+        cooldown_active, digest_header_text, dm_scan_due, expand_status, format_ts, key_for,
+        live_event_admitted, lookback_cutoff_ts, marker_count, marker_text, next_batch, older_of,
+        pick_changed_dm, poll_error_status, reaction_suffix, reaction_window_ts, reply_rail,
+        resolve_im_names, resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
+        widen_for_reactions,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -2499,6 +2614,7 @@ mod tests {
             text: text.into(),
             edited: false,
             reply_count: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -2548,6 +2664,7 @@ mod tests {
             // the actual clock) would silently exclude.
             lookback_days: 0,
             conv_msg_counts: HashMap::new(),
+            reaction_refreshed: HashMap::new(),
             catchup_remaining: 0,
             dm_allow_convs: HashSet::new(),
         }
@@ -3131,6 +3248,107 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    // ---- reactions: rendering, merge authority, and the 24h polling refresh window ----------
+
+    #[test]
+    fn reaction_suffix_renders_emoji_counts_compactly() {
+        let reactions =
+            vec![("+1".to_string(), 3), ("party-parrot".to_string(), 1), ("tada".to_string(), 2)];
+        assert_eq!(reaction_suffix(&reactions), "👍3 :party-parrot: 🎉2");
+        assert_eq!(reaction_suffix(&[]), "");
+    }
+
+    #[test]
+    fn a_messages_reactions_render_as_a_suffix_on_its_row() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(Message {
+            reactions: vec![("+1".to_string(), 3)],
+            ..msg("C1", "1.0", None, "U1", "ship it")
+        }));
+        app.touch();
+        let rows = app.feed_rows();
+        assert_eq!(rows[0].reactions, "👍3");
+        assert_eq!(rows[0].text, "ship it", "reactions live in their own field, not the text");
+    }
+
+    #[test]
+    fn a_history_refetch_is_authoritative_for_reactions_including_removal() {
+        let mut app = empty_app();
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "ship it")));
+        // Poll/backfill/replies all route through upsert_new — history-authoritative: a
+        // re-shipped message's reactions replace what's stored, in both directions.
+        app.upsert_new(Message {
+            reactions: vec![("+1".to_string(), 2)],
+            ..msg("C1", "1.0", None, "U1", "ship it")
+        });
+        app.touch();
+        assert_eq!(app.feed_rows()[0].reactions, "👍2");
+        app.upsert_new(msg("C1", "1.0", None, "U1", "ship it"));
+        assert_eq!(app.feed_rows()[0].reactions, "", "an authoritative empty set clears");
+    }
+
+    #[test]
+    fn a_live_duplicate_without_reactions_never_clears_stored_ones() {
+        let mut app = empty_app();
+        app.upsert_new(Message {
+            reactions: vec![("+1".to_string(), 2)],
+            ..msg("C1", "1.0", None, "U1", "ship it")
+        });
+        // The live socket path: a redelivered/duplicate event carries no reactions field —
+        // that means "not reported", never "removed".
+        app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "ship it")));
+        app.touch();
+        assert_eq!(app.feed_rows()[0].reactions, "👍2");
+    }
+
+    #[test]
+    fn a_live_edit_without_reactions_inherits_the_stored_ones() {
+        let mut app = empty_app();
+        app.upsert_new(Message {
+            reactions: vec![("+1".to_string(), 2)],
+            ..msg("C1", "1.0", None, "U1", "original")
+        });
+        app.apply(SocketEvent::Changed(Message {
+            edited: true,
+            ..msg("C1", "1.0", None, "U1", "edited text")
+        }));
+        app.touch();
+        let rows = app.feed_rows();
+        assert_eq!(rows[0].text, "edited text");
+        assert_eq!(rows[0].reactions, "👍2", "an edit event must not strip reactions");
+    }
+
+    #[test]
+    fn widen_for_reactions_is_due_at_most_once_per_interval() {
+        let now = Instant::now();
+        assert!(widen_for_reactions(None, now), "a never-refreshed conversation is due");
+        assert!(!widen_for_reactions(
+            Some(now),
+            now + (REACTION_REFRESH_INTERVAL - Duration::from_secs(1))
+        ));
+        assert!(widen_for_reactions(Some(now), now + REACTION_REFRESH_INTERVAL));
+    }
+
+    #[test]
+    fn older_of_takes_the_watermark_when_it_predates_the_reaction_window() {
+        // Watermark newer than the 24h window: widen to the window (re-ship the last day).
+        assert_eq!(
+            older_of(Some("200.000000".to_string()), "100.000000".to_string()),
+            "100.000000"
+        );
+        // Watermark *older* (a quiet conversation): keep it, or unseen messages between the
+        // watermark and the window edge would be skipped forever.
+        assert_eq!(older_of(Some("50.000000".to_string()), "100.000000".to_string()), "50.000000");
+        // No watermark yet: the window alone bounds the fetch.
+        assert_eq!(older_of(None, "100.000000".to_string()), "100.000000");
+    }
+
+    #[test]
+    fn reaction_window_ts_reaches_back_one_day() {
+        assert_eq!(reaction_window_ts(1_752_300_000), "1752213600.000000"); // −86 400s
+        assert_eq!(reaction_window_ts(100), "0.000000"); // saturates, never underflows
     }
 
     // ---- silent-socket safety poll support: the event loop compares arrival counts around a

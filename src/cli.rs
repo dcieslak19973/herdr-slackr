@@ -626,6 +626,7 @@ mod tests {
             text: text.to_string(),
             edited: false,
             reply_count: None,
+            reactions: Vec::new(),
         }
     }
 

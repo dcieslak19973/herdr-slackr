@@ -494,7 +494,23 @@ fn parse_messages(v: &Value, conv: &str) -> Vec<Message> {
                 text: m["text"].as_str().unwrap_or_default().to_string(),
                 edited: !m["edited"].is_null(),
                 reply_count,
+                reactions: parse_reactions(m),
             }
+        })
+        .collect()
+}
+
+/// A message object's `reactions[]` as `(name, count)` pairs, in Slack's own order; an entry
+/// missing its name or count is skipped rather than fabricated.
+fn parse_reactions(m: &Value) -> Vec<(String, u32)> {
+    m["reactions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let name = r["name"].as_str()?.to_string();
+            let count = u32::try_from(r["count"].as_u64()?).ok()?;
+            Some((name, count))
         })
         .collect()
 }
@@ -924,6 +940,23 @@ mod tests {
         let msgs = parse_messages(&v, "C1");
         assert_eq!(msgs[0].reply_count, Some(3));
         assert_eq!(msgs[1].reply_count, None);
+    }
+
+    #[test]
+    fn parse_messages_reads_reactions_as_name_count_pairs_in_slack_order() {
+        let v = serde_json::json!({
+            "messages": [
+                {"ts": "1.1", "user": "U1", "text": "ship it",
+                 "reactions": [
+                     {"name": "+1", "count": 3, "users": ["U2", "U3", "U4"]},
+                     {"name": "party-parrot", "count": 1, "users": ["U5"]}
+                 ]},
+                {"ts": "1.2", "user": "U1", "text": "no reactions"}
+            ]
+        });
+        let msgs = parse_messages(&v, "C1");
+        assert_eq!(msgs[0].reactions, vec![("+1".to_string(), 3), ("party-parrot".to_string(), 1)]);
+        assert!(msgs[1].reactions.is_empty());
     }
 
     #[test]
