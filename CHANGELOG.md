@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **A confirmed-lossy socket now escalates to fallback-cadence polling** (spec F17). The 0.1.9
+  safety poll diagnosed a connected-but-undelivering socket but kept its 5-minute cadence —
+  one 8-request batch per 5 minutes round-robins a typical subscription list every ~20
+  minutes, a diagnosis rather than a usable feed. The first safety poll that finds
+  socket-missed messages now switches to the ordinary `poll_fallback_secs` rhythm (default
+  30s, jittered — the same request cost as a socket-down outage) until a live event actually
+  arrives and proves the socket healed. Escalation and recovery both log to `slackr.log`.
+
 ## [0.1.9] — 2026-07-19
 
 ### Added

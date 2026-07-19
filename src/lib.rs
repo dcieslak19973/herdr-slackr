@@ -185,6 +185,10 @@ fn event_loop(
     // Seeded to "now" rather than an already-elapsed instant: startup backfill just covered
     // everything, so the first safety poll is earned only after a genuinely silent interval.
     let mut last_live_event = Instant::now();
+    // Set once a safety poll finds messages the socket should have delivered; cleared by the
+    // next live event. While set, safety polling runs at fallback cadence instead of the slow
+    // five-minute diagnostic cadence — see the safety-poll block below.
+    let mut socket_lossy = false;
 
     loop {
         while let Ok(ev) = rx.try_recv() {
@@ -198,6 +202,12 @@ fn event_loop(
             dirty = true;
             if is_live_message {
                 last_live_event = Instant::now();
+                if socket_lossy {
+                    // The socket proved itself again — drop back to the slow 5-minute
+                    // safety cadence rather than keeping fallback-speed polling forever.
+                    socket_lossy = false;
+                    crate::logln!("safety poll: live events resumed — degraded polling ends");
+                }
             }
             if went_down {
                 down_since.get_or_insert_with(Instant::now);
@@ -214,14 +224,23 @@ fn event_loop(
         // live event, spend one ordinary poll batch as a safety net; if it finds messages the
         // socket should have delivered, say so — that one status line is the difference
         // between "quiet afternoon" and "misconfigured app" from the user's chair.
+        //
+        // Once a safety poll has *proved* the socket lossy, one batch per five minutes is a
+        // miserable cadence to live behind (a given conversation would refresh every
+        // ~20 minutes on a typical subscription list) — so `socket_lossy` escalates the
+        // cadence to the ordinary `poll_fallback_secs` rhythm, exactly what a socket-down
+        // outage costs, until a live event actually arrives and proves the socket healed.
         if !app.polling
             && last_live_event.elapsed() >= SILENT_SOCKET_POLL
-            && last_poll_tick.elapsed() >= SILENT_SOCKET_POLL
+            && last_poll_tick.elapsed()
+                >= if socket_lossy { next_poll_gap } else { SILENT_SOCKET_POLL }
         {
-            crate::logln!(
-                "safety poll: socket connected but no live events for {}s",
-                SILENT_SOCKET_POLL.as_secs()
-            );
+            if !socket_lossy {
+                crate::logln!(
+                    "safety poll: socket connected but no live events for {}s",
+                    SILENT_SOCKET_POLL.as_secs()
+                );
+            }
             let before = app.arrival_count();
             app.poll_tick(rest);
             if app.arrival_count() > before {
@@ -232,8 +251,17 @@ fn event_loop(
                     "safety poll: found {} messages the socket never delivered",
                     app.arrival_count() - before
                 );
+                if !socket_lossy {
+                    socket_lossy = true;
+                    crate::logln!(
+                        "safety poll: socket confirmed lossy — polling every ~{}s until live \
+                         events resume",
+                        poll_fallback_secs
+                    );
+                }
             }
             last_poll_tick = Instant::now();
+            next_poll_gap = jittered(poll_fallback);
             dirty = true;
         }
 
