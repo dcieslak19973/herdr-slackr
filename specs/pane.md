@@ -143,7 +143,7 @@ and symmetrically `f` pressed while in `Threads` lands on `Focus` directly.
 | `t`                   | Feed tab only: toggle between the Timeline and the Threads-only view (see below) |
 | `f`                   | Feed tab only: toggle into/out of the Focus view (see above) — mutually exclusive with `t`'s Threads toggle |
 | `o`                   | open the selected row's Slack permalink (`chat.getPermalink`) in the browser |
-| `r`                   | manual refresh: re-pull the last 50 messages of every subscribed conversation |
+| `r`                   | manual refresh: one immediate poll batch, plus arming the paced catch-up sweep (`App::request_refresh`) so every subscribed conversation gets one watermarked fetch under the normal request budget; re-pressing mid-sweep never shrinks the remaining count; sets a `refreshing n conversations` status |
 | `q`                   | quit the pane                                                     |
 
 `viewport_rows` is set once per draw from the body area's measured height (`App::set_viewport_rows`, fed by `ui::body_rows`), so a page move is always sized off the pane's actual on-screen row count, including right after a terminal resize.
