@@ -185,9 +185,12 @@ fn row_line(palette: &Palette, row: &Row, width: usize, selected: bool) -> Line<
     Line::from(spans)
 }
 
-/// The `#chan  @author  HH:MM  text` header, as separately colored spans (see `row_line`'s doc).
+/// The `#chan  @author  HH:MM  text` header, as separately colored spans (see `row_line`'s
+/// doc), plus — when the row carries any — a trailing muted reactions span (`👍3 :parrot:`);
+/// muted so counts inform without competing with the text, and last on the line so a flaky
+/// emoji glyph width can only misalign what follows it, which is nothing.
 fn header_spans(palette: &Palette, row: &Row, bg: Option<Color>) -> Vec<Span<'static>> {
-    vec![
+    let mut spans = vec![
         Span::styled(row.conv_label.clone(), cell_style(palette.lavender, bg)),
         Span::styled("  ", cell_style(palette.text, bg)),
         Span::styled(format!("@{}", row.author), cell_style(palette.green, bg)),
@@ -195,7 +198,11 @@ fn header_spans(palette: &Palette, row: &Row, bg: Option<Color>) -> Vec<Span<'st
         Span::styled(row.time_hhmm.clone(), cell_style(palette.overlay1, bg)),
         Span::styled("  ", cell_style(palette.text, bg)),
         Span::styled(row.text.clone(), cell_style(palette.text, bg)),
-    ]
+    ];
+    if !row.reactions.is_empty() {
+        spans.push(Span::styled(format!("  {}", row.reactions), cell_style(palette.overlay1, bg)));
+    }
+    spans
 }
 
 /// `fg` plus the selected row's cursor-fill `bg`, if any — the one-liner every `row_line` span

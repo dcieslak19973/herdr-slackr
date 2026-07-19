@@ -30,7 +30,7 @@ Row shapes, identical structure across both tabs:
 
 | kind          | rendered as                                                     |
 | -------------- | ------------------------------------------------------------------|
-| message       | `#chan  @author  HH:MM  text` (`@chan` prefix for a DM)          |
+| message       | `#chan  @author  HH:MM  text  👍3 :parrot:` — reactions, when any, as a trailing muted suffix (`(name, count)` pairs in Slack's order; count omitted at 1; common shortcodes render as Unicode via the vendored `emoji` table, custom/unknown ones as `:name:`, skin-tone suffixes stripped). Last on the line so a flaky emoji glyph width can only misalign what follows it — nothing. Applies to message, reply, mention, and thread-header rows alike. |
 | thread marker | `#chan  ↳ n replies · @author: <latest reply text>` — a collapsed thread's one-row summary: count first (fixed position, clip-safe at any width), then the latest locally-known reply's resolved author and text; just `↳ n replies` when no reply is stored yet. Replaces the old scattered per-reply activity rows entirely (see P2a). |
 | reply (rail)  | `├─  @author  HH:MM  text` — a reply beneath its root (Timeline expanded, Threads view), its conv label swapped for a tree-connector rail (`└─` on the thread's last reply) space-padded to the root row's label width so author/time/text columns align with the root's |
 | thread header | the Threads view's per-thread anchor: `#chan  @author  <last-activity time>  n replies · <root text>`, all spans bold — the time column is the thread's *latest activity* (the view's sort key), not the root's own age |

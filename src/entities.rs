@@ -128,6 +128,7 @@ mod tests {
             text: text.into(),
             edited: false,
             reply_count: None,
+            reactions: Vec::new(),
         }
     }
 

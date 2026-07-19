@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Reactions.** Messages now show their reactions as a trailing muted suffix — `👍3
+  :party-parrot:` — on Feed, thread, mention, and digest rows alike. Common shortcodes render
+  as Unicode via a small vendored table (no emoji crate; skin-tone suffixes stripped); custom
+  workspace emoji, which have no Unicode form a terminal could show, render as `:name:`.
+  Because reactions land on *already-fetched* messages that watermark polling never re-ships,
+  each conversation's poll widens its window to the last 24 hours at most once per 15 minutes
+  (spec F18) and merges the re-shipped messages' reaction counts authoritatively — so
+  poll-only mode keeps counts on recent messages fresh instead of frozen at first sight. Live
+  socket events never clear counts they don't carry.
+
 ## [0.1.11] — 2026-07-19
 
 ### Changed

@@ -50,6 +50,7 @@ fn msg(conv: &str, ts: &str, thread_ts: Option<&str>, author: &str, text: &str) 
         text: text.into(),
         edited: false,
         reply_count: None,
+        reactions: Vec::new(),
     }
 }
 
@@ -446,6 +447,37 @@ fn mentions_tab_status_has_no_t_hint() {
     app.set_tab(Tab::Mentions);
     let out = render_ready(&app);
     assert!(!out.to_lowercase().contains("t: threads"), "{out}");
+}
+
+// ---- reactions render as a muted suffix after the message text -------------------------------
+
+#[test]
+fn reactions_render_after_the_text_in_the_muted_overlay_tone() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(Message {
+        reactions: vec![("+1".to_string(), 3), ("party-parrot".to_string(), 1)],
+        ..msg("C1", "1.0", None, "U1", "ship it")
+    }));
+    app.touch();
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(&app))).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let out = render_ready(&app);
+    assert!(out.contains("ship it"), "{out}");
+    // The 👍 is double-width, so the buffer dump shows a continuation-cell space between the
+    // glyph and its count — assert the pieces, not the exact byte sequence.
+    assert!(out.contains("👍"), "{out}");
+    assert!(out.contains("3 :party-parrot:"), "{out}");
+    assert_eq!(
+        fg_at(buffer, ":party-parrot:"),
+        palette.overlay1,
+        "reactions are muted, not text-colored"
+    );
 }
 
 // ---- poll-only footer marker: a permanent mode is a compact marker, not a status sentence ----

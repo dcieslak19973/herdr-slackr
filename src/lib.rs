@@ -9,6 +9,7 @@ pub mod app;
 pub mod browser;
 pub mod cli;
 pub mod config;
+pub mod emoji;
 pub mod entities;
 #[macro_use]
 pub mod log;
