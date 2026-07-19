@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-07-19
+
 ### Changed
 - **Compact footer.** Poll-only mode announced itself with a permanent status sentence
   (`poll-only mode — no app token, live socket disabled · polling · …`) that crowded the key
