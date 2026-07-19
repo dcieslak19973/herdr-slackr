@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-07-19
+
 ### Added
 - **Poll-only mode: the `xapp-` app token is now optional.** Omitting it (no env var, no
   `app_token` key) starts the pane with no Socket Mode connection: the request-budgeted polling
