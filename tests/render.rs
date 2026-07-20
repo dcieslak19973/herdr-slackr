@@ -449,6 +449,74 @@ fn mentions_tab_status_has_no_t_hint() {
     assert!(!out.to_lowercase().contains("t: threads"), "{out}");
 }
 
+// ---- long messages wrap with continuation lines indented to the text column ------------------
+
+#[test]
+fn a_long_message_wraps_instead_of_clipping() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg(
+        "C1",
+        "1.0",
+        None,
+        "U1",
+        "the quarterly deploy window opens tomorrow at nine and closes at noon sharp",
+    )));
+    app.touch();
+
+    // 48 columns: far too narrow for that text on one line.
+    let mut terminal = Terminal::new(TestBackend::new(48, 20)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(&app))).unwrap();
+    let out = format!("{:?}", terminal.backend().buffer()).replace("\",", "\n");
+
+    assert!(out.contains("noon sharp"), "the tail must be visible, not clipped:\n{out}");
+    // The continuation line carries no header — it starts with the indent, not `#eng`.
+    assert_eq!(out.matches("#eng").count(), 1, "one header for the whole wrapped message:\n{out}");
+}
+
+#[test]
+fn an_explicit_newline_in_a_message_renders_as_a_line_break() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    app.apply(SocketEvent::Message(msg("C1", "1.0", None, "U1", "first paragraph\nsecond one")));
+    app.touch();
+
+    let out = render_ready(&app);
+    assert!(out.contains("first paragraph"), "{out}");
+    assert!(out.contains("second one"), "{out}");
+    let first_line = out.lines().find(|l| l.contains("first paragraph")).unwrap();
+    assert!(
+        !first_line.contains("second one"),
+        "the newline must break the line, not flatten into a space:\n{out}"
+    );
+}
+
+#[test]
+fn the_cursor_row_stays_fully_visible_when_earlier_rows_wrap_tall() {
+    let mut app = App::empty("SELF");
+    app.add_conversation("C1", "eng", ConvKind::Channel);
+    app.add_user("U1", "dan");
+    let long = "word ".repeat(60);
+    for ts in ["1.0", "2.0", "3.0"] {
+        app.apply(SocketEvent::Message(msg("C1", ts, None, "U1", long.trim())));
+    }
+    app.apply(SocketEvent::Message(msg("C1", "4.0", None, "U1", "the newest message")));
+    app.touch();
+    app.jump_newest();
+
+    let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+    let palette = herdr_slackr::theme::resolve(Some("catppuccin"));
+    terminal.draw(|f| ui::render(f, &palette, &PaneState::Ready(&app))).unwrap();
+    let out = format!("{:?}", terminal.backend().buffer()).replace("\",", "\n");
+    assert!(
+        out.contains("the newest message"),
+        "the selected bottom row must be scrolled into view past the wrapped rows:\n{out}"
+    );
+}
+
 // ---- reactions render as a muted suffix after the message text -------------------------------
 
 #[test]
