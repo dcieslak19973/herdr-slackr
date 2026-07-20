@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.13] — 2026-07-20
+
 ### Changed
 - **Long messages wrap instead of clipping.** Message, reply, and mention rows now wrap at the
   pane width with continuation lines indented to the text column, chat-style — and explicit
