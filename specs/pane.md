@@ -26,6 +26,15 @@ One frame, three regions, always: a one-line tab bar, the active tab's row list,
 | row list   | the active tab's rows, cursor row highlighted                                  |
 | status bar | one-line notice (socket down, rate limit, theme warning); empty when nothing to say |
 
+Message-family rows (message, reply, mention) **wrap**: text longer than the pane width breaks
+at word boundaries (display-width-measured, so wide glyphs count double; a single over-wide
+word breaks mid-word) onto continuation lines indented to the text column, and an explicit
+newline in the message text is a forced break — a multi-paragraph Slack message renders as its
+paragraphs. Summary rows (thread marker, digest header, overflow, divider) stay one clipped
+line by design: their text is a preview, not the content. Cursor/scroll math tracks rows in
+*display lines* (`ui::scroll_offset_lines`): the selected row is always fully visible, or
+pinned to its first line when taller than the viewport.
+
 Row shapes, identical structure across both tabs:
 
 | kind          | rendered as                                                     |

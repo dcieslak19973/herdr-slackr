@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Long messages wrap instead of clipping.** Message, reply, and mention rows now wrap at the
+  pane width with continuation lines indented to the text column, chat-style — and explicit
+  newlines in a message render as real line breaks instead of being flattened. Width is
+  measured per display column (wide glyphs count double), a single over-wide word breaks
+  mid-word, and a pane too narrow for the indented column falls back to full-width
+  continuations. Scrolling now tracks display lines: the selected row is always fully visible
+  (pinned to its first line if taller than the viewport). Summary rows — thread markers,
+  digest headers, the overflow line — deliberately stay one line: they are previews, and the
+  full content is one Enter away.
+
 ## [0.1.12] — 2026-07-19
 
 ### Added

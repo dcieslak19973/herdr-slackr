@@ -94,12 +94,14 @@ fn render_body(frame: &mut Frame, palette: &Palette, app: &App, area: Rect) {
         Tab::Mentions => app.mention_rows(),
     };
     let width = area.width as usize;
-    let lines: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| row_line(palette, row, width, i == app.cursor))
-        .collect();
-    let offset = scroll_offset(lines.len(), app.cursor, area.height as usize);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    let mut heights: Vec<usize> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let row_lines = row_lines(palette, row, width, i == app.cursor);
+        heights.push(row_lines.len());
+        lines.extend(row_lines);
+    }
+    let offset = scroll_offset_lines(&heights, app.cursor, area.height as usize);
     #[allow(clippy::cast_possible_truncation)]
     let offset = offset as u16;
     frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), area);
@@ -124,20 +126,152 @@ fn render_new_arrivals_indicator(frame: &mut Frame, palette: &Palette, area: Rec
     frame.render_widget(p, overlay);
 }
 
-/// The first visible row for a `height`-row-tall viewport that keeps `cursor` on-screen among
-/// `total` rows: the window stays pinned at the top (`0`) until `cursor` would fall below it,
-/// then follows `cursor` exactly (so `cursor` sits on the viewport's last visible row), capped
-/// so it never scrolls past the point that shows the final `height` rows. `render_body` never
-/// wraps a row across multiple terminal lines (each `Row` is exactly one `Line`), so this
-/// row-count arithmetic is exactly the terminal-line arithmetic `Paragraph::scroll` needs — no
-/// per-row display-height accounting required.
-fn scroll_offset(total: usize, cursor: usize, height: usize) -> usize {
-    if height == 0 || total <= height {
+/// The first visible *display line* for a `viewport`-line-tall body, given each row's wrapped
+/// line count (`heights`, one entry per row) and the cursor's row index: the window stays
+/// pinned at the top until the cursor row's last line would fall below it, then scrolls just
+/// enough that the whole cursor row is visible — or, for a row taller than the viewport
+/// itself, pins to the row's first line (its opening is the part worth showing). Capped so it
+/// never scrolls past the final screenful. With every height at `1` this reduces exactly to
+/// the old one-row-per-line arithmetic.
+fn scroll_offset_lines(heights: &[usize], cursor: usize, viewport: usize) -> usize {
+    if viewport == 0 || heights.is_empty() {
         return 0;
     }
-    let cursor = cursor.min(total - 1);
-    let wants = (cursor + 1).saturating_sub(height);
-    wants.min(total - height)
+    let total: usize = heights.iter().sum();
+    if total <= viewport {
+        return 0;
+    }
+    let cursor = cursor.min(heights.len() - 1);
+    let first: usize = heights[..cursor].iter().sum();
+    let end = first + heights[cursor];
+    let wants = end.saturating_sub(viewport).min(first);
+    wants.min(total - viewport)
+}
+
+/// Greedy display-width word wrap into lines of at most `avail` columns (measured with
+/// `unicode-width`, so a double-width emoji or CJK glyph counts as two): words move whole to
+/// the next line when they'd overflow, a single word wider than `avail` breaks mid-word at
+/// the column limit, and an explicit `\n` in the text is a forced break (Slack messages are
+/// routinely multi-paragraph; flattening their newlines into spaces would garble them).
+/// Always returns at least one (possibly empty) line.
+fn wrap_text(text: &str, avail: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let avail = avail.max(1);
+    let mut lines = Vec::new();
+    for segment in text.split('\n') {
+        let mut cur = String::new();
+        let mut cur_w = 0usize;
+        for word in segment.split_whitespace() {
+            let word_w = word.width();
+            let sep = usize::from(!cur.is_empty());
+            if cur_w + sep + word_w <= avail {
+                if sep == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+                cur_w += sep + word_w;
+            } else if word_w <= avail {
+                lines.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+                cur_w = word_w;
+            } else {
+                if !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                }
+                let mut piece_w = 0usize;
+                for ch in word.chars() {
+                    let ch_w = ch.width().unwrap_or(0);
+                    if piece_w + ch_w > avail && !cur.is_empty() {
+                        lines.push(std::mem::take(&mut cur));
+                        piece_w = 0;
+                    }
+                    cur.push(ch);
+                    piece_w += ch_w;
+                }
+                cur_w = piece_w;
+            }
+        }
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// All display lines for one row. Summary rows — divider, thread marker, digest header — stay
+/// a single clipped line by design (their text is a preview, not the content). Message-family
+/// rows (message, reply rail, mention) wrap their text at the pane width, chat-style:
+/// continuation lines indent to the text column so the message reads as one aligned block,
+/// and explicit newlines in the message are honored as line breaks (see [`wrap_text`]).
+fn row_lines(palette: &Palette, row: &Row, width: usize, selected: bool) -> Vec<Line<'static>> {
+    match row.kind {
+        RowKind::Divider | RowKind::ThreadMarker { .. } | RowKind::ThreadHeader => {
+            vec![row_line(palette, row, width, selected)]
+        }
+        RowKind::Message | RowKind::Reply { .. } | RowKind::Mention { .. } => {
+            wrapped_message_lines(palette, row, width, selected)
+        }
+    }
+}
+
+/// A message-family row wrapped into one-or-more display lines: the usual colored prefix
+/// (mention glyph / conv label or rail / author / time) on the first line, the text wrapped at
+/// the remaining width, continuation lines indented to the text column, and the muted
+/// reactions span trailing the final line. A pane too narrow to afford the indented column
+/// (under ~10 usable text columns) falls back to full-width continuations rather than
+/// wrapping into a sliver.
+fn wrapped_message_lines(
+    palette: &Palette,
+    row: &Row,
+    width: usize,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let bg = selected.then(|| palette.cursor_bg(true));
+    let conv_color = if matches!(row.kind, RowKind::Reply { .. }) {
+        palette.overlay1 // the thread rail is muted — see `row_line`'s Reply arm
+    } else {
+        palette.lavender
+    };
+    let mut prefix: Vec<Span<'static>> = Vec::new();
+    if let RowKind::Mention { read } = row.kind {
+        let marker = if read { "○ " } else { "● " };
+        prefix.push(Span::styled(marker.to_string(), cell_style(palette.text, bg)));
+    }
+    prefix.push(Span::styled(row.conv_label.clone(), cell_style(conv_color, bg)));
+    prefix.push(Span::styled("  ", cell_style(palette.text, bg)));
+    prefix.push(Span::styled(format!("@{}", row.author), cell_style(palette.green, bg)));
+    prefix.push(Span::styled("  ", cell_style(palette.text, bg)));
+    prefix.push(Span::styled(row.time_hhmm.clone(), cell_style(palette.overlay1, bg)));
+    prefix.push(Span::styled("  ", cell_style(palette.text, bg)));
+
+    let indent: usize = prefix.iter().map(|s| s.content.as_ref().width()).sum();
+    let (avail, cont_indent) =
+        if indent + 10 >= width { (width.max(1), 0) } else { (width - indent, indent) };
+    let chunks = wrap_text(&row.text, avail);
+    let last = chunks.len() - 1;
+    let mut lines = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = if i == 0 {
+            let mut spans = prefix.clone();
+            spans.push(Span::styled(chunk, cell_style(palette.text, bg)));
+            spans
+        } else {
+            vec![
+                Span::styled(" ".repeat(cont_indent), cell_style(palette.text, bg)),
+                Span::styled(chunk, cell_style(palette.text, bg)),
+            ]
+        };
+        if i == last && !row.reactions.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", row.reactions),
+                cell_style(palette.overlay1, bg),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// One row as styled spans (spec §4): the conv label (`#chan`/`@dm`) in the palette's
@@ -289,33 +423,70 @@ pub fn nav_title(unread: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{nav_title, scroll_offset};
+    use super::{nav_title, scroll_offset_lines, wrap_text};
 
     #[test]
     fn nav_title_builds_the_osc_0_escape_with_the_unread_count() {
         assert_eq!(nav_title(3), "\x1b]0;slack (3)\x07");
     }
 
+    // ---- wrap_text: greedy display-width word wrap with forced breaks at newlines ----------
+
     #[test]
-    fn scroll_offset_is_zero_when_every_row_already_fits() {
-        assert_eq!(scroll_offset(5, 3, 10), 0);
+    fn wrap_text_returns_one_line_when_it_fits() {
+        assert_eq!(wrap_text("short", 20), vec!["short"]);
+        assert_eq!(wrap_text("", 20), vec![""]);
     }
 
     #[test]
-    fn scroll_offset_stays_pinned_to_the_top_while_the_cursor_fits_in_view() {
-        assert_eq!(scroll_offset(100, 0, 10), 0);
-        assert_eq!(scroll_offset(100, 9, 10), 0);
+    fn wrap_text_wraps_greedily_at_word_boundaries() {
+        assert_eq!(wrap_text("one two three four", 9), vec!["one two", "three", "four"]);
     }
 
     #[test]
-    fn scroll_offset_follows_the_cursor_once_it_would_fall_below_the_viewport() {
-        assert_eq!(scroll_offset(100, 10, 10), 1);
-        assert_eq!(scroll_offset(100, 99, 10), 90);
+    fn wrap_text_breaks_a_word_longer_than_the_width() {
+        assert_eq!(wrap_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
     }
 
     #[test]
-    fn scroll_offset_never_scrolls_past_the_final_screenful() {
-        assert_eq!(scroll_offset(100, 50, 10), 41);
-        assert_eq!(scroll_offset(20, 19, 10), 10);
+    fn wrap_text_measures_display_width_not_char_count() {
+        // 你 is double-width: three of them (display width 6) cannot fit in 5 columns.
+        assert_eq!(wrap_text("你你你", 5), vec!["你你", "你"]);
+    }
+
+    #[test]
+    fn wrap_text_honors_explicit_newlines_as_forced_breaks() {
+        assert_eq!(wrap_text("first line\nsecond", 40), vec!["first line", "second"]);
+        assert_eq!(wrap_text("a\n\nb", 40), vec!["a", "", "b"], "a blank line survives");
+    }
+
+    // ---- scroll_offset_lines: the row-scroll math generalized to variable-height rows -------
+
+    #[test]
+    fn scroll_offset_lines_matches_the_old_row_math_when_every_row_is_one_line() {
+        let h = vec![1; 100];
+        assert_eq!(scroll_offset_lines(&h, 0, 10), 0);
+        assert_eq!(scroll_offset_lines(&h, 9, 10), 0);
+        assert_eq!(scroll_offset_lines(&h, 10, 10), 1);
+        assert_eq!(scroll_offset_lines(&h, 50, 10), 41);
+        assert_eq!(scroll_offset_lines(&h, 99, 10), 90);
+        let short = vec![1; 5];
+        assert_eq!(scroll_offset_lines(&short, 3, 10), 0, "everything fits — no scroll");
+    }
+
+    #[test]
+    fn scroll_offset_lines_keeps_a_wrapped_cursor_row_fully_visible() {
+        // Rows of 1,1,3,1 lines; viewport 4. Cursor on the 3-line row (lines [2,5)):
+        // scrolling to offset 1 shows lines 1..5 — the whole wrapped row.
+        let h = vec![1, 1, 3, 1];
+        assert_eq!(scroll_offset_lines(&h, 2, 4), 1);
+        // Cursor on the last row (lines [5,6)): offset 2 shows lines 2..6.
+        assert_eq!(scroll_offset_lines(&h, 3, 4), 2);
+    }
+
+    #[test]
+    fn scroll_offset_lines_pins_to_the_top_of_a_row_taller_than_the_viewport() {
+        let h = vec![1, 5, 1];
+        assert_eq!(scroll_offset_lines(&h, 1, 3), 1, "show the row's first lines, not its tail");
     }
 }
