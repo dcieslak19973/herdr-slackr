@@ -411,11 +411,10 @@ pub fn body_rows(total_rows: u16) -> usize {
     total_rows.saturating_sub(2) as usize
 }
 
-/// The OSC 0 terminal-title escape naming the unread mention count — the nav-presence spike
-/// (spec §Nav presence). The event loop emits this to stdout, before the ratatui draw,
-/// whenever `App::unread_mentions()` changes, on the chance herdr's left-nav panel reflects a
-/// terminal-title update; unverified beyond this escape string (a live-smoke question, not a
-/// render-test one — see the report).
+/// The OSC 0 terminal-title escape naming the unread mention count (spec §Nav presence).
+/// The event loop emits this to stdout whenever `App::unread_mentions()` changes — kept as
+/// the only badge path for herdr < 0.7.4, alongside `herdr_meta::Reporter`'s
+/// `pane report-metadata` call which owns the sidebar row on newer herdr.
 #[must_use]
 pub fn nav_title(unread: usize) -> String {
     format!("\x1b]0;slack ({unread})\x07")

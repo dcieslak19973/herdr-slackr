@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod emoji;
 pub mod entities;
+pub mod herdr_meta;
 #[macro_use]
 pub mod log;
 pub mod model;
@@ -35,6 +36,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::app::{App, Tab};
+use crate::herdr_meta::LinkHealth;
 use crate::rest::Rest;
 use crate::socket::SocketEvent;
 use crate::ui::PaneState;
@@ -192,6 +194,10 @@ fn event_loop(
         app.status = warning;
     }
     let mut last_unread = app.unread_mentions();
+    // Sidebar badge (spec `2026-07-23-sidebar-badge-design.md`): mirrors the OSC 0 title
+    // below onto the pane's herdr sidebar row via `pane report-metadata`. Self-disables
+    // after one failure (herdr < 0.7.4), so the OSC 0 escape stays as the only fallback.
+    let mut reporter = herdr_meta::Reporter::from_env();
     let mut down_since: Option<Instant> = None;
     let mut last_poll_tick = Instant::now();
     let mut last_catchup: Option<Instant> = None;
@@ -335,6 +341,18 @@ fn event_loop(
                 let _ = io::stdout().flush();
                 last_unread = unread;
             }
+
+            // `Polling` outranks `Lossy`: `socket_lossy` can only be set while the socket
+            // is nominally up (`!app.polling` gates the safety poll), so the two are
+            // mutually exclusive in practice; the order here just makes that explicit.
+            let health = if poll_only || app.polling {
+                LinkHealth::Polling
+            } else if socket_lossy {
+                LinkHealth::Lossy
+            } else {
+                LinkHealth::Live
+            };
+            reporter.report(unread, health);
 
             terminal.draw(|f| {
                 // Threaded into `App` once per draw (rather than measured only on a page-move

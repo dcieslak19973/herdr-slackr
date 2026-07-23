@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-07-12
-Last edited: 2026-07-12
+Last edited: 2026-07-23
 ---
 
 # herdr-slackr
@@ -33,6 +33,7 @@ Two tabs:
 - Slack text-entity resolution for display (`<@U…>`, `<#C…>`, links) — plain text, no mrkdwn styling.
 - One permalink-open action (`o`) into the browser.
 - Config and token resolution from `$HERDR_PLUGIN_CONFIG_DIR` (`config.md`).
+- Sidebar badge: unread count and link health onto the pane's herdr sidebar row (`pane.md` §Nav presence).
 
 ## Non-goals
 
@@ -40,7 +41,7 @@ Out of scope by explicit choice, not by oversight:
 
 - Posting, replying, or reacting in Slack. A separate Slack MCP covers agent-side read/reply; humans reply in Slack itself.
 - Message persistence across pane restarts.
-- Native herdr nav/badge integration beyond an unverified terminal-title spike (see `pane.md`).
+- Deeper herdr nav integration than the pane's own sidebar row — `agent.view.*` ordering/filtering, custom sidebar rows or sections (`pane.md` §Nav presence covers what *is* in scope).
 - Multi-workspace / Enterprise Grid support — one workspace, one token pair.
 - Message search or a searchable archive — the Feed tab is a live stream only.
 

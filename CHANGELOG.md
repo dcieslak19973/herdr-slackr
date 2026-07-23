@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Sidebar badge.** On herdr ≥ 0.7.4 the pane labels its own sidebar row `slack (n)` with
+  the unread mention count via `pane report-metadata`, and publishes `$slack_mentions` /
+  `$slack_link` metadata tokens for custom row layouts (README §Sidebar badge). Older herdr:
+  one plugin-log line, then silence — the OSC 0 terminal-title fallback stays.
+
 ## [0.1.13] — 2026-07-20
 
 ### Changed

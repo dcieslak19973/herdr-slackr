@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-07-12
-Last edited: 2026-07-12
+Last edited: 2026-07-23
 ---
 
 # The pane
@@ -173,7 +173,11 @@ An unrecognized `theme` value is not a `Blocked` trigger (see `config.md` C6): t
 
 ## Nav presence
 
-herdr's plugin v1 has no nav extension point for a custom badge. The pane emits an OSC 0 terminal-title escape (`slack (n)`, `n` the unread mention count) to stdout whenever the count changes, on the chance herdr's left-nav panel reflects a terminal-title update the way it does for another pane observed doing so. Whether it does is unverified pending a live-herdr check (see the project README's Limitations section); until confirmed, the tab bar's own count is the only reliable indicator.
+| #  | Always true                                                                                                     |
+| -- | --------------------------------------------------------------------------------------------------------------- |
+| N1 | On herdr ≥ 0.7.4, the pane reports its sidebar row title (`slack (n)` / bare `slack` at zero) and the tokens `slack_mentions` + `slack_link` (`live`/`polling`/`lossy`) via `herdr pane report-metadata`, source `plugin:dcieslak19973.slackr` — at most one call per `(unread, link)` change, spawned fire-and-forget, never blocking the event loop (`herdr_meta::Reporter`). |
+| N2 | A failed report disables the reporter for the session and writes at most one plugin-log line — on the next frame after the failure, and only when `$HERDR_PLUGIN_STATE_DIR` provides a log sink. Failure never surfaces in the status bar and never triggers `Blocked` (O4): the badge is decoration, not function. Unset `$HERDR_PANE_ID` disables it from the start. |
+| N3 | The OSC 0 terminal-title escape (`slack (n)` on every unread change) is kept as the pre-0.7.4 fallback; whether any herdr version renders it in the nav remains unverified. |
 
 ## Related specs
 

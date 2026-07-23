@@ -48,6 +48,7 @@ title = "slackr: close feed"
 contexts = ["pane", "workspace"]
 command = ["bash", "herdr/sidebar.sh", "close"]
 
-# No [[events]] block: unlike reviewr, slackr never auto-opens. The design spec is explicit
-# (Goal: "native herdr nav integration" is out of scope beyond the title-badge spike) — the user
-# opens the feed once per session via the toggle action, typically bound to a key.
+# No [[events]] block: unlike reviewr, slackr never auto-opens — the user opens the feed once
+# per session via the toggle action. Nav presence is the pane's own sidebar row: the binary
+# reports its title and $slack_mentions/$slack_link tokens via `pane report-metadata` on
+# herdr >= 0.7.4 (specs/pane.md §Nav presence); deeper nav integration stays out of scope.
