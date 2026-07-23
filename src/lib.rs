@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod emoji;
 pub mod entities;
+pub mod herdr_meta;
 #[macro_use]
 pub mod log;
 pub mod model;
