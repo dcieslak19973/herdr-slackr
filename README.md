@@ -267,6 +267,35 @@ Every row is color-segmented by field, not one flat color, under whichever palet
 conversation label in the accent color, the author name in green, the time/thread markers in a
 muted tone, and the message text in the default foreground.
 
+## Sidebar badge
+
+On herdr ≥ 0.7.4 the pane labels its own row in herdr's left sidebar with the unread mention
+count — `slack (3)`, back to `slack` when you're read up — via `herdr pane report-metadata`.
+No configuration needed; the title updates whenever the count changes.
+
+The pane also publishes two custom metadata tokens for sidebar row layouts:
+
+| token             | value                                                                 |
+| ------------------ | ----------------------------------------------------------------------|
+| `$slack_mentions` | the unread mention count (`0` when read up)                            |
+| `$slack_link`     | `live` (socket delivering) · `polling` (poll-only mode or socket down) · `lossy` (socket connected but proven silent — see the safety poll) |
+
+To render them, add the tokens to your herdr `config.toml` sidebar row layout (per-token
+styling needs herdr ≥ 0.7.5), e.g. as an extra row under `[ui.sidebar.agents]`:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "workspace", "tab"],
+  ["agent", { token = "$slack_mentions", bold = true }, { token = "$slack_link", dim = true }],
+]
+```
+
+On herdr older than 0.7.4 the report fails once, writes one line to the plugin log, and the
+pane never tries again that session — the badge quietly doesn't exist. The pane also still
+emits an OSC 0 terminal-title escape (`slack (n)`) on every count change as a fallback for
+those versions.
+
 ## Navigation
 
 Every tab and every Feed projection reads top-to-bottom chronological, oldest at the top and
@@ -438,6 +467,10 @@ Slack's servers) — it's covered here instead, by hand, before each release:
    answer) — it should appear within `poll_fallback_secs` of its send time.
 5. **Restore the network.** The socket should reconnect on its own; the status line clears and
    `polling` stops appearing within one backoff interval.
+6. **Sidebar badge** (herdr ≥ 0.7.5). Receive a DM: the pane's sidebar row should read
+   `slack (1)` within a tick; mark it read (`Enter` on the Mentions row) and the row returns
+   to `slack`. On herdr < 0.7.4: exactly one `sidebar badge: …` line in the plugin log
+   (`herdr plugin log list --plugin dcieslak19973.slackr`), no other visible behavior.
 
 ## Working with agents
 
@@ -533,12 +566,10 @@ This is a focused, young tool. Known constraints:
   pane restart re-backfills the last 50 messages per conversation from Slack and starts fresh.
 - **Read-only, always.** No composing, replying, reacting, or marking read in Slack itself — this
   pane only ever reads.
-- **No native nav badge, unverified.** The pane emits an OSC 0 terminal-title escape
-  (`slack (n)`) naming the unread mention count, on the chance herdr's left-nav panel reflects a
-  terminal-title update the way it does for reviewr's pane. Whether it actually does is a live-herdr
-  question, not something a test can confirm — it needs to be checked against a running herdr
-  once this plugin is installed, and this section updated with the result (tracked for Task 9).
-  Until confirmed, treat the pane's own tab-bar count as the only reliable unread indicator.
+- **Sidebar badge needs herdr ≥ 0.7.4.** On older herdr the `pane report-metadata` call fails
+  once, logs once, and stays off for the session (see [Sidebar badge](#sidebar-badge)); the
+  OSC 0 terminal-title escape (`slack (n)`) remains the only — unverified — nav signal there,
+  and the pane's own tab-bar count the only reliable one.
 - **One workspace, one token pair.** No multi-workspace / Enterprise Grid support.
 - **No message search.** The Feed tab is a live stream, not a searchable archive.
 - **macOS and Linux only** — no Windows pane (development happens on Windows; only the binary
