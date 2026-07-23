@@ -102,7 +102,7 @@ the unverified terminal-title spike gets rewritten to describe the layered behav
 - Live smoke (deferred to a herdr ≥ 0.7.5 install — work, after upgrade), two checks:
   1. Badge renders: unread mentions change the sidebar row to `slack (n)`; tokens render
      once the row layout references them.
-  2. Old-herdr degradation: on 0.7.1, exactly one plugin-log line, no visible misbehavior.
+  2. Old-herdr degradation: on 0.7.1, at most one plugin-log line, no visible misbehavior.
 
 ## Out of scope
 
