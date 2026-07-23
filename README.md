@@ -469,8 +469,9 @@ Slack's servers) — it's covered here instead, by hand, before each release:
    `polling` stops appearing within one backoff interval.
 6. **Sidebar badge** (herdr ≥ 0.7.5). Receive a DM: the pane's sidebar row should read
    `slack (1)` within a tick; mark it read (`Enter` on the Mentions row) and the row returns
-   to `slack`. On herdr < 0.7.4: exactly one `sidebar badge: …` line in the plugin log
-   (`herdr plugin log list --plugin dcieslak19973.slackr`), no other visible behavior.
+   to `slack`. On herdr < 0.7.4: at most one `sidebar badge: …` line in the plugin log
+   (`herdr plugin log list --plugin dcieslak19973.slackr` — written on the next feed activity
+   after the failure), and no other visible behavior.
 
 ## Working with agents
 

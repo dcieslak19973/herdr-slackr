@@ -62,6 +62,10 @@ pub fn argv(pane_id: &str, unread: usize, health: LinkHealth) -> Vec<String> {
 /// (old herdr rejecting `--token`, missing binary, no server); the next `report` call then
 /// writes one plugin-log line and the reporter stays disabled for the session — the
 /// plausible causes don't heal mid-run, and retries would only spam a shared machine's log.
+///
+/// Reports are fire-and-forget and unserialized: two rapid pair changes can race in herdr,
+/// leaving the older title until the next change — accepted; the badge self-heals on any
+/// later report.
 #[derive(Debug)]
 pub struct Reporter {
     pane_id: Option<String>,
@@ -75,7 +79,7 @@ impl Reporter {
     /// (standalone/CLI runs outside a herdr pane).
     #[must_use]
     pub fn from_env() -> Self {
-        Self::new(std::env::var("HERDR_PANE_ID").ok())
+        Self::new(std::env::var("HERDR_PANE_ID").ok().filter(|s| !s.is_empty()))
     }
 
     #[must_use]
@@ -108,23 +112,32 @@ impl Reporter {
 
     /// Report one `(unread, health)` observation. No-op unless [`due`](Self::due) says
     /// otherwise; the CLI call runs on a detached thread so the event loop never blocks on
-    /// a subprocess (spec §Design — fire-and-forget).
+    /// a subprocess (spec §Design — fire-and-forget). A failed thread spawn trips the same
+    /// latch as a failed CLI call.
     pub fn report(&mut self, unread: usize, health: LinkHealth) {
         if let Some(args) = self.due(unread, health) {
             let failed = Arc::clone(&self.failed);
-            std::thread::spawn(move || {
-                let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-                let ok = Command::new(bin)
-                    .args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success());
-                if !ok {
-                    failed.store(true, Ordering::Release);
-                }
-            });
+            let failed_on_spawn_err = Arc::clone(&self.failed);
+            let builder = std::thread::Builder::new();
+            if builder
+                .spawn(move || {
+                    let bin =
+                        std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+                    let ok = Command::new(bin)
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !ok {
+                        failed.store(true, Ordering::Release);
+                    }
+                })
+                .is_err()
+            {
+                failed_on_spawn_err.store(true, Ordering::Release);
+            }
         }
     }
 }

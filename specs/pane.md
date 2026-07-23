@@ -176,7 +176,7 @@ An unrecognized `theme` value is not a `Blocked` trigger (see `config.md` C6): t
 | #  | Always true                                                                                                     |
 | -- | --------------------------------------------------------------------------------------------------------------- |
 | N1 | On herdr ≥ 0.7.4, the pane reports its sidebar row title (`slack (n)` / bare `slack` at zero) and the tokens `slack_mentions` + `slack_link` (`live`/`polling`/`lossy`) via `herdr pane report-metadata`, source `plugin:dcieslak19973.slackr` — at most one call per `(unread, link)` change, spawned fire-and-forget, never blocking the event loop (`herdr_meta::Reporter`). |
-| N2 | The first failed report writes one plugin-log line and disables the reporter for the session. Failure never surfaces in the status bar and never triggers `Blocked` (O4): the badge is decoration, not function. Unset `$HERDR_PANE_ID` disables it from the start. |
+| N2 | A failed report disables the reporter for the session and writes at most one plugin-log line — on the next frame after the failure, and only when `$HERDR_PLUGIN_STATE_DIR` provides a log sink. Failure never surfaces in the status bar and never triggers `Blocked` (O4): the badge is decoration, not function. Unset `$HERDR_PANE_ID` disables it from the start. |
 | N3 | The OSC 0 terminal-title escape (`slack (n)` on every unread change) is kept as the pre-0.7.4 fallback; whether any herdr version renders it in the nav remains unverified. |
 
 ## Related specs

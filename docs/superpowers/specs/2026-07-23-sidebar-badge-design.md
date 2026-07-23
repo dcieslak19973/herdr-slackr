@@ -52,7 +52,7 @@ One small module owning everything herdr-metadata:
   unchanged; otherwise it spawns the CLI call on a fire-and-forget thread (the event loop
   never blocks on a subprocess). The thread reports failure back through a shared
   `Arc<AtomicBool>`; once set, the latch logs one `crate::logln!` line
-  (`sidebar badge: herdr rejected pane.report_metadata — disabled for this session (needs
+  (`sidebar badge: herdr pane report-metadata failed — disabled for this session (needs
   herdr >= 0.7.4)`) and suppresses all further attempts.
 - Payload construction is a pure function (unit-testable, same style as `nav_title`):
   - `title`: `slack (3)` when unread > 0, `slack` when 0 — mirrors `nav_title`'s text.
@@ -97,8 +97,8 @@ the unverified terminal-title spike gets rewritten to describe the layered behav
 ## Testing
 
 - Unit: payload/title/token formatting (pure function, table style like `nav_title`'s test);
-  latch behavior (disabled after injected failure, no-op on unchanged pair, disabled without
-  `HERDR_PANE_ID`) via an injected runner closure — no subprocess in tests.
+  latch behavior (disabled after failure, no-op on unchanged pair, disabled without
+  `HERDR_PANE_ID`) tested through the private `due()` gating seam — no subprocess in tests.
 - Live smoke (deferred to a herdr ≥ 0.7.5 install — work, after upgrade), two checks:
   1. Badge renders: unread mentions change the sidebar row to `slack (n)`; tokens render
      once the row layout references them.
