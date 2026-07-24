@@ -865,9 +865,16 @@ impl App {
         let had_rows_before = !self.current_ids().is_empty();
         let arrival_before = self.arrival_seq;
 
+        let status_before = self.status.clone();
         let slots = POLL_BATCH.min(self.catchup_remaining);
         let outcome = self.poll_conversations(rest, slots, now);
         self.catchup_remaining = self.catchup_remaining.saturating_sub(outcome.completed);
+        // A batch that surfaced an error or rate limit owns the status line; only a quiet
+        // batch narrates the sweep (spec decision 3). This also makes the post-reconnect
+        // catch-up visible, replacing the stale "socket unavailable — polling" line.
+        if self.status == status_before {
+            self.status = catchup_status(self.catchup_remaining, crate::users_cache::now_secs());
+        }
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
     }
 
@@ -2576,6 +2583,19 @@ fn poll_error_status_at(now_secs: u64, conv_name: &str, error: &RestError) -> St
     }
 }
 
+/// The status line a quiet catch-up batch leaves behind (spec `2026-07-24-status-hygiene`
+/// decision 3): the countdown while the sweep is still armed, a timestamped completion when
+/// this batch drained it. The caller only applies it when the batch wrote no status of its
+/// own (error / rate limit) — detected by comparing status before/after the batch — so the
+/// countdown never overwrites fresher bad news.
+fn catchup_status(remaining: usize, now_secs: u64) -> String {
+    if remaining > 0 {
+        format!("refreshing {remaining} conversations")
+    } else {
+        format!("{} refresh complete", hhmm_utc(now_secs))
+    }
+}
+
 /// Resolve each `Im` conversation's display name: `conversations.list` sets an IM's `name` to
 /// its counterpart user id (rest.rs's `parse_conversations` doc), not a display name, so it is
 /// looked up in the `users.list` cache here — falling back to the raw id if the user is
@@ -2604,7 +2624,7 @@ mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
         REACTION_REFRESH_INTERVAL, RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision,
-        budget_exhausted, capped_sleep_secs, catchup_after_reconnect, clamp_oldest,
+        budget_exhausted, capped_sleep_secs, catchup_after_reconnect, catchup_status, clamp_oldest,
         cooldown_active, digest_header_text, dm_scan_due, expand_status, format_ts, hhmm_utc,
         key_for, live_event_admitted, lookback_cutoff_ts, marker_count, marker_text, next_batch,
         older_of, pick_changed_dm, poll_error_status_at, reaction_suffix, reaction_window_ts,
@@ -3265,6 +3285,71 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    #[test]
+    fn catchup_tick_leaves_a_batch_error_status_alone() {
+        let mut app = empty_app();
+        app.request_refresh();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // Every call fails ("request cancelled"), so the batch writes an error status; the
+        // countdown must not paper over it (spec decision 3's guard).
+        app.catchup_tick_at(&rest, Instant::now());
+        assert!(
+            !app.status.starts_with("refreshing") && !app.status.ends_with("refresh complete"),
+            "error status must survive the batch: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn catchup_tick_counts_down_and_completes_with_a_timestamp() {
+        let mut app = empty_app();
+        app.request_refresh();
+        assert_eq!(app.status, "refreshing 2 conversations");
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // Both fixture conversations fail-and-retire in one batch (continue-past-errors), so
+        // the sweep drains; the error status the batch wrote survives (guard). A second tick
+        // with nothing armed must not touch status either.
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.catchup_remaining, 0);
+        let after_drain = app.status.clone();
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.status, after_drain, "a no-op tick must not rewrite status");
+    }
+
+    #[test]
+    fn catchup_tick_narrates_a_quiet_batch_with_the_countdown_status() {
+        // `poll_conversations` with an empty conversation list visits nothing at all — no REST
+        // calls, no status write, and `completed == 0` (see `next_batch`'s `n == 0` case), so
+        // the sweep makes no arithmetic progress either. That means a batch quiet enough to
+        // reach the *completion* stamp (drain to 0 with no error) cannot be driven through
+        // `catchup_tick_at` without a real successful REST call — seeing this required reading
+        // `poll_conversations`'s empty-list handling, per the brief's fixture caveat. The
+        // completion arm (`"HH:MM refresh complete"`) is instead covered by the pure
+        // `catchup_status` unit test below. What *is* reachable and worth locking down here:
+        // a quiet batch still narrates the countdown, overwriting whatever stale status (e.g.
+        // "socket unavailable — polling") preceded it — the guard's positive branch.
+        let mut app = empty_app();
+        app.conversations.clear();
+        app.catchup_remaining = 1;
+        app.status = "socket unavailable — polling".to_string();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.catchup_remaining, 1, "an empty due list makes no progress on the sweep");
+        assert_eq!(
+            app.status, "refreshing 1 conversations",
+            "a quiet batch replaces stale status with the live countdown"
+        );
+    }
+
+    #[test]
+    fn catchup_status_counts_down_then_completes_with_a_stamp() {
+        assert_eq!(catchup_status(7, 1_752_300_000), "refreshing 7 conversations");
+        assert_eq!(catchup_status(0, 1_752_300_000), "06:00 refresh complete");
     }
 
     // ---- reactions: rendering, merge authority, and the 24h polling refresh window ----------
