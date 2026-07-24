@@ -2104,6 +2104,14 @@ fn format_ts(ts: &str, now: SystemTime) -> String {
     }
 }
 
+/// UTC `HH:MM` for an epoch-seconds clock reading — the timestamp prefix recurring error
+/// statuses carry (spec `2026-07-24-status-hygiene` decision 2), in the same UTC convention
+/// as `format_ts`'s message times.
+fn hhmm_utc(now_secs: u64) -> String {
+    let day_secs = now_secs % 86_400;
+    format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
+}
+
 /// Days-since-1970-01-01 to a proleptic Gregorian `(year, month, day)`, Howard Hinnant's
 /// widely-used `civil_from_days` algorithm — mirrors the epoch-seconds↔civil-date math used
 /// elsewhere in this project's family (e.g. herdr-reviewr's `comments::civil_from_days` /
@@ -2550,12 +2558,21 @@ fn backfill_one(
 
 /// The one-line status `poll_tick` sets on a per-conversation history-fetch failure: a
 /// rate-limit notice naming the retry delay (Slack's own back-off signal, distinct from any
-/// other failure) or a line naming which conversation failed and why. Split out so the wording
-/// is unit-tested without a real REST call.
+/// other failure) or a line naming which conversation failed and why — either way prefixed
+/// with the UTC `HH:MM` it happened (spec `2026-07-24-status-hygiene` decision 2: statuses
+/// are write-once and can sit on screen for hours, so an error must date itself). Split so
+/// the wording is unit-tested without a real REST call or a live clock.
 fn poll_error_status(conv_name: &str, error: &RestError) -> String {
+    poll_error_status_at(crate::users_cache::now_secs(), conv_name, error)
+}
+
+/// `poll_error_status`'s real logic, taking the clock as a parameter (production always
+/// passes `users_cache::now_secs()`), for the same testability reason as `poll_tick_at`.
+fn poll_error_status_at(now_secs: u64, conv_name: &str, error: &RestError) -> String {
+    let stamp = hhmm_utc(now_secs);
     match error {
-        RestError::RateLimited(secs) => format!("slack rate limit — retrying in {secs}s"),
-        other => format!("{conv_name}: {other:?}"),
+        RestError::RateLimited(secs) => format!("{stamp} slack rate limit — retrying in {secs}s"),
+        other => format!("{stamp} {conv_name}: {other:?}"),
     }
 }
 
@@ -2588,11 +2605,11 @@ mod tests {
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
         REACTION_REFRESH_INTERVAL, RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision,
         budget_exhausted, capped_sleep_secs, catchup_after_reconnect, clamp_oldest,
-        cooldown_active, digest_header_text, dm_scan_due, expand_status, format_ts, key_for,
-        live_event_admitted, lookback_cutoff_ts, marker_count, marker_text, next_batch, older_of,
-        pick_changed_dm, poll_error_status, reaction_suffix, reaction_window_ts, reply_rail,
-        resolve_im_names, resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
-        widen_for_reactions,
+        cooldown_active, digest_header_text, dm_scan_due, expand_status, format_ts, hhmm_utc,
+        key_for, live_event_admitted, lookback_cutoff_ts, marker_count, marker_text, next_batch,
+        older_of, pick_changed_dm, poll_error_status_at, reaction_suffix, reaction_window_ts,
+        reply_rail, resolve_im_names, resume_cursor, thread_slot_count, track_newest,
+        updated_ms_to_ts, widen_for_reactions,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -4047,16 +4064,28 @@ mod tests {
     // ---- poll_tick status wording (Fix 2b) --------------------------------------------------
 
     #[test]
-    fn poll_error_status_is_a_rate_limit_notice_for_rate_limited() {
-        let status = poll_error_status("eng", &RestError::RateLimited(42));
-        assert_eq!(status, "slack rate limit — retrying in 42s");
+    fn poll_error_status_is_a_timestamped_rate_limit_notice_for_rate_limited() {
+        // 1752300000 = 2025-07-12T06:00:00Z.
+        let status = poll_error_status_at(1_752_300_000, "eng", &RestError::RateLimited(42));
+        assert_eq!(status, "06:00 slack rate limit — retrying in 42s");
     }
 
     #[test]
-    fn poll_error_status_names_the_conversation_for_other_errors() {
-        let status =
-            poll_error_status("eng", &RestError::SlackError("channel_not_found".to_string()));
-        assert!(status.contains("eng"), "{status}");
+    fn poll_error_status_timestamps_and_names_the_conversation_for_other_errors() {
+        let status = poll_error_status_at(
+            1_752_300_000,
+            "eng",
+            &RestError::SlackError("channel_not_found".to_string()),
+        );
+        assert!(status.starts_with("06:00 eng: "), "{status}");
+        assert!(status.contains("channel_not_found"), "{status}");
+    }
+
+    #[test]
+    fn hhmm_utc_formats_midnight_and_end_of_day() {
+        assert_eq!(hhmm_utc(0), "00:00");
+        assert_eq!(hhmm_utc(86_399), "23:59");
+        assert_eq!(hhmm_utc(86_400), "00:00", "rolls over at the UTC day boundary");
     }
 
     #[test]
