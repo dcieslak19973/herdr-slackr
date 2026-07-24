@@ -876,8 +876,8 @@ impl App {
         self.catchup_remaining = self.catchup_remaining.saturating_sub(outcome.completed);
         if self.status == CATCHUP_PROBE {
             // Quiet batch: narrate the sweep (spec `2026-07-24-status-hygiene` decision 3).
-            // This also makes the post-reconnect catch-up visible, replacing the stale
-            // "socket unavailable — polling" line.
+            // This also makes the post-reconnect catch-up visible in the otherwise-empty
+            // status.
             self.status = catchup_status(self.catchup_remaining, crate::users_cache::now_secs());
         }
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
@@ -2597,8 +2597,8 @@ const CATCHUP_PROBE: &str = "\u{1}catchup-probe";
 /// The status line a quiet catch-up batch leaves behind (spec `2026-07-24-status-hygiene`
 /// decision 3): the countdown while the sweep is still armed, a timestamped completion when
 /// this batch drained it. The caller only applies it when the batch wrote no status of its
-/// own (error / rate limit) — detected by comparing status before/after the batch — so the
-/// countdown never overwrites fresher bad news.
+/// own (error / rate limit) — detected via the `CATCHUP_PROBE` sentinel swapped into `status`
+/// around the synchronous batch — so the countdown never overwrites fresher bad news.
 fn catchup_status(remaining: usize, now_secs: u64) -> String {
     if remaining > 0 {
         format!("refreshing {remaining} conversations")
@@ -3312,6 +3312,7 @@ mod tests {
             "error status must survive the batch: {}",
             app.status
         );
+        assert!(app.status.contains("cancelled"), "{}", app.status);
     }
 
     #[test]

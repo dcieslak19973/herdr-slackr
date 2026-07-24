@@ -247,6 +247,26 @@ fn event_loop(
             }
         }
 
+        // Post-reconnect catch-up (spec §Polling fallback): the socket never redelivers events
+        // missed while it was down, so once it is healthy again the armed sweep re-fetches every
+        // subscribed conversation from its watermark, one paced batch at a time. Only while the
+        // socket is up — during a renewed outage the ordinary poll fallback above covers
+        // freshness, and the next `Connected` re-arms the sweep in full anyway.
+        // (Poll-only mode has no reconnects to catch up after, but `r`'s manual refresh arms
+        // this same sweep — so the branch runs there too, gated only by its own pacing.)
+        // Runs before the poll branches deliberately: a quiet batch's countdown narration must
+        // lose to any status those branches write later this same iteration (the draw sees the
+        // freshest write).
+        if (!app.polling || poll_only)
+            && app.catchup_due()
+            && last_catchup.is_none_or(|at: Instant| at.elapsed() >= next_catchup_gap)
+        {
+            app.catchup_tick(rest);
+            last_catchup = Some(Instant::now());
+            next_catchup_gap = jittered(CATCHUP_INTERVAL);
+            dirty = true;
+        }
+
         // Silent-socket safety poll: a socket that connects but never delivers (the signature
         // of a Slack app missing its `message.*` event subscriptions — plausible on a shared
         // corporate app someone else configured) would otherwise freeze the feed forever,
@@ -309,23 +329,6 @@ fn event_loop(
             app.poll_tick(rest);
             last_poll_tick = Instant::now();
             next_poll_gap = jittered(poll_fallback);
-            dirty = true;
-        }
-
-        // Post-reconnect catch-up (spec §Polling fallback): the socket never redelivers events
-        // missed while it was down, so once it is healthy again the armed sweep re-fetches every
-        // subscribed conversation from its watermark, one paced batch at a time. Only while the
-        // socket is up — during a renewed outage the ordinary poll fallback above covers
-        // freshness, and the next `Connected` re-arms the sweep in full anyway.
-        // (Poll-only mode has no reconnects to catch up after, but `r`'s manual refresh arms
-        // this same sweep — so the branch runs there too, gated only by its own pacing.)
-        if (!app.polling || poll_only)
-            && app.catchup_due()
-            && last_catchup.is_none_or(|at: Instant| at.elapsed() >= next_catchup_gap)
-        {
-            app.catchup_tick(rest);
-            last_catchup = Some(Instant::now());
-            next_catchup_gap = jittered(CATCHUP_INTERVAL);
             dirty = true;
         }
 

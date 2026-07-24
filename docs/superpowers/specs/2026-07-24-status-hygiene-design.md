@@ -26,10 +26,11 @@ self-describing, and gives the refresh sweep visible progress and an end.
    finishes without writing an error status updates the line to
    `refreshing <remaining> conversations`, and the batch that drains the sweep writes
    `HH:MM refresh complete`. A batch that *did* surface an error (or rate limit) leaves that
-   error on screen — the countdown never overwrites fresher bad news (guard: compare status
-   before/after the batch). Applies to the same sweep when armed by a socket reconnect: the
-   post-reconnect catch-up becomes visible the same way, which replaces the stale
-   `socket unavailable — polling` line it previously left behind.
+   error on screen — the countdown never overwrites fresher bad news (guard: a `CATCHUP_PROBE`
+   sentinel swapped into the status around the synchronous batch — amended from the original
+   before/after comparison, approved 2026-07-24, to close the identical-rewrite blind spot).
+   Applies to the same sweep when armed by a socket reconnect, making the post-reconnect
+   catch-up visible in the otherwise-empty status line.
 
 ## Design
 
