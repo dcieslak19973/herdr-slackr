@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.15] — 2026-07-24
+
 ### Changed
 - **Status lines date themselves.** Recurring background errors (polling, dm scan, thread
   fetches, rate limits) are now prefixed with the UTC `HH:MM` they occurred — a transient
