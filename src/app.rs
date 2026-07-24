@@ -865,14 +865,19 @@ impl App {
         let had_rows_before = !self.current_ids().is_empty();
         let arrival_before = self.arrival_seq;
 
-        let status_before = self.status.clone();
+        // Detecting "did this batch write a status?" by value comparison has a blind spot:
+        // a batch re-writing the exact text already on screen (two identical rate-limit
+        // notices in the same UTC minute) would read as quiet. The tick is synchronous
+        // between draws, so a sentinel that can never render distinguishes the two exactly:
+        // any write by the batch replaces it; finding it intact afterward proves quiet.
+        self.status = CATCHUP_PROBE.to_string();
         let slots = POLL_BATCH.min(self.catchup_remaining);
         let outcome = self.poll_conversations(rest, slots, now);
         self.catchup_remaining = self.catchup_remaining.saturating_sub(outcome.completed);
-        // A batch that surfaced an error or rate limit owns the status line; only a quiet
-        // batch narrates the sweep (spec decision 3). This also makes the post-reconnect
-        // catch-up visible, replacing the stale "socket unavailable — polling" line.
-        if self.status == status_before {
+        if self.status == CATCHUP_PROBE {
+            // Quiet batch: narrate the sweep (spec `2026-07-24-status-hygiene` decision 3).
+            // This also makes the post-reconnect catch-up visible, replacing the stale
+            // "socket unavailable — polling" line.
             self.status = catchup_status(self.catchup_remaining, crate::users_cache::now_secs());
         }
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
@@ -2583,6 +2588,12 @@ fn poll_error_status_at(now_secs: u64, conv_name: &str, error: &RestError) -> St
     }
 }
 
+/// `catchup_tick_at`'s write-detection sentinel: swapped into `status` for the duration of
+/// one synchronous batch and checked afterward — a leading control character no real status
+/// can start with (`poll_error_status_at` starts with `HH:MM` digits). Never renders: the
+/// swap and check happen inside one tick, strictly between draws.
+const CATCHUP_PROBE: &str = "\u{1}catchup-probe";
+
 /// The status line a quiet catch-up batch leaves behind (spec `2026-07-24-status-hygiene`
 /// decision 3): the countdown while the sweep is still armed, a timestamped completion when
 /// this batch drained it. The caller only applies it when the batch wrote no status of its
@@ -3304,15 +3315,16 @@ mod tests {
     }
 
     #[test]
-    fn catchup_tick_counts_down_and_completes_with_a_timestamp() {
+    fn catchup_tick_drains_the_sweep_and_a_noop_tick_leaves_status_alone() {
         let mut app = empty_app();
         app.request_refresh();
         assert_eq!(app.status, "refreshing 2 conversations");
         let cancelled = AtomicBool::new(false);
         let rest = precancelled_rest(&cancelled);
-        // Both fixture conversations fail-and-retire in one batch (continue-past-errors), so
-        // the sweep drains; the error status the batch wrote survives (guard). A second tick
-        // with nothing armed must not touch status either.
+        // The failing fixture drains the sweep's arithmetic: both fixture conversations
+        // fail-and-retire in one batch (continue-past-errors retires visited conversations
+        // even on error), so `catchup_remaining` reaches 0. The error status the batch wrote
+        // survives the guard. A second tick with nothing armed must not touch status either.
         app.catchup_tick_at(&rest, Instant::now());
         assert_eq!(app.catchup_remaining, 0);
         let after_drain = app.status.clone();
