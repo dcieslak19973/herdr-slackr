@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-07-12
-Last edited: 2026-07-23
+Last edited: 2026-07-24
 ---
 
 # The pane
@@ -152,7 +152,7 @@ and symmetrically `f` pressed while in `Threads` lands on `Focus` directly.
 | `t`                   | Feed tab only: toggle between the Timeline and the Threads-only view (see below) |
 | `f`                   | Feed tab only: toggle into/out of the Focus view (see above) — mutually exclusive with `t`'s Threads toggle |
 | `o`                   | open the selected row's Slack permalink (`chat.getPermalink`) in the browser |
-| `r`                   | manual refresh: one immediate poll batch, plus arming the paced catch-up sweep (`App::request_refresh`) so every subscribed conversation gets one watermarked fetch under the normal request budget; re-pressing mid-sweep never shrinks the remaining count; sets a `refreshing n conversations` status |
+| `r`                   | manual refresh: one immediate poll batch, plus arming the paced catch-up sweep (`App::request_refresh`) so every subscribed conversation gets one watermarked fetch under the normal request budget; re-pressing mid-sweep never shrinks the remaining count; sets a `refreshing n conversations` status that counts down as batches retire and ends as `HH:MM refresh complete` — unless a batch surfaced an error, which owns the line (statuses carry a UTC `HH:MM` stamp on recurring errors; see §Degraded states) |
 | `q`                   | quit the pane                                                     |
 
 `viewport_rows` is set once per draw from the body area's measured height (`App::set_viewport_rows`, fed by `ui::body_rows`), so a page move is always sized off the pane's actual on-screen row count, including right after a terminal resize.
@@ -168,6 +168,8 @@ The pane has exactly two render states: `Ready` (the tab bar/rows/status above) 
 | `App::build`'s own REST failure (e.g. an unknown channel, `invalid_auth`) | the build error verbatim                        |
 
 `Blocked` never crashes the process — `q` still quits it. Once the pane reaches `Ready`, it stays there for the rest of the session: a later Slack-side error (rate limit, socket down) surfaces in the status bar, not by reverting to `Blocked`.
+
+Recurring background errors (poll, dm scan, thread fetch, rate limit) are prefixed with the UTC `HH:MM` they occurred, so a stale error is visibly stale; a REST response that fails JSON parsing names the HTTP status when curl's write-out trailer provided one.
 
 An unrecognized `theme` value is not a `Blocked` trigger (see `config.md` C6): the pane starts `Ready` on the default palette with a one-line status warning.
 

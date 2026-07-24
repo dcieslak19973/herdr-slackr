@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Status lines date themselves.** Recurring background errors (polling, dm scan, thread
+  fetches, rate limits) are now prefixed with the UTC `HH:MM` they occurred — a transient
+  overnight hiccup no longer masquerades as a live failure hours later. A REST response that
+  fails JSON parsing now names the HTTP status from curl's write-out trailer
+  (`invalid JSON (HTTP 302): …`), and the manual-refresh sweep counts down
+  (`refreshing 7 conversations`) and finishes with a stamped `refresh complete` instead of
+  sitting on its opening message forever.
+
 ## [0.1.14] — 2026-07-23
 
 ### Added

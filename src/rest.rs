@@ -378,14 +378,20 @@ fn split_trailer(out: &str) -> (&str, Option<Trailer>) {
 /// back with an HTML (non-JSON) body, and the trailer's HTTP status is authoritative regardless
 /// of what the body contains. Deferring to the JSON parse first would surface that as
 /// `Other("invalid JSON...")` instead of the `RateLimited` the caller needs to back off on.
+/// When the parse does fail, the trailer's HTTP status is folded into the error text.
 fn parse_response(out: &str) -> Result<Value, RestError> {
     let (body, trailer) = split_trailer(out);
     if trailer.is_some_and(|(code, _)| code == 429) {
         let secs = trailer.and_then(|(_, retry_after)| retry_after).unwrap_or(30);
         return Err(RestError::RateLimited(secs));
     }
-    let v: Value =
-        serde_json::from_str(body).map_err(|e| RestError::Other(format!("invalid JSON: {e}")))?;
+    let v: Value = serde_json::from_str(body).map_err(|e| match trailer {
+        // The trailer's HTTP status is the one fact that names a non-JSON response's
+        // culprit (proxy redirect, WAF page, empty 200) — spec `2026-07-24-status-hygiene`
+        // decision 1. No trailer (curl < 7.83) leaves nothing to report.
+        Some((code, _)) => RestError::Other(format!("invalid JSON (HTTP {code}): {e}")),
+        None => RestError::Other(format!("invalid JSON: {e}")),
+    })?;
     check_ok(v, trailer)
 }
 
@@ -737,6 +743,25 @@ mod tests {
         let out = "<html>Too Many Requests</html>\n200 ";
         let err = parse_response(out).unwrap_err();
         assert!(matches!(err, RestError::Other(_)));
+    }
+
+    #[test]
+    fn an_invalid_json_body_with_a_trailer_names_the_http_status() {
+        // The overnight incident (2026-07-24): a proxy answered with an empty body and a
+        // non-429 status; the old wording discarded the one fact that names the culprit.
+        let out = "\n302 ";
+        let err = parse_response(out).unwrap_err();
+        let RestError::Other(msg) = err else { panic!("expected Other, got {err:?}") };
+        assert!(msg.starts_with("invalid JSON (HTTP 302): "), "{msg}");
+    }
+
+    #[test]
+    fn an_invalid_json_body_without_a_trailer_keeps_the_plain_wording() {
+        // curl < 7.83 appends no trailer; there is no HTTP status to report.
+        let err = parse_response("not json").unwrap_err();
+        let RestError::Other(msg) = err else { panic!("expected Other, got {err:?}") };
+        assert!(msg.starts_with("invalid JSON: "), "{msg}");
+        assert!(!msg.contains("HTTP"), "{msg}");
     }
 
     // ---- conversations.list ---------------------------------------------------------------

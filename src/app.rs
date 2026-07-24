@@ -865,9 +865,21 @@ impl App {
         let had_rows_before = !self.current_ids().is_empty();
         let arrival_before = self.arrival_seq;
 
+        // Detecting "did this batch write a status?" by value comparison has a blind spot:
+        // a batch re-writing the exact text already on screen (two identical rate-limit
+        // notices in the same UTC minute) would read as quiet. The tick is synchronous
+        // between draws, so a sentinel that can never render distinguishes the two exactly:
+        // any write by the batch replaces it; finding it intact afterward proves quiet.
+        self.status = CATCHUP_PROBE.to_string();
         let slots = POLL_BATCH.min(self.catchup_remaining);
         let outcome = self.poll_conversations(rest, slots, now);
         self.catchup_remaining = self.catchup_remaining.saturating_sub(outcome.completed);
+        if self.status == CATCHUP_PROBE {
+            // Quiet batch: narrate the sweep (spec `2026-07-24-status-hygiene` decision 3).
+            // This also makes the post-reconnect catch-up visible in the otherwise-empty
+            // status.
+            self.status = catchup_status(self.catchup_remaining, crate::users_cache::now_secs());
+        }
         self.finish_after_arrivals(follow_bottom, had_rows_before, arrival_before);
     }
 
@@ -2104,6 +2116,14 @@ fn format_ts(ts: &str, now: SystemTime) -> String {
     }
 }
 
+/// UTC `HH:MM` for an epoch-seconds clock reading — the timestamp prefix recurring error
+/// statuses carry (spec `2026-07-24-status-hygiene` decision 2), in the same UTC convention
+/// as `format_ts`'s message times.
+fn hhmm_utc(now_secs: u64) -> String {
+    let day_secs = now_secs % 86_400;
+    format!("{:02}:{:02}", day_secs / 3600, (day_secs % 3600) / 60)
+}
+
 /// Days-since-1970-01-01 to a proleptic Gregorian `(year, month, day)`, Howard Hinnant's
 /// widely-used `civil_from_days` algorithm — mirrors the epoch-seconds↔civil-date math used
 /// elsewhere in this project's family (e.g. herdr-reviewr's `comments::civil_from_days` /
@@ -2550,12 +2570,40 @@ fn backfill_one(
 
 /// The one-line status `poll_tick` sets on a per-conversation history-fetch failure: a
 /// rate-limit notice naming the retry delay (Slack's own back-off signal, distinct from any
-/// other failure) or a line naming which conversation failed and why. Split out so the wording
-/// is unit-tested without a real REST call.
+/// other failure) or a line naming which conversation failed and why — either way prefixed
+/// with the UTC `HH:MM` it happened (spec `2026-07-24-status-hygiene` decision 2: statuses
+/// are write-once and can sit on screen for hours, so an error must date itself). Split so
+/// the wording is unit-tested without a real REST call or a live clock.
 fn poll_error_status(conv_name: &str, error: &RestError) -> String {
+    poll_error_status_at(crate::users_cache::now_secs(), conv_name, error)
+}
+
+/// `poll_error_status`'s real logic, taking the clock as a parameter (production always
+/// passes `users_cache::now_secs()`), for the same testability reason as `poll_tick_at`.
+fn poll_error_status_at(now_secs: u64, conv_name: &str, error: &RestError) -> String {
+    let stamp = hhmm_utc(now_secs);
     match error {
-        RestError::RateLimited(secs) => format!("slack rate limit — retrying in {secs}s"),
-        other => format!("{conv_name}: {other:?}"),
+        RestError::RateLimited(secs) => format!("{stamp} slack rate limit — retrying in {secs}s"),
+        other => format!("{stamp} {conv_name}: {other:?}"),
+    }
+}
+
+/// `catchup_tick_at`'s write-detection sentinel: swapped into `status` for the duration of
+/// one synchronous batch and checked afterward — a leading control character no real status
+/// can start with (`poll_error_status_at` starts with `HH:MM` digits). Never renders: the
+/// swap and check happen inside one tick, strictly between draws.
+const CATCHUP_PROBE: &str = "\u{1}catchup-probe";
+
+/// The status line a quiet catch-up batch leaves behind (spec `2026-07-24-status-hygiene`
+/// decision 3): the countdown while the sweep is still armed, a timestamped completion when
+/// this batch drained it. The caller only applies it when the batch wrote no status of its
+/// own (error / rate limit) — detected via the `CATCHUP_PROBE` sentinel swapped into `status`
+/// around the synchronous batch — so the countdown never overwrites fresher bad news.
+fn catchup_status(remaining: usize, now_secs: u64) -> String {
+    if remaining > 0 {
+        format!("refreshing {remaining} conversations")
+    } else {
+        format!("{} refresh complete", hhmm_utc(now_secs))
     }
 }
 
@@ -2587,12 +2635,12 @@ mod tests {
     use super::{
         App, BackfillOutcome, BackfillRetry, DM_SCAN_INTERVAL, FeedView, MAX_PER_CONV, PRUNE_SLACK,
         REACTION_REFRESH_INTERVAL, RowKind, SelKind, Tab, apply_backfill, backfill_retry_decision,
-        budget_exhausted, capped_sleep_secs, catchup_after_reconnect, clamp_oldest,
-        cooldown_active, digest_header_text, dm_scan_due, expand_status, format_ts, key_for,
-        live_event_admitted, lookback_cutoff_ts, marker_count, marker_text, next_batch, older_of,
-        pick_changed_dm, poll_error_status, reaction_suffix, reaction_window_ts, reply_rail,
-        resolve_im_names, resume_cursor, thread_slot_count, track_newest, updated_ms_to_ts,
-        widen_for_reactions,
+        budget_exhausted, capped_sleep_secs, catchup_after_reconnect, catchup_status, clamp_oldest,
+        cooldown_active, digest_header_text, dm_scan_due, expand_status, format_ts, hhmm_utc,
+        key_for, live_event_admitted, lookback_cutoff_ts, marker_count, marker_text, next_batch,
+        older_of, pick_changed_dm, poll_error_status_at, reaction_suffix, reaction_window_ts,
+        reply_rail, resolve_im_names, resume_cursor, thread_slot_count, track_newest,
+        updated_ms_to_ts, widen_for_reactions,
     };
     use crate::model::{ConvKind, Conversation, Message};
     use crate::rest::{Rest, RestError};
@@ -3248,6 +3296,74 @@ mod tests {
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, now);
         assert_eq!(app.catchup_remaining, 2, "the sweep must wait out the cooldown, not skip it");
+    }
+
+    #[test]
+    fn catchup_tick_leaves_a_batch_error_status_alone() {
+        let mut app = empty_app();
+        app.request_refresh();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // Every call fails ("request cancelled"), so the batch writes an error status; the
+        // countdown must not paper over it (spec decision 3's guard).
+        app.catchup_tick_at(&rest, Instant::now());
+        assert!(
+            !app.status.starts_with("refreshing") && !app.status.ends_with("refresh complete"),
+            "error status must survive the batch: {}",
+            app.status
+        );
+        assert!(app.status.contains("cancelled"), "{}", app.status);
+    }
+
+    #[test]
+    fn catchup_tick_drains_the_sweep_and_a_noop_tick_leaves_status_alone() {
+        let mut app = empty_app();
+        app.request_refresh();
+        assert_eq!(app.status, "refreshing 2 conversations");
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        // The failing fixture drains the sweep's arithmetic: both fixture conversations
+        // fail-and-retire in one batch (continue-past-errors retires visited conversations
+        // even on error), so `catchup_remaining` reaches 0. The error status the batch wrote
+        // survives the guard. A second tick with nothing armed must not touch status either.
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.catchup_remaining, 0);
+        let after_drain = app.status.clone();
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.status, after_drain, "a no-op tick must not rewrite status");
+    }
+
+    #[test]
+    fn catchup_tick_narrates_a_quiet_batch_with_the_countdown_status() {
+        // `poll_conversations` with an empty conversation list visits nothing at all — no REST
+        // calls, no status write, and `completed == 0` (see `next_batch`'s `n == 0` case), so
+        // the sweep makes no arithmetic progress either. That means a batch quiet enough to
+        // reach the *completion* stamp (drain to 0 with no error) cannot be driven through
+        // `catchup_tick_at` without a real successful REST call — seeing this required reading
+        // `poll_conversations`'s empty-list handling, per the brief's fixture caveat. The
+        // completion arm (`"HH:MM refresh complete"`) is instead covered by the pure
+        // `catchup_status` unit test below. What *is* reachable and worth locking down here:
+        // a quiet batch still narrates the countdown, overwriting whatever stale status
+        // preceded it (any stale string does; a dated error line is the realistic case) —
+        // the guard's positive branch.
+        let mut app = empty_app();
+        app.conversations.clear();
+        app.catchup_remaining = 1;
+        app.status = "03:12 eng: stale error from hours ago".to_string();
+        let cancelled = AtomicBool::new(false);
+        let rest = precancelled_rest(&cancelled);
+        app.catchup_tick_at(&rest, Instant::now());
+        assert_eq!(app.catchup_remaining, 1, "an empty due list makes no progress on the sweep");
+        assert_eq!(
+            app.status, "refreshing 1 conversations",
+            "a quiet batch replaces stale status with the live countdown"
+        );
+    }
+
+    #[test]
+    fn catchup_status_counts_down_then_completes_with_a_stamp() {
+        assert_eq!(catchup_status(7, 1_752_300_000), "refreshing 7 conversations");
+        assert_eq!(catchup_status(0, 1_752_300_000), "06:00 refresh complete");
     }
 
     // ---- reactions: rendering, merge authority, and the 24h polling refresh window ----------
@@ -4047,16 +4163,28 @@ mod tests {
     // ---- poll_tick status wording (Fix 2b) --------------------------------------------------
 
     #[test]
-    fn poll_error_status_is_a_rate_limit_notice_for_rate_limited() {
-        let status = poll_error_status("eng", &RestError::RateLimited(42));
-        assert_eq!(status, "slack rate limit — retrying in 42s");
+    fn poll_error_status_is_a_timestamped_rate_limit_notice_for_rate_limited() {
+        // 1752300000 = 2025-07-12T06:00:00Z.
+        let status = poll_error_status_at(1_752_300_000, "eng", &RestError::RateLimited(42));
+        assert_eq!(status, "06:00 slack rate limit — retrying in 42s");
     }
 
     #[test]
-    fn poll_error_status_names_the_conversation_for_other_errors() {
-        let status =
-            poll_error_status("eng", &RestError::SlackError("channel_not_found".to_string()));
-        assert!(status.contains("eng"), "{status}");
+    fn poll_error_status_timestamps_and_names_the_conversation_for_other_errors() {
+        let status = poll_error_status_at(
+            1_752_300_000,
+            "eng",
+            &RestError::SlackError("channel_not_found".to_string()),
+        );
+        assert!(status.starts_with("06:00 eng: "), "{status}");
+        assert!(status.contains("channel_not_found"), "{status}");
+    }
+
+    #[test]
+    fn hhmm_utc_formats_midnight_and_end_of_day() {
+        assert_eq!(hhmm_utc(0), "00:00");
+        assert_eq!(hhmm_utc(86_399), "23:59");
+        assert_eq!(hhmm_utc(86_400), "00:00", "rolls over at the UTC day boundary");
     }
 
     #[test]
