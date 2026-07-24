@@ -3343,12 +3343,13 @@ mod tests {
         // `poll_conversations`'s empty-list handling, per the brief's fixture caveat. The
         // completion arm (`"HH:MM refresh complete"`) is instead covered by the pure
         // `catchup_status` unit test below. What *is* reachable and worth locking down here:
-        // a quiet batch still narrates the countdown, overwriting whatever stale status (e.g.
-        // "socket unavailable — polling") preceded it — the guard's positive branch.
+        // a quiet batch still narrates the countdown, overwriting whatever stale status
+        // preceded it (any stale string does; a dated error line is the realistic case) —
+        // the guard's positive branch.
         let mut app = empty_app();
         app.conversations.clear();
         app.catchup_remaining = 1;
-        app.status = "socket unavailable — polling".to_string();
+        app.status = "03:12 eng: stale error from hours ago".to_string();
         let cancelled = AtomicBool::new(false);
         let rest = precancelled_rest(&cancelled);
         app.catchup_tick_at(&rest, Instant::now());
