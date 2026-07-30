@@ -1,4 +1,5 @@
-//! `herdr-slackr mentions|feed|skill-path|skill-install` — the agent-facing CLI.
+//! `herdr-slackr mentions|feed|skill-path|skill-install|sidebar` — the agent-facing CLI plus
+//! the manifest's pane actions (`sidebar`, dispatched to [`crate::sidebar`]).
 //!
 //! See `docs/superpowers/specs/2026-07-12-agent-cli-design.md`. Unlike `crate::run` (the
 //! long-running pane), every subcommand here is a short-lived, read-only process: it opens a
@@ -23,7 +24,7 @@ use crate::model::{ConvKind, Conversation, Message, resolve_channels, ts_cmp, ts
 use crate::rest::{self, Rest, RestError};
 use crate::tokens;
 
-const USAGE: &str = "usage: herdr-slackr mentions [--json] [--limit <n>]\n       herdr-slackr feed [--channel \"#name\"] [--json] [--limit <n>]\n       herdr-slackr skill-path\n       herdr-slackr skill-install [--target <dir> | --project] [--copy] [--force]\n";
+const USAGE: &str = "usage: herdr-slackr mentions [--json] [--limit <n>]\n       herdr-slackr feed [--channel \"#name\"] [--json] [--limit <n>]\n       herdr-slackr skill-path\n       herdr-slackr skill-install [--target <dir> | --project] [--copy] [--force]\n       herdr-slackr sidebar <toggle|open|close>\n";
 
 /// The pane's backfill depth per conversation (spec: "the pane's backfill depth,
 /// 50/conversation"), reused here so a fresh CLI invocation sees the same window.
@@ -34,7 +35,7 @@ const DEFAULT_LIMIT: u32 = 20;
 
 /// Entry point called from `main` with the full process argv (`args[0]` is the program name,
 /// `args[1]` the subcommand). Only reached when `main` has already confirmed `args[1]` is one
-/// of the four subcommands this module owns.
+/// of the subcommands this module owns.
 #[allow(clippy::needless_pass_by_value)]
 pub fn run(args: Vec<String>) -> ExitCode {
     crate::log::init();
@@ -43,6 +44,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         Some("feed") => feed(&args[2..]),
         Some("skill-path") => skill_path(),
         Some("skill-install") => skill_install(&args[2..]),
+        Some("sidebar") => crate::sidebar::run(&args[2..]),
         _ => usage_error(),
     }
 }
@@ -53,11 +55,11 @@ pub fn run(args: Vec<String>) -> ExitCode {
 pub fn owns(args: &[String]) -> bool {
     matches!(
         args.get(1).map(String::as_str),
-        Some("mentions" | "feed" | "skill-path" | "skill-install")
+        Some("mentions" | "feed" | "skill-path" | "skill-install" | "sidebar")
     )
 }
 
-fn usage_error() -> ExitCode {
+pub(crate) fn usage_error() -> ExitCode {
     eprint!("{USAGE}");
     ExitCode::from(2)
 }

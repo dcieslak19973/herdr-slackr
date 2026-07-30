@@ -1,28 +1,56 @@
 id = "dcieslak19973.slackr"
 name = "slackr"
 version = "0.1.15"
-min_herdr_version = "0.7.0"
-platforms = ["macos", "linux"]
+# 0.7.5 is the earliest herdr verified to honor item-level `platforms` filters (see
+# docs/superpowers/specs/2026-07-30-windows-support-design.md); an older herdr refuses here
+# with a version message instead of half-installing a manifest it may misread.
+min_herdr_version = "0.7.5"
+platforms = ["macos", "linux", "windows"]
 description = "Real-time Slack feed and mentions pane for herdr."
 
 # On `herdr plugin install`, download the prebuilt `herdr-slackr` binary for this platform from
 # the matching GitHub Release into $HERDR_PLUGIN_ROOT/bin (no Rust toolchain needed). Skipped by
 # `herdr plugin link` — for a local checkout, build it yourself with `cargo install --path .`.
+#
+# Windows notes (design spec §4): commands are argv arrays herdr spawns directly — no shell —
+# so each entry has a unix item and a Windows twin gated by item-level `platforms`. herdr
+# rejects duplicate pane/action ids even across disjoint platforms, hence the `-windows` id
+# suffixes; on Windows, bind THOSE action ids. The PowerShell one-liners expand
+# $env:HERDR_PLUGIN_ROOT themselves and strip the `\\?\` verbatim prefix herdr reports on
+# Windows before invoking bin\herdr-slackr.exe by absolute path.
 [[build]]
+platforms = ["macos", "linux"]
 command = ["bash", "herdr/install.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "herdr/install.ps1"]
 
 # The pane runs the downloaded binary by absolute path under the plugin root, since the pane's
 # cwd is not the plugin root and the binary isn't on PATH. Placement is fixed: unlike reviewr,
 # slackr has no toggle_placement config key (see specs/config.md) — one channel/DM feed has no
-# reason to open as a tab or overlay.
+# reason to open as a tab or overlay. Both platform twins share the `slack` title, so the
+# `sidebar` actions' label-based pane discovery is platform-agnostic.
 [[panes]]
 id = "feed"
+platforms = ["macos", "linux"]
 title = "slack"
 placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-slackr\""]
 
+[[panes]]
+id = "feed-windows"
+platforms = ["windows"]
+title = "slack"
+placement = "split"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-slackr.exe'; & $exe''',
+]
+
 [[actions]]
 id = "skill-install"
+platforms = ["macos", "linux"]
 title = "slackr: install agent skill"
 contexts = ["pane", "workspace"]
 # install.sh links the binary onto PATH, but that link can be missing (a fresh shell that
@@ -31,22 +59,67 @@ contexts = ["pane", "workspace"]
 command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-slackr\" skill-install"]
 
 [[actions]]
+id = "skill-install-windows"
+platforms = ["windows"]
+title = "slackr: install agent skill"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-slackr.exe'; & $exe skill-install''',
+]
+
+# The toggle/open/close actions run the binary's `sidebar` subcommand (the retired
+# herdr/sidebar.sh, ported in-process — no bash/jq at action time on any platform).
+[[actions]]
 id = "toggle"
+platforms = ["macos", "linux"]
 title = "slackr: toggle feed"
 contexts = ["pane", "workspace"]
-command = ["bash", "herdr/sidebar.sh", "toggle"]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-slackr\" sidebar toggle"]
+
+[[actions]]
+id = "toggle-windows"
+platforms = ["windows"]
+title = "slackr: toggle feed"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-slackr.exe'; & $exe sidebar toggle''',
+]
 
 [[actions]]
 id = "open"
+platforms = ["macos", "linux"]
 title = "slackr: open feed"
 contexts = ["pane", "workspace"]
-command = ["bash", "herdr/sidebar.sh", "open"]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-slackr\" sidebar open"]
+
+[[actions]]
+id = "open-windows"
+platforms = ["windows"]
+title = "slackr: open feed"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-slackr.exe'; & $exe sidebar open''',
+]
 
 [[actions]]
 id = "close"
+platforms = ["macos", "linux"]
 title = "slackr: close feed"
 contexts = ["pane", "workspace"]
-command = ["bash", "herdr/sidebar.sh", "close"]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-slackr\" sidebar close"]
+
+[[actions]]
+id = "close-windows"
+platforms = ["windows"]
+title = "slackr: close feed"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-slackr.exe'; & $exe sidebar close''',
+]
 
 # No [[events]] block: unlike reviewr, slackr never auto-opens — the user opens the feed once
 # per session via the toggle action. Nav presence is the pane's own sidebar row: the binary

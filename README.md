@@ -21,9 +21,12 @@ triage surface: glance at the pane, know if you need to context-switch, keep wor
 
 ## Requirements
 
-- **herdr ≥ 0.7.0** (the plugin system).
-- **macOS or Linux.**
+- **herdr ≥ 0.7.5** (the plugin system with per-platform manifest entries).
+- **macOS, Linux, or Windows** (Windows is beta — herdr's own Windows support is preview).
+  Installing on Windows additionally needs **git** on `PATH`
+  ([Git for Windows](https://gitforwindows.org/)) — herdr clones the plugin repo with it.
 - **curl** on `PATH` (the Web API backend — see [specs/slack-host.md](specs/slack-host.md)).
+  Windows 10 1803+ and Windows 11 ship it in System32.
 - A **truecolor (24-bit)** terminal. Pick a theme that matches its light or dark background (see
   [Theme](#theme)).
 - A Slack app installed in your workspace with Socket Mode enabled and the scopes below —
@@ -99,6 +102,20 @@ With no key bound, run the action once with
 `herdr plugin action invoke toggle --plugin dcieslak19973.slackr`. `open` and `close` are the same
 shape, made for scripts and layout plugins: `open` no-ops if the feed is already open, `close`
 no-ops if none is.
+
+> **On Windows, action ids carry a `-windows` suffix** (`toggle-windows`, `open-windows`,
+> `close-windows`, `skill-install-windows`): herdr requires distinct ids per platform variant,
+> so bind `dcieslak19973.slackr.toggle-windows` there instead.
+
+**Windows install troubleshooting:**
+
+- `Error: Error { kind: NotFound, message: "program not found" }` from
+  `herdr plugin install` means **git is not on `PATH`** — herdr spawns git to clone the plugin
+  repo and reports the failed spawn verbatim. Install Git for Windows, open a fresh terminal,
+  retry.
+- A herdr predating Windows plugin support "installs" the plugin but skips the build step
+  (the install log says `build (skipped on windows)`), leaving no binary — the pane then
+  cannot start. `herdr update` to ≥ 0.7.5 and reinstall.
 
 ## Tokens
 
@@ -573,8 +590,9 @@ This is a focused, young tool. Known constraints:
   and the pane's own tab-bar count the only reliable one.
 - **One workspace, one token pair.** No multi-workspace / Enterprise Grid support.
 - **No message search.** The Feed tab is a live stream, not a searchable archive.
-- **macOS and Linux only** — no Windows pane (development happens on Windows; only the binary
-  itself is cross-platform).
+- **Windows is beta.** herdr's own Windows support is preview ("best effort" per herdr's
+  Windows-beta doc), the release ships one Windows target (`x86_64-pc-windows-msvc`; ARM runs
+  it via x64 emulation), and action ids differ there (see [Install](#install)).
 
 ## Building from source
 
@@ -585,6 +603,15 @@ binary where the pane command looks for it, at `$HERDR_PLUGIN_ROOT/bin/herdr-sla
 git clone https://github.com/dcieslak19973/herdr-slackr
 cd herdr-slackr
 just install   # build release → bin/herdr-slackr
+herdr plugin link .
+```
+
+On Windows (`just install` assumes a unix shell), the equivalent is:
+
+```powershell
+cargo build --release
+New-Item -ItemType Directory -Force bin | Out-Null
+Copy-Item target\release\herdr-slackr.exe bin\herdr-slackr.exe -Force
 herdr plugin link .
 ```
 

@@ -17,6 +17,7 @@ pub mod log;
 pub mod model;
 pub mod proc;
 pub mod rest;
+pub mod sidebar;
 pub mod socket;
 pub mod theme;
 pub mod tokens;
