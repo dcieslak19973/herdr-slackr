@@ -1,5 +1,5 @@
 //! Integration tests for the agent-facing `mentions`/`feed`/`skill-path`/`skill-install`
-//! subcommands, spawning the real binary. `mentions`/`feed`'s REST-touching paths are never
+//! subcommands and the manifest's `sidebar` actions, spawning the real binary. `mentions`/`feed`'s REST-touching paths are never
 //! driven against live Slack here — a config+tokens fixture pointing at a tempdir gets the
 //! discovery layer past config/token resolution, and the assertion is that the resulting
 //! failure is a Slack/curl error (proving discovery worked), not a config error.
@@ -321,4 +321,32 @@ fn project_and_target_together_exit_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("usage:"), "{}", stderr(&out));
+}
+
+// ---- sidebar ------------------------------------------------------------------------------
+
+#[test]
+fn sidebar_with_an_unknown_mode_exits_2_with_usage_on_stderr() {
+    let out = Command::new(bin()).args(["sidebar", "sideways"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("usage:"), "{}", stderr(&out));
+}
+
+#[test]
+fn sidebar_with_no_mode_exits_2_with_usage_on_stderr() {
+    let out = Command::new(bin()).args(["sidebar"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("usage:"), "{}", stderr(&out));
+}
+
+#[test]
+fn sidebar_outside_herdr_refuses_with_the_workspace_context_line() {
+    let out = Command::new(bin())
+        .args(["sidebar", "toggle"])
+        .env_remove("HERDR_WORKSPACE_ID")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("slackr: no workspace context (invoke from inside herdr)"), "{err}");
 }

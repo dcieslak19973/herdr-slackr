@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Windows support (beta).** The manifest declares `windows` with per-platform command
+  variants (`-windows`-suffixed pane/action ids — herdr rejects duplicate ids across
+  platforms), a PowerShell installer (`herdr/install.ps1`) downloads the new
+  `x86_64-pc-windows-msvc` release asset, opening permalinks uses `rundll32`, and CI runs the
+  suite on `windows-latest`. Requires herdr ≥ 0.7.5 (the earliest version verified to honor
+  item-level `platforms` filters) and git on `PATH` — a missing git is what herdr's
+  `Error { kind: NotFound, message: "program not found" }` install failure means (README
+  §Install).
+- **`herdr-slackr sidebar <toggle|open|close>`.** The pane actions now live in the binary —
+  `herdr/sidebar.sh` is gone, and with it the actions' runtime `bash`/`jq` dependency on
+  every platform.
+
+### Changed
+- `min_herdr_version` is now 0.7.5 (was 0.7.0): older herdrs refuse the new per-platform
+  manifest cleanly instead of misreading it.
+
 ## [0.1.15] — 2026-07-24
 
 ### Changed

@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-07-12
-Last edited: 2026-07-12
+Last edited: 2026-07-30
 ---
 
 # Agent CLI
@@ -18,6 +18,12 @@ herdr-slackr feed [--channel "#name"] [--json] [--limit <n>]
 herdr-slackr skill-path
 herdr-slackr skill-install [--target <dir> | --project] [--copy] [--force]
 ```
+
+(A fifth subcommand, `sidebar <toggle|open|close>`, also lives on the binary but is not
+agent-facing: it is the manifest's pane actions, ported in-process from the retired
+`herdr/sidebar.sh` so they run without `bash`/`jq` on every platform — see
+`docs/superpowers/specs/2026-07-30-windows-support-design.md` §3. Same exit-code conventions:
+usage errors exit 2, refusals exit 1 with one `slackr: …` stderr line.)
 
 `mentions` and `feed` open a fresh Slack REST session on every invocation — the pane's in-memory message store belongs to another process and is never read or shared. Same user token, same read methods the pane's own backfill uses (`auth.test`, `conversations.list`, `conversations.history`, `users.list`), same rate-limit handling (surface the remedy, no retry). `skill-path` prints the bundled skill's location; `skill-install` copies or symlinks it into an agent's skills directory. Both are ported from herdr-reviewr's `cli.rs` contract verbatim, adapted to this crate's skill name and directory.
 

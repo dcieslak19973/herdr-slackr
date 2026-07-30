@@ -35,6 +35,19 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+  # Windows is a release platform (herdr-plugin.toml `platforms`), so the suite must pass
+  # there too. fmt/clippy stay Linux-only — they are platform-independent.
+  test-windows:
+    name: test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --all-features
+
   static-linux:
     name: musl binary is static
     runs-on: ubuntu-latest

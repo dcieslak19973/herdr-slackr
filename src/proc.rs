@@ -9,11 +9,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-/// Whether `name` is a file in some directory on `$PATH` — used by `browser::open` to pick
-/// the first available platform URL opener. Copied from `herdr-reviewr`'s `src/proc.rs`.
+/// Whether `name` resolves to a file in some directory on `$PATH` — used by `browser::open`
+/// to pick the first available platform URL opener. Copied from `herdr-reviewr`'s
+/// `src/proc.rs`. On Windows an executable carries an extension on disk (`rundll32` is
+/// `rundll32.exe`), so an extensionless name is probed with each `PATHEXT` suffix the way the
+/// OS command search would.
 pub(crate) fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+    let candidates: Vec<String> = if cfg!(windows) && !name.contains('.') {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!("{name}{ext}"))
+            .collect()
+    } else {
+        vec![name.to_string()]
+    };
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| candidates.iter().any(|c| dir.join(c).is_file()))
+    })
 }
 
 /// How a spawned tool run failed, before its stdout/stderr is classified by the caller.
