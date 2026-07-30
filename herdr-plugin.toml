@@ -1,6 +1,6 @@
 id = "dcieslak19973.slackr"
 name = "slackr"
-version = "0.1.15"
+version = "0.1.16"
 # 0.7.5 is the earliest herdr verified to honor item-level `platforms` filters (see
 # docs/superpowers/specs/2026-07-30-windows-support-design.md); an older herdr refuses here
 # with a version message instead of half-installing a manifest it may misread.

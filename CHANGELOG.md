@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.16] — 2026-07-30
+
 ### Added
 - **Windows support (beta).** The manifest declares `windows` with per-platform command
   variants (`-windows`-suffixed pane/action ids — herdr rejects duplicate ids across
